@@ -78,3 +78,4 @@ sketches/
 
 # Test artifacts
 backend/tests/*.db
+scripts/.fonts/
