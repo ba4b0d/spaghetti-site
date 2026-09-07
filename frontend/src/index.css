@@ -2306,17 +2306,16 @@ body {
 
 /* PRIMARY ACTIONS */
 .dcard-primary-actions {
-  display: grid;
-  grid-template-columns: 1fr auto auto;
-  gap: 10px;
+  display: flex;
 }
 
-.dcard-btn-save {
-  background: linear-gradient(135deg, #ff9a3d, #e07b2c);
+.dcard-btn-qr {
+  width: 100%;
+  background: #131726;
   color: #fff;
   font-size: 14px;
   font-weight: 700;
-  border: none;
+  border: 1px solid #232b42;
   border-radius: 16px;
   padding: 14px 18px;
   display: flex;
@@ -2324,33 +2323,14 @@ body {
   justify-content: center;
   gap: 10px;
   cursor: pointer;
-  box-shadow: 0 6px 20px rgba(255, 154, 61, 0.3);
   transition: all 0.2s;
   font-family: inherit;
 }
 
-.dcard-btn-save:hover {
-  filter: brightness(1.08);
-  transform: translateY(-1px);
-}
-
-.dcard-btn-icon {
-  background: #131726;
-  border: 1px solid #232b42;
-  border-radius: 16px;
-  width: 50px;
-  height: 50px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #f8fafc;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.dcard-btn-icon:hover {
+.dcard-btn-qr:hover {
   background: #1c2237;
   border-color: #ff9a3d;
+  transform: translateY(-1px);
 }
 
 /* CHANNEL TILES */
@@ -2519,40 +2499,4 @@ body {
   cursor: pointer;
   font-family: inherit;
   width: 100%;
-}
-
-/* TOAST */
-.dcard-toast {
-  position: fixed;
-  bottom: 24px;
-  left: 50%;
-  transform: translateX(-50%) translateY(100px);
-  background: rgba(23, 28, 45, 0.95);
-  border: 1px solid #ff9a3d;
-  color: #fff;
-  padding: 10px 20px;
-  border-radius: 30px;
-  font-size: 13px;
-  font-weight: 600;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-  pointer-events: none;
-  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-  z-index: 2000;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.dcard-toast.show {
-  transform: translateX(-50%) translateY(0);
-}
-
-@media (max-width: 400px) {
-  .dcard-primary-actions {
-    grid-template-columns: 1fr;
-  }
-
-  .dcard-btn-icon {
-    width: 100%;
-  }
 }

@@ -1,11 +1,10 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { useSEO, buildOrganizationJsonLd } from '../lib/seo';
 import { getContact, getPublicBrand } from '../lib/api';
 import { QR_VIEWBOX, QR_MODULE, QR_DOTS } from '../lib/cardQr';
 
 const PHONE = '09981923856';
 const PHONE_DISPLAY = '0998 192 3856';
-const CARD_URL = 'https://spaghettiprints.ir/card';
 
 export default function DigitalCard() {
   useSEO({
@@ -17,7 +16,6 @@ export default function DigitalCard() {
 
   const [contact, setContact] = useState({ telegram: 'spaghetti_prints', instagram: 'spaghetti.prints', bale: 'spaghetti_prints', brand: 'اسپاگتی پرینت', city: 'تهران', logo: '/icon-512.png' });
   const [qrOpen, setQrOpen] = useState(false);
-  const [toast, setToast] = useState('');
 
   useEffect(() => {
     getContact()
@@ -40,53 +38,6 @@ export default function DigitalCard() {
       })
       .catch(() => {});
   }, []);
-
-  const showToast = useCallback((msg) => {
-    setToast(msg);
-    setTimeout(() => setToast(''), 2500);
-  }, []);
-
-  const downloadVCard = () => {
-    const lines = [
-      'BEGIN:VCARD',
-      'VERSION:3.0',
-      `FN;CHARSET=UTF-8:${contact.brand}`,
-      `N;CHARSET=UTF-8:${contact.brand};;;;`,
-      'ORG;CHARSET=UTF-8:استودیو چاپ سه بعدی اسپاگتی (Spaghetti Print)',
-      'TITLE;CHARSET=UTF-8:خدمات تخصصی پرینت سه بعدی FDM و نمونهسازی',
-      `TEL;TYPE=CELL,VOICE,PREF:${PHONE}`,
-      'URL;CHARSET=UTF-8:https://spaghettiprints.ir',
-      `NOTE;CHARSET=UTF-8:خدمات تخصصی پرینت سه بعدی FDM\\nتلگرام: @${contact.telegram}\\nاینستاگرام: @${contact.instagram}\\nبله: @${contact.bale}\\nوبسایت: spaghettiprints.ir`,
-      `X-SOCIALPROFILE;type=telegram:https://t.me/${contact.telegram}`,
-      `X-SOCIALPROFILE;type=instagram:https://instagram.com/${contact.instagram}`,
-      `X-SOCIALPROFILE;type=bale:https://ble.ir/${contact.bale}`,
-      'END:VCARD',
-    ];
-    const blob = new Blob([lines.join('\r\n')], { type: 'text/vcard;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', 'Spaghetti_Print.vcf');
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-    showToast('مخاطب آماده ذخیره در تلفن همراه است');
-  };
-
-  const shareCard = () => {
-    if (navigator.share) {
-      navigator.share({
-        title: 'کارت ویزیت دیجیتال اسپاگتی پرینت',
-        text: 'خدمات تخصصی پرینت سه بعدی و نمونهسازی سریع اسپاگتی پرینت',
-        url: CARD_URL,
-      }).catch(() => {});
-    } else {
-      navigator.clipboard.writeText(CARD_URL).then(() => {
-        showToast('لینک کارت ویزیت در کلیپبورد کپی شد');
-      }).catch(() => {});
-    }
-  };
 
   return (
     <div className="dcard-page">
@@ -115,19 +66,11 @@ export default function DigitalCard() {
           </div>
         </div>
 
-        {/* PRIMARY ACTION: VCARD & SHARE */}
+        {/* QR code for in-person sharing */}
         <div className="dcard-primary-actions">
-          <button type="button" className="dcard-btn-save" onClick={downloadVCard}>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>
-            افزودن به مخاطبین تلفن (vCard)
-          </button>
-
-          <button type="button" className="dcard-btn-icon" onClick={() => setQrOpen(true)} title="نمایش بارکد اختصاصی" aria-label="نمایش بارکد">
+          <button type="button" className="dcard-btn-qr" onClick={() => setQrOpen(true)} title="نمایش بارکد اختصاصی">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /></svg>
-          </button>
-
-          <button type="button" className="dcard-btn-icon" onClick={shareCard} title="کپی لینک کارت" aria-label="اشتراک گذاری کارت">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" /><line x1="8.59" y1="13.51" x2="15.42" y2="17.49" /><line x1="15.41" y1="6.51" x2="8.59" y2="10.49" /></svg>
+            نمایش بارکد کارت ویزیت
           </button>
         </div>
 
@@ -257,11 +200,7 @@ export default function DigitalCard() {
         </div>
       )}
 
-      {/* TOAST */}
-      <div className={`dcard-toast${toast ? ' show' : ''}`}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
-        <span>{toast || 'لینک کارت ویزیت در کلیپبورد کپی شد'}</span>
-      </div>
+
     </div>
   );
 }
