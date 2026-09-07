@@ -6,7 +6,7 @@ import { useSEO } from '../lib/seo';
 const SPAGHETTI_TIPS = [
   'نکته پرینت: به نظر میرسه چسبندگی لایه اول (First Layer Adhesion) از دست رفته و قطعه ول کرده!',
   'نکته پرینت: شاید کالیبراسیون و تراز صفحه (Bed Leveling) به هم ریخته!',
-  'نکته پرینت: دمای هیتبد رو ۵ درجه ببر بالا و قبل چاپ یکم چسب ماتیکی یا اسپری بزن!',
+  'نکته پرینت: دمای هیت بد رو ۵ درجه ببر بالا و قبل چاپ یکم چسب ماتیکی یا اسپری بزن!',
   'نکته پرینت: Z-offset رو چک کن؛ نازل داشت توی هوا برای خودش اسپاگتی میپخت!',
   'نکته پرینت: این قطعه رفت جزو ضایعات، ولی توی کاتالوگ کلی قطعه سالم و آماده داریم!',
   'نکته پرینت: سنسور هوش مصنوعی اسپاگتی فعال شد و چاپ متوقف شد تا فیلامنتت نسوزه!',
@@ -18,7 +18,7 @@ export default function NotFound() {
 
   useSEO({
     title: 'صفحه پیدا نشد (خطای ۴۰۴)',
-    description: 'اوپس! پرینت این صفحه اسپاگتی شد! قطعه مورد نظر روی هیتبد پیدا نشد.',
+    description: 'اوپس! پرینت این صفحه اسپاگتی شد! قطعه مورد نظر روی هیت بد پیدا نشد.',
     url: '/404',
   });
 
@@ -210,7 +210,7 @@ export default function NotFound() {
             اوپس! پرینت این صفحه اسپاگتی شد! 🍝
           </h1>
           <p className="p404-desc">
-            قطعهای که دنبالش بودید روی هیتبد پیدا نشد؛ ظاهراً چسبندگی لایه اول از دست رفته و کل پرینتر پر از رشتههای سرگردان فیلامنت شده!
+            قطعه های که دنبالش بودید روی هیت بد پیدا نشد؛ ظاهراً چسبندگی لایه اول از دست رفته و کل پرینتر پر از رشته های سرگردان فیلامنت شده!
           </p>
 
           {/* 3D PRINTER STATUS CONSOLE */}
@@ -229,7 +229,7 @@ export default function NotFound() {
                 <span className="p404-stat-val text-orange-400">۲۱۵°C</span>
               </div>
               <div className="p404-stat-box">
-                <span className="p404-stat-label">دمای هیتبد</span>
+                <span className="p404-stat-label">دمای هیت بد</span>
                 <span className="p404-stat-val text-blue-400">۶۰°C</span>
               </div>
               <div className="p404-stat-box">
@@ -237,7 +237,7 @@ export default function NotFound() {
                 <span className="p404-stat-val text-amber-400">۴۰۴ متر</span>
               </div>
               <div className="p404-stat-box">
-                <span className="p404-stat-label">وضعیت لایهها</span>
+                <span className="p404-stat-label">وضعیت لایه ها</span>
                 <span className="p404-stat-val text-red-400">ناموفق ❌</span>
               </div>
             </div>
