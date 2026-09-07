@@ -52,3 +52,45 @@ def test_delete_category(client, auth_headers):
     resp = client.delete(f"/api/v1/categories/{cat_id}", headers=auth_headers)
     assert resp.status_code == 200
     assert "حذف شد" in resp.json()["message"]
+
+
+def test_deleted_category_is_not_recreated_from_legacy_product_text(client, auth_headers, monkeypatch):
+    """A deleted category must stay deleted after the application restarts."""
+    from app.database import get_db
+    from app.models import Category, Product
+    from app.main import lifespan
+    import app.main as main_module
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    # Make the startup migration use the isolated database created by the fixture.
+    engine = create_engine("sqlite:///tests/test.db", connect_args={"check_same_thread": False})
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    monkeypatch.setattr(main_module, "SessionLocal", session_factory)
+
+    unique_name = f"LegacyCat-{int(time.time())}"
+    create_resp = client.post("/api/v1/categories", json={"name": unique_name}, headers=auth_headers)
+    cat_id = create_resp.json()["id"]
+
+    db = next(client.app.dependency_overrides[get_db]())
+    try:
+        db.add(Product(name=f"Product-{unique_name}", category=unique_name))
+        db.commit()
+    finally:
+        db.close()
+
+    delete_resp = client.delete(f"/api/v1/categories/{cat_id}", headers=auth_headers)
+    assert delete_resp.status_code == 200
+
+    async def restart_app():
+        async with lifespan(client.app):
+            pass
+
+    import asyncio
+    asyncio.run(restart_app())
+
+    db = next(client.app.dependency_overrides[get_db]())
+    try:
+        assert db.query(Category).filter(Category.name == unique_name).first() is None
+    finally:
+        db.close()

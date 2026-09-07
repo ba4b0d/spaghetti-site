@@ -138,8 +138,13 @@ def delete_category(cat_id: int, user=Depends(require_staff_role), db: Session =
         child.parent_id = cat.parent_id
 
     from app.models import ProductCategory
-    # Clear category associations in junction table
+    # Clear both the many-to-many links and the legacy category text. Startup
+    # migration uses Product.category to backfill categories, so leaving this
+    # value would recreate a category that an administrator deleted.
     db.query(ProductCategory).filter(ProductCategory.category_id == cat_id).delete()
+    db.query(Product).filter(Product.category == cat.name).update(
+        {Product.category: None}, synchronize_session=False
+    )
     db.delete(cat)
     db.commit()
     invalidate_stats()
