@@ -374,6 +374,39 @@ function CollectionCard({ coll, activeTag, duplicate = false }) {
 const INITIAL_BATCH = 24;
 const BATCH_SIZE = 24;
 
+export function collectionBundlesForCategory(products) {
+  const collectionsMap = new Map();
+  const nonCollectionProducts = [];
+
+  for (const product of products) {
+    const collection = product.collections?.[0];
+    if (!collection) {
+      nonCollectionProducts.push(product);
+      continue;
+    }
+
+    const collectionKey = collection.slug || collection.name;
+    if (!collectionsMap.has(collectionKey)) {
+      collectionsMap.set(collectionKey, { collection, items: [] });
+    }
+    collectionsMap.get(collectionKey).items.push(product);
+  }
+
+  const collectionCards = Array.from(collectionsMap.values()).map(({ collection, items }) => {
+    const representative = items[0];
+    return {
+      ...representative,
+      isCollectionBundle: true,
+      collectionTag: collection.slug || collection.name,
+      collectionCount: items.length,
+      name: `${collection.name} (${items.length} آیتم)`,
+      images: items.flatMap((item) => item.images || []),
+    };
+  });
+
+  return [...collectionCards, ...nonCollectionProducts];
+}
+
 export default function Catalog() {
   const { tag: routeTag } = useParams();
   const [products, setProducts] = useState([]);
@@ -588,44 +621,6 @@ export default function Catalog() {
   const filtered = useMemo(() => {
     let list = [...products];
 
-    // Grouping into single Collection Bundle Cards ONLY on the unfiltered homepage.
-    // Once any filter (category / tag / search) is active, show products individually —
-    // otherwise collection members vanish from their category and subcategory listings.
-    if (!activeTag && !search && !activeCategory) {
-      const collectionsMap = new Map();
-      const nonCollectionProducts = [];
-
-      for (const p of list) {
-        // ONLY group using explicit collections assigned via Admin Collections
-        const coll = p.collections && p.collections.length > 0 ? p.collections[0] : null;
-
-        if (coll) {
-          const collName = coll.name;
-          if (!collectionsMap.has(collName)) {
-            collectionsMap.set(collName, { coll, items: [] });
-          }
-          collectionsMap.get(collName).items.push(p);
-        } else {
-          nonCollectionProducts.push(p);
-        }
-      }
-
-      // Rebuild list: 1 Bundle Card per Collection + individual non-collection products
-      const collectionCards = Array.from(collectionsMap.entries()).map(([name, { coll, items }]) => {
-        const rep = items[0];
-        return {
-          ...rep,
-          isCollectionBundle: true,
-          collectionTag: coll.slug || name,
-          collectionCount: items.length,
-          name: `${name} (${items.length} آیتم)`,
-          images: items.flatMap(i => i.images || []),
-        };
-      });
-
-      list = [...collectionCards, ...nonCollectionProducts];
-    }
-
     if (search) {
       const q = search.toLowerCase();
       list = list.filter(
@@ -676,6 +671,10 @@ export default function Catalog() {
         const collMatch = p.collections?.some((c) => c.name === activeTag || c.slug === activeTag);
         return tagMatch || collMatch;
       });
+    }
+    // Group after filtering so category/subcategory cards represent only matching products.
+    if (!activeTag && !search) {
+      list = collectionBundlesForCategory(list);
     }
     switch (sortBy) {
       case 'price_asc':
