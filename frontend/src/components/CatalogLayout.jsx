@@ -461,6 +461,7 @@ export default function CatalogLayout({ children }) {
             <Link to="/how-to-order" className="catalog-footer-link">سفارش از کاتالوگ</Link>
             <Link to="/custom-order" className="catalog-footer-link">سفارش طرح دلخواه</Link>
             <Link to="/contact" className="catalog-footer-link">تماس با ما</Link>
+            <Link to="/card" className="catalog-footer-link">کارت ویزیت</Link>
             <Link to="/privacy" className="catalog-footer-link">حریم خصوصی</Link>
             <Link to="/terms" className="catalog-footer-link">قوانین</Link>
           </nav>

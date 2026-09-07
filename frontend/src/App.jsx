@@ -22,6 +22,7 @@ const HowToOrder = lazy(() => import('./pages/HowToOrder'));
 const CustomOrder = lazy(() => import('./pages/CustomOrder'));
 const Privacy = lazy(() => import('./pages/Privacy'));
 const Terms = lazy(() => import('./pages/Terms'));
+const DigitalCard = lazy(() => import('./pages/DigitalCard'));
 const UsersPage = lazy(() => import('./pages/Users'));
 const Categories = lazy(() => import('./pages/Categories'));
 const Collections = lazy(() => import('./pages/Collections'));
@@ -74,6 +75,7 @@ function AppRoutes() {
                 <Route path="/collections/:tag" element={<CatalogLayout><Catalog /></CatalogLayout>} />
                 <Route path="/catalog/:slug" element={<CatalogLayout><PublicProductDetail /></CatalogLayout>} />
                 <Route path="/contact" element={<CatalogLayout><Contact /></CatalogLayout>} />
+                <Route path="/card" element={<DigitalCard />} />
                 <Route path="/how-to-order" element={<CatalogLayout><HowToOrder /></CatalogLayout>} />
                 <Route path="/custom-order" element={<CatalogLayout><CustomOrder /></CatalogLayout>} />
                 <Route path="/privacy" element={<CatalogLayout><Privacy /></CatalogLayout>} />
