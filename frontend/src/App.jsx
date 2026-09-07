@@ -35,14 +35,27 @@ const BlogPostDetail = lazy(() => import('./pages/BlogPostDetail'));
 const AdminBlog = lazy(() => import('./pages/AdminBlog'));
 const NotFound = lazy(() => import('./pages/NotFound'));
 
-function PageLoader() {
+export function PageLoader() {
   return (
-    <div className="min-h-screen flex items-center justify-center" style={{ backgroundColor: 'var(--bg-primary)' }}>
-      <div className="flex flex-col items-center gap-3">
-        <div className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: 'var(--accent)', borderTopColor: 'transparent' }} />
-        <div className="text-sm" style={{ color: 'var(--text-muted)' }}>در حال بارگذاری...</div>
+    <main className="spaghetti-loader" aria-live="polite" aria-busy="true">
+      <div className="spaghetti-loader__glow" aria-hidden="true" />
+      <div className="spaghetti-loader__content">
+        <div className="spaghetti-loader__printer" aria-hidden="true">
+          <div className="spaghetti-loader__gantry">
+            <span className="spaghetti-loader__rail" />
+            <span className="spaghetti-loader__nozzle" />
+          </div>
+          <div className="spaghetti-loader__filament" />
+          <div className="spaghetti-loader__bed">
+            <i /><i /><i /><i /><i />
+          </div>
+        </div>
+        <p className="spaghetti-loader__eyebrow">SPAGHETTI PRINT</p>
+        <h1>اسپاگتی پرینت</h1>
+        <p className="spaghetti-loader__message">در حال آمادهسازی چاپ سه بعدی شما</p>
+        <div className="spaghetti-loader__progress" aria-hidden="true"><span /></div>
       </div>
-    </div>
+    </main>
   );
 }
 
