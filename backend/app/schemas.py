@@ -20,7 +20,7 @@ class SettingsResponse(BaseModel):
     id: int
     key: str
     value: float
-    description: str
+    description: Optional[str] = ""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -107,8 +107,8 @@ class MaterialResponse(BaseModel):
     name: str
     price_per_kg: float
     waste_pct: float
-    color: str
-    notes: str
+    color: Optional[str] = ""
+    notes: Optional[str] = ""
     is_active: bool
     is_default: bool = False
 
@@ -207,9 +207,9 @@ class ProductResponse(BaseModel):
     product_id: str
     name: str
     qty: int
-    machine_id: Optional[int]
+    machine_id: Optional[int] = None
     machine_name: Optional[str] = None
-    material_id: Optional[int]
+    material_id: Optional[int] = None
     material_name: Optional[str] = None
     material_color: Optional[str] = None
     weight_g: float
@@ -221,13 +221,13 @@ class ProductResponse(BaseModel):
     print_time_hours: float
     post_pro_hours: float
     extras_cost: float
-    image_url: Optional[str]
+    image_url: Optional[str] = None
     images: list[ProductImageResponse] = []
-    final_price: Optional[float]
-    category: str = ""
+    final_price: Optional[float] = None
+    category: Optional[str] = ""
     categories: list[dict] = []
     collections: list[dict] = []
-    notes: str
+    notes: Optional[str] = ""
     package_info: Optional[str] = ""
     is_active: bool
     slug: Optional[str] = None

@@ -85,8 +85,8 @@ def _enrich_product(product: Product, db: Session, machines_dict: dict = None, m
             for img in (product.images if hasattr(product, 'images') and product.images else [])
         ],
         "final_price": product.final_price,
-        "category": product.category,
-        "notes": product.notes,
+        "category": product.category or "",
+        "notes": product.notes or "",
         "package_info": product.package_info or "",
         "is_active": product.is_active,
     }
