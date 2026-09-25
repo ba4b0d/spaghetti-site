@@ -1,13 +1,12 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { MessageCircle, Send, Phone, Camera, ExternalLink, ClipboardList } from 'lucide-react';
+import { MessageCircle, Send, Camera, ExternalLink, ClipboardList } from 'lucide-react';
 import { CONTACT, CHANNELS, displayChannels } from '../lib/contact';
 import { getContact } from '../lib/api';
 import { useSEO, buildOrganizationJsonLd } from '../lib/seo';
 
 const ICONS = {
   telegram: Send,
-  whatsapp: Phone,
   instagram: Camera,
   bale: MessageCircle,
 };
@@ -26,11 +25,6 @@ function mergeChannels(api) {
       const clean = value.replace(/^@/, '');
       handle = `@${clean}`;
       href = `https://t.me/${clean}`;
-    } else if (ch.id === 'whatsapp') {
-      const digits = value.replace(/[^0-9]/g, '');
-      const phone = digits.startsWith('98') ? digits : `98${digits.replace(/^0/, '')}`;
-      handle = value;
-      href = `https://wa.me/${phone}`;
     } else if (ch.id === 'instagram') {
       const clean = value.replace(/^@/, '');
       handle = `@${clean}`;
@@ -47,7 +41,7 @@ function mergeChannels(api) {
 export default function Contact() {
   useSEO({
     title: 'تماس با ما',
-    description: 'راه‌های ارتباط با اسپاگتی پرینت — تلگرام، واتس‌اپ، اینستاگرام',
+    description: 'راههای ارتباط با اسپاگتی پرینت — تلگرام، اینستاگرام، بله',
     url: '/contact',
     jsonLd: buildOrganizationJsonLd(),
   });

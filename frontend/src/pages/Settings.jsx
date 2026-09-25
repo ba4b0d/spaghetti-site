@@ -175,7 +175,6 @@ export default function Settings() {
   const contactFields = [
     { key: 'contact_brand', label: 'نام برند', icon: '🏷️', stringField: true },
     { key: 'contact_telegram', label: 'تلگرام', icon: '✈️', stringField: true, hint: 'نام کاربری مثل @username' },
-    { key: 'contact_whatsapp', label: 'واتس‌اپ', icon: '📱', stringField: true, hint: 'شماره تلفن' },
     { key: 'contact_instagram', label: 'اینستاگرام', icon: '📷', stringField: true, hint: 'نام کاربری مثل @username' },
     { key: 'contact_bale', label: 'بله', icon: '💬', stringField: true, hint: 'نام کاربری مثل @username' },
     { key: 'contact_hours', label: 'ساعات کاری', icon: '🕐', stringField: true, hint: 'مثلاً ۹ تا ۲۱' },

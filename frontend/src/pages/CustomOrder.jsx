@@ -24,7 +24,7 @@ const STEPS = [
     n: 2,
     icon: MessageCircle,
     title: 'ارسال پیام',
-    body: 'برای استعلام قیمت، اطلاعات زیر را از طریق تلگرام، واتس‌اپ، اینستاگرام و یا بله برای ما ارسال کنید:\n• توصیف طرح ذهنی\n• ارائه توضیحات (برای مثال اگر طرح دلخواهتان مربوط به شخصیت یک فیلم است، نام شخصیت و فیلم را برایمان بفرستید)\n• تصویر/ تصاویر مشابه\n• ابعاد حدودی',
+    body: 'برای استعلام قیمت، اطلاعات زیر را از طریق تلگرام، اینستاگرام و یا بله برای ما ارسال کنید:\n• توصیف طرح ذهنی\n• ارائه توضیحات (برای مثال اگر طرح دلخواهتان مربوط به شخصیت یک فیلم است، نام شخصیت و فیلم را برایمان بفرستید)\n• تصویر/ تصاویر مشابه\n• ابعاد حدودی',
   },
   {
     n: 3,
@@ -116,8 +116,8 @@ function CustomOrderForm() {
         <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-primary)' }}>کانال ارتباطی</label>
         <select name="channel" value={form.channel} onChange={handleChange} className="select-field">
           <option value="telegram">تلگرام</option>
-          <option value="whatsapp">واتس‌اپ</option>
           <option value="instagram">اینستاگرام</option>
+          <option value="bale">بله</option>
           <option value="phone">تماس تلفنی</option>
         </select>
       </div>
