@@ -122,7 +122,17 @@ def test_tier_margin_percentages():
     assert get_tier_margin_pct(250000) == 110.0
     assert get_tier_margin_pct(299999) == 110.0
     assert get_tier_margin_pct(300000) == 100.0
-    assert get_tier_margin_pct(500000) == 100.0
+    assert get_tier_margin_pct(349999) == 100.0
+    assert get_tier_margin_pct(350000) == 90.0
+    assert get_tier_margin_pct(399999) == 90.0
+    assert get_tier_margin_pct(400000) == 80.0
+    assert get_tier_margin_pct(449999) == 80.0
+    assert get_tier_margin_pct(450000) == 70.0
+    assert get_tier_margin_pct(499999) == 70.0
+    assert get_tier_margin_pct(500000) == 60.0
+    assert get_tier_margin_pct(549999) == 60.0
+    assert get_tier_margin_pct(550000) == 50.0
+    assert get_tier_margin_pct(1000000) == 50.0
 
 
 def test_round_up_to_nearest():
@@ -188,9 +198,9 @@ def test_calculate_product_costs_from_values():
         + 50000, 2
     )
     assert result["base_price"] == expected_base
-    # Base price is > 300,000 -> 100% margin -> 2x -> raw = 2368175.16 -> ceil to 5k = 2370000
-    assert result["margin_pct"] == 100.0
-    expected_suggested = math.ceil((expected_base * 2.0) / 5000.0) * 5000.0
+    # Base price is > 550,000 -> 50% margin -> 1.5x -> raw = 1776131.37 -> ceil to 5k = 1780000
+    assert result["margin_pct"] == 50.0
+    expected_suggested = math.ceil((expected_base * 1.5) / 5000.0) * 5000.0
     assert result["suggested_price"] == expected_suggested
 
 

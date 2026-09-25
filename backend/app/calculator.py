@@ -21,7 +21,12 @@ def get_tier_margin_pct(base_price: float) -> float:
       - Between 150,000 and 200,000 -> 130%
       - Between 200,000 and 250,000 -> 120%
       - Between 250,000 and 300,000 -> 110%
-      - Above 300,000 Tomans       -> 100%
+      - Between 300,000 and 350,000 -> 100%
+      - Between 350,000 and 400,000 -> 90%
+      - Between 400,000 and 450,000 -> 80%
+      - Between 450,000 and 500,000 -> 70%
+      - Between 500,000 and 550,000 -> 60%
+      - Above 550,000 Tomans       -> 50%
     """
     if base_price < 50000:
         return 200.0
@@ -35,8 +40,18 @@ def get_tier_margin_pct(base_price: float) -> float:
         return 120.0
     elif base_price < 300000:
         return 110.0
-    else:
+    elif base_price < 350000:
         return 100.0
+    elif base_price < 400000:
+        return 90.0
+    elif base_price < 450000:
+        return 80.0
+    elif base_price < 500000:
+        return 70.0
+    elif base_price < 550000:
+        return 60.0
+    else:
+        return 50.0
 
 
 def round_up_to_nearest(value: float, step: float = 5000.0) -> float:
