@@ -1,3 +1,4 @@
+import math
 from sqlalchemy.orm import Session
 from app.models import Settings, Machine, Material
 from app.cache import get_settings_dict
@@ -9,6 +10,40 @@ _DEFAULTS = {
     "overhead_fixed_per_job": 0.3,
     "coloring_cost_per_hour": 150000,
 }
+
+
+def get_tier_margin_pct(base_price: float) -> float:
+    """
+    Return profit percentage based on finished cost (base_price in Tomans):
+      - Under 50,000 Tomans        -> 200%
+      - Between 50,000 and 100,000 -> 160%
+      - Between 100,000 and 150,000 -> 140%
+      - Between 150,000 and 200,000 -> 130%
+      - Between 200,000 and 250,000 -> 120%
+      - Between 250,000 and 300,000 -> 110%
+      - Above 300,000 Tomans       -> 100%
+    """
+    if base_price < 50000:
+        return 200.0
+    elif base_price < 100000:
+        return 160.0
+    elif base_price < 150000:
+        return 140.0
+    elif base_price < 200000:
+        return 130.0
+    elif base_price < 250000:
+        return 120.0
+    elif base_price < 300000:
+        return 110.0
+    else:
+        return 100.0
+
+
+def round_up_to_nearest(value: float, step: float = 5000.0) -> float:
+    """Round up value to the nearest step (e.g. 5,000 Tomans)."""
+    if value <= 0:
+        return 0.0
+    return float(math.ceil(value / step) * step)
 
 
 def _get_setting(db: Session, key: str, default: float = 0.0) -> float:
@@ -49,9 +84,6 @@ def calculate_product_costs_from_values(
     electricity_rate = settings_dict.get(
         "electricity_rate_per_kwh", _DEFAULTS["electricity_rate_per_kwh"]
     )
-    default_markup_pct = settings_dict.get(
-        "default_markup_pct", _DEFAULTS["default_markup_pct"]
-    )
     overhead_fixed = settings_dict.get(
         "overhead_fixed_per_job", _DEFAULTS["overhead_fixed_per_job"]
     )
@@ -74,11 +106,11 @@ def calculate_product_costs_from_values(
 
     base_price = material_cost + power_cost + downtime_cost + maintenance_cost + coloring_cost + overhead_cost + extras_cost
 
-    suggested_price = base_price * default_markup_pct
+    margin_pct = get_tier_margin_pct(base_price)
+    raw_suggested_price = base_price * (1.0 + margin_pct / 100.0) if base_price > 0 else 0.0
+    suggested_price = round_up_to_nearest(raw_suggested_price, 5000.0)
 
     gross_margin = suggested_price - base_price
-
-    margin_pct = (default_markup_pct - 1) * 100  # as percentage
 
     return {
         "material_cost": round(material_cost, 2),

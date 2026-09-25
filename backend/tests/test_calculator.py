@@ -3,6 +3,7 @@ Pure-function calculator tests — no DB or API calls.
 """
 import sys
 import os
+import math
 import pytest
 
 # Ensure backend is on path
@@ -10,7 +11,11 @@ backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
-from app.calculator import calculate_product_costs_from_values
+from app.calculator import (
+    calculate_product_costs_from_values,
+    get_tier_margin_pct,
+    round_up_to_nearest,
+)
 
 
 # ── Settings dict used for all tests ─────────────────────────────────
@@ -102,19 +107,47 @@ def test_overhead_calculation():
     assert result["overhead_cost"] == expected_overhead
 
 
-def test_suggested_price_with_markup():
-    """suggested_price = base_price * markup (3x default = 200% margin)"""
+def test_tier_margin_percentages():
+    """Verify tier profit percentages based on base cost (base_price)."""
+    assert get_tier_margin_pct(0) == 200.0
+    assert get_tier_margin_pct(49999) == 200.0
+    assert get_tier_margin_pct(50000) == 160.0
+    assert get_tier_margin_pct(99999) == 160.0
+    assert get_tier_margin_pct(100000) == 140.0
+    assert get_tier_margin_pct(149999) == 140.0
+    assert get_tier_margin_pct(150000) == 130.0
+    assert get_tier_margin_pct(199999) == 130.0
+    assert get_tier_margin_pct(200000) == 120.0
+    assert get_tier_margin_pct(249999) == 120.0
+    assert get_tier_margin_pct(250000) == 110.0
+    assert get_tier_margin_pct(299999) == 110.0
+    assert get_tier_margin_pct(300000) == 100.0
+    assert get_tier_margin_pct(500000) == 100.0
+
+
+def test_round_up_to_nearest():
+    """Verify ceiling rounding to nearest 5,000 Tomans."""
+    assert round_up_to_nearest(0) == 0.0
+    assert round_up_to_nearest(42000, 5000) == 45000.0
+    assert round_up_to_nearest(45000, 5000) == 45000.0
+    assert round_up_to_nearest(45001, 5000) == 50000.0
+    assert round_up_to_nearest(96000, 5000) == 100000.0
+
+
+def test_suggested_price_tiered_and_rounded():
+    """suggested_price applies tiered profit % and rounds up to nearest 5000."""
+    # Under 50k base price: e.g. 10g @ 2600/g = 27300 material + overhead (30%) = ~35490
     result = calculate_product_costs_from_values(
         SETTINGS,
-        weight_g=100, support_g=0, flushed_g=0,
-        print_time_hours=2, post_pro_hours=0, extras_cost=0,
-        material_price_per_kg=2600000,
+        weight_g=10, support_g=0, flushed_g=0,
+        print_time_hours=0, post_pro_hours=0, extras_cost=0,
+        material_price_per_kg=2600000, material_waste_pct=0.05,
     )
-    # The calculator rounds base_price and suggested_price independently
-    # from the same unrounded intermediate, so they may differ by 0.01
-    # when recomputing from the rounded base_price.
-    assert result["suggested_price"] == pytest.approx(result["base_price"] * 3.0, abs=0.02)
+    # base = 27300 * 1.3 = 35490 (< 50k -> 200% margin -> 3x -> 106470 -> round up to 5k -> 110000)
+    assert result["base_price"] == 35490.0
     assert result["margin_pct"] == 200.0
+    assert result["suggested_price"] == 110000.0
+    assert result["gross_margin"] == 110000.0 - 35490.0
 
 
 def test_calculate_product_costs_from_values():
@@ -155,9 +188,10 @@ def test_calculate_product_costs_from_values():
         + 50000, 2
     )
     assert result["base_price"] == expected_base
-    # suggested_price is computed from the unrounded intermediate sum;
-    # the rounded base_price may differ slightly, so use approx.
-    assert result["suggested_price"] == pytest.approx(result["base_price"] * 3.0, abs=0.02)
+    # Base price is > 300,000 -> 100% margin -> 2x -> raw = 2368175.16 -> ceil to 5k = 2370000
+    assert result["margin_pct"] == 100.0
+    expected_suggested = math.ceil((expected_base * 2.0) / 5000.0) * 5000.0
+    assert result["suggested_price"] == expected_suggested
 
 
 def test_edge_case_zero_material():
