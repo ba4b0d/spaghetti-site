@@ -167,7 +167,7 @@ describe('audited accessibility fixes 2026-08-23', () => {
 
     expect(categoriesButton.getAttribute('aria-expanded')).toBe('true');
     expect(categoriesButton.getAttribute('aria-controls')).toBe('catalog-mega-menu');
-    expect(screen.getByRole('menu', { name: 'دستهبندی محصولات' })).toBeDefined();
+    expect(screen.getByRole('menu', { name: 'دسته‌بندی محصولات' })).toBeDefined();
   });
 
   it('admin layout mobile sidebar receives focus, traps focus, restores focus, and hides content while open', async () => {

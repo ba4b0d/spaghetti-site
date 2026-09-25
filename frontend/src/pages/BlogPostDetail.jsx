@@ -179,7 +179,7 @@ export default function BlogPostDetail() {
             <button
               onClick={handleShareTelegram}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 text-sky-400 transition-colors text-xs font-medium border border-sky-500/20"
-              aria-label="اشتراکگذاری در تلگرام"
+              aria-label="اشتراک‌گذاری در تلگرام"
             >
               <Share2 size={14} />
               <span>تلگرام</span>

@@ -47,7 +47,7 @@ export default function NotFound() {
               fill="none"
               xmlns="http://www.w3.org/2000/svg"
               role="img"
-              aria-label="تصویر پرینتر سه بعدی با خطای اسپاگتی شدن فیلامنت"
+              aria-label="تصویر پرینتر سه‌بعدی با خطای اسپاگتی شدن فیلامنت"
             >
               <defs>
                 <linearGradient id="p404-bed-grad" x1="0" y1="0" x2="0" y2="1">
@@ -210,7 +210,7 @@ export default function NotFound() {
             اوپس! پرینت این صفحه اسپاگتی شد! 🍝
           </h1>
           <p className="p404-desc">
-            قطعه های که دنبالش بودید روی هیت بد پیدا نشد؛ ظاهراً چسبندگی لایه اول از دست رفته و کل پرینتر پر از رشته های سرگردان فیلامنت شده!
+            قطعه‌ای که دنبالش بودید روی هیت بد پیدا نشد؛ ظاهراً چسبندگی لایه اول از دست رفته و کل پرینتر پر از رشته‌های سرگردان فیلامنت شده!
           </p>
 
           {/* 3D PRINTER STATUS CONSOLE */}
@@ -237,7 +237,7 @@ export default function NotFound() {
                 <span className="p404-stat-val text-amber-400">۴۰۴ متر</span>
               </div>
               <div className="p404-stat-box">
-                <span className="p404-stat-label">وضعیت لایه ها</span>
+                <span className="p404-stat-label">وضعیت لایه‌ها</span>
                 <span className="p404-stat-val text-red-400">ناموفق ❌</span>
               </div>
             </div>

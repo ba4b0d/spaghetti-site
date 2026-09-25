@@ -7,7 +7,7 @@ import { useSEO } from '../lib/seo';
 export default function BlogList() {
   useSEO({
     title: 'وبلاگ و مقالات — اسپاگتی پرینت',
-    description: 'جدیدترین اخبار، آموزشها و مقالات دنیای چاپ سه بعدی و مدلسازی در اسپاگتی پرینت',
+    description: 'جدیدترین اخبار، آموزش‌ها و مقالات دنیای چاپ سه‌بعدی و مدل‌سازی در اسپاگتی پرینت',
     url: '/blog',
   });
 

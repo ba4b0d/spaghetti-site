@@ -9,7 +9,7 @@ const PHONE_DISPLAY = '0998 192 3856';
 export default function DigitalCard() {
   useSEO({
     title: 'کارت ویزیت دیجیتال اسپاگتی پرینت',
-    description: 'کارت ویزیت دیجیتال اسپاگتی پرینت — ارتباط مستقیم از تلگرام، اینستاگرام، بله و تماس تلفنی برای خدمات پرینت سه بعدی',
+    description: 'کارت ویزیت دیجیتال اسپاگتی پرینت — ارتباط مستقیم از تلگرام، اینستاگرام، بله و تماس تلفنی برای خدمات پرینت سه‌بعدی',
     url: '/card',
     jsonLd: buildOrganizationJsonLd(),
   });
@@ -56,12 +56,12 @@ export default function DigitalCard() {
           </h1>
           <div className="dcard-brand-sub">SPAGHETTI PRINT · 3D STUDIO</div>
           <p className="dcard-brand-desc">
-            خدمات تخصصی پرینت سه بعدی FDM · نمونهسازی سریع قطعات صنعتی و دکوراتیو · از ایده تا واقعیت، لایه به لایه
+            خدمات تخصصی پرینت سه‌بعدی FDM · نمونه‌سازی سریع قطعات صنعتی و دکوراتیو · از ایده تا واقعیت، لایه به لایه
           </p>
 
           <div className="dcard-meta-pills">
             <span className="dcard-meta-pill">📍 {contact.city} · ارسال سراسر کشور</span>
-            <span className="dcard-meta-pill">💎 دقت ۰.۰۸ تا ۰.۲۸ میلیمتر</span>
+            <span className="dcard-meta-pill">💎 دقت ۰.۰۸ تا ۰.۲۸ میلی‌متر</span>
             <span className="dcard-meta-pill">🛠️ فیلامنت PLA · PETG · ABS</span>
           </div>
         </div>
@@ -84,7 +84,7 @@ export default function DigitalCard() {
               </div>
               <div className="dcard-channel-text">
                 <div className="dcard-channel-title">ارسال فایل و پیام در تلگرام</div>
-                <div className="dcard-channel-sub">@{contact.telegram} · استعلام قیمت و ارسال فایل سه بعدی</div>
+                <div className="dcard-channel-sub">@{contact.telegram} · استعلام قیمت و ارسال فایل سه‌بعدی</div>
               </div>
             </div>
             <div className="dcard-channel-arrow">
@@ -99,7 +99,7 @@ export default function DigitalCard() {
               </div>
               <div className="dcard-channel-text">
                 <div className="dcard-channel-title">پیج رسمی اینستاگرام</div>
-                <div className="dcard-channel-sub">@{contact.instagram} · نمونه کارها و ویدیوهای چاپ</div>
+                <div className="dcard-channel-sub">@{contact.instagram} · نمونه‌کارها و ویدیو‌های چاپ</div>
               </div>
             </div>
             <div className="dcard-channel-arrow">
@@ -113,7 +113,7 @@ export default function DigitalCard() {
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" /></svg>
               </div>
               <div className="dcard-channel-text">
-                <div className="dcard-channel-title">ارتباط در پیامرسان بله</div>
+                <div className="dcard-channel-title">ارتباط در پیام‌رسان بله</div>
                 <div className="dcard-channel-sub">@{contact.bale} · پشتیبانی و سفارش مستقیم</div>
               </div>
             </div>
@@ -144,7 +144,7 @@ export default function DigitalCard() {
               </div>
               <div className="dcard-channel-text">
                 <div className="dcard-channel-title">سفارش قطعه اختصاصی / فایل دلخواه</div>
-                <div className="dcard-channel-sub">آپلود مدل سه بعدی و استعلام مستقیم قیمت</div>
+                <div className="dcard-channel-sub">آپلود مدل سه‌بعدی و استعلام مستقیم قیمت</div>
               </div>
             </div>
             <div className="dcard-channel-arrow">

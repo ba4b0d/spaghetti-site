@@ -195,7 +195,7 @@ export default function CatalogLayout({ children }) {
               </button>
 
               {megaOpen && (
-                <div id="catalog-mega-menu" className="mega-menu-panel" role="menu" aria-label="دستهبندی محصولات">
+                <div id="catalog-mega-menu" className="mega-menu-panel" role="menu" aria-label="دسته‌بندی محصولات">
                   <div className="mega-menu-inner">
                     {/* Search bar */}
                     <div className="mega-menu-search">

@@ -7,20 +7,20 @@ import { useSEO, buildWebSiteJsonLd, buildOrganizationJsonLd, buildFaqJsonLd } f
 
 const FAQ_ITEMS = [
   {
-    question: 'پرینت سه بعدی با چه متریالی انجام میشود و چقدر مقاوم است؟',
-    answer: 'محصولات اسپاگتی پرینت با فیلامنت درجه یک PLA (پلیلاکتیک اسید) تولید میشوند که بر پایه نیشکر و نشاسته ذرت بوده و کاملاً بدون بو، زیستسازگار و دارای استحکام مکانیکی بسیار بالا برای استفادههای دکوراتیو، فیگور و قطعات کاربردی است.',
+    question: 'پرینت سه‌بعدی با چه متریالی انجام می‌شود و چقدر مقاوم است؟',
+    answer: 'محصولات اسپاگتی پرینت با فیلامنت درجه یک PLA (پلی‌لاکتیک اسید) تولید می‌شوند که بر پایه نیشکر و نشاسته ذرت بوده و کاملاً بدون بو، زیست‌سازگار و دارای استحکام مکانیکی بسیار بالا برای استفاده‌های دکوراتیو، فیگور و قطعات کاربردی است.',
   },
   {
-    question: 'چگونه میتوانم فایل سه بعدی اختصاصی یا عکس قطعه شکسته را برای چاپ ارسال کنم؟',
-    answer: 'کافیست وارد صفحه «سفارش طرح دلخواه» شوید یا در تلگرام و پیامرسانها فایل مدل خود با فرمتهای STL، 3MF، OBJ یا عکس از زوایای مختلف قطعه را ارسال نمایید تا در کوتاهترین زمان برآورد وزن، زمان و قیمت انجام شود.',
+    question: 'چگونه می‌توانم فایل سه‌بعدی اختصاصی یا عکس قطعه شکسته را برای چاپ ارسال کنم؟',
+    answer: 'کافیست وارد صفحه «سفارش طرح دلخواه» شوید یا در تلگرام و پیام‌رسان‌ها فایل مدل خود با فرمت‌های STL، 3MF، OBJ یا عکس از زوایای مختلف قطعه را ارسال نمایید تا در کوتاه‌ترین زمان برآورد وزن، زمان و قیمت انجام شود.',
   },
   {
-    question: 'زمان آمادهسازی و ارسال سفارشات چقدر است؟',
-    answer: 'بسته به ابعاد قطعه و تعداد سفارش، محصولات کاتالوگ ظرف ۲۴ تا ۴۸ ساعت چاپ و آماده ارسال پستی به سراسر ایران میشوند. کلیه بستهها با محافظ ضدضربه ارسال میگردند.',
+    question: 'زمان آماده‌سازی و ارسال سفارشات چقدر است؟',
+    answer: 'بسته به ابعاد قطعه و تعداد سفارش، محصولات کاتالوگ ظرف ۲۴ تا ۴۸ ساعت چاپ و آماده ارسال پستی به سراسر ایران می‌شوند. کلیه بسته‌ها با محافظ ضدضربه ارسال می‌گردند.',
   },
   {
     question: 'آیا امکان تغییر رنگ یا حک اسم دلخواه روی محصولات وجود دارد؟',
-    answer: 'بله؛ تنوع گستردهای از رنگهای جذاب فیلامنت موجود است و در زمان ثبت سفارش میتوانید رنگ مورد نظرتان را انتخاب کنید یا درخواست درج اسم و نوشته دلخواه را ثبت نمایید.',
+    answer: 'بله؛ تنوع گسترده‌ای از رنگ‌های جذاب فیلامنت موجود است و در زمان ثبت سفارش می‌توانید رنگ مورد نظرتان را انتخاب کنید یا درخواست درج اسم و نوشته دلخواه را ثبت نمایید.',
   },
 ];
 
@@ -39,7 +39,7 @@ function FaqSection() {
             سؤالات متداول (FAQ)
           </h3>
           <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
-            پاسخ به سؤالات پرتکرار درباره چاپ سه بعدی و ثبت سفارش
+            پاسخ به سؤالات پرتکرار درباره چاپ سه‌بعدی و ثبت سفارش
           </p>
         </div>
         <span className="text-2xl select-none">❓</span>
@@ -93,7 +93,7 @@ function OrderProcessSection() {
           روند آسان و سریع
         </span>
         <h3 className="text-base sm:text-xl font-bold" style={{ color: 'var(--text-primary)' }}>
-          مراحل سفارش چاپ سه بعدی در اسپاگتی پرینت
+          مراحل سفارش چاپ سه‌بعدی در اسپاگتی پرینت
         </h3>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-5 sm:gap-6">
@@ -129,7 +129,7 @@ function OrderProcessSection() {
             چاپ دقیق و ارسال ایمن
           </h4>
           <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-            پرینت با دقت میکرونی، کنترل کیفیت نهایی و بستهبندی ضدضربه پستی.
+            پرینت با دقت میکرونی، کنترل کیفیت نهایی و بسته‌بندی ضدضربه پستی.
           </p>
         </div>
       </div>
@@ -724,13 +724,13 @@ export default function Catalog() {
 
   const seoTitle = bannerInfo
     ? `${bannerInfo.title} (${bannerInfo.kind}) — خرید و سفارش آنلاین`
-    : 'خدمات پرینت سه بعدی و کاتالوگ محصولات';
+    : 'خدمات پرینت سه‌بعدی و کاتالوگ محصولات';
 
   const seoDesc =
     bannerInfo?.desc ||
     (bannerInfo
-      ? `مشاهده و خرید آنلاین انواع محصولات ${bannerInfo.title} با تکنولوژی پرینت سه بعدی و قیمت شفاف در اسپاگتی پرینت.`
-      : 'اسپاگتی پرینت — خدمات آنلاین پرینت و چاپ سه بعدی سفارشی، ساخت قطعات و نمونه اولیه، کاتالوگ محصولات با قیمت شفاف');
+      ? `مشاهده و خرید آنلاین انواع محصولات ${bannerInfo.title} با تکنولوژی پرینت سه‌بعدی و قیمت شفاف در اسپاگتی پرینت.`
+      : 'اسپاگتی پرینت — خدمات آنلاین پرینت و چاپ سه‌بعدی سفارشی، ساخت قطعات و نمونه اولیه، کاتالوگ محصولات با قیمت شفاف');
 
   const jsonLd = useMemo(() => {
     return [
@@ -770,18 +770,18 @@ export default function Catalog() {
                   className="catalog-hero-title text-2xl sm:text-3xl lg:text-4xl font-bold mb-2.5 tracking-tight leading-[1.15]"
                   style={{ color: 'var(--text-primary)' }}
                 >
-                  خدمات پرینت سه بعدی و کاتالوگ محصولات
+                  خدمات پرینت سه‌بعدی و کاتالوگ محصولات
                 </h1>
                 <p className="text-xs sm:text-sm opacity-90 mt-1 max-w-xl" style={{ color: 'var(--text-secondary)' }}>
-                  سفارش آنلاین قطعات سفارشی با عکس یا STL + شخصیسازی کامل رنگ و ابعاد محصولات کاتالوگ
+                  سفارش آنلاین قطعات سفارشی با عکس یا STL + شخصی‌سازی کامل رنگ و ابعاد محصولات کاتالوگ
                 </p>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <span className="catalog-stat-pill catalog-stat-pill-on-photo">
-                    {loading ? 'پرینت آنلاین سه بعدی' : `${products.length} محصول`}
+                    {loading ? 'پرینت آنلاین سه‌بعدی' : `${products.length} محصول`}
                   </span>
                   {!loading && categories.length > 0 && (
                     <span className="catalog-stat-pill catalog-stat-pill-on-photo">
-                      {categories.length} دستهبندی
+                      {categories.length} دسته‌بندی
                     </span>
                   )}
                 </div>
@@ -805,14 +805,14 @@ export default function Catalog() {
           <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl flex items-center justify-center text-base sm:text-lg shrink-0" style={{ backgroundColor: 'rgba(255, 154, 61, 0.15)', color: 'var(--brand-orange-deep)' }}>✨</div>
           <div className="min-w-0">
             <h3 className="text-xs font-bold truncate" style={{ color: 'var(--text-primary)' }}>متریال درجه یک PLA</h3>
-            <p className="text-[11px] truncate mt-0.5" style={{ color: 'var(--text-muted)' }}>زیستسازگار و بدون بو</p>
+            <p className="text-[11px] truncate mt-0.5" style={{ color: 'var(--text-muted)' }}>زیست‌سازگار و بدون بو</p>
           </div>
         </div>
 
         <div className="card p-3 sm:p-3.5 flex items-center gap-3 rounded-2xl border transition-all hover:border-accent" style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}>
           <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl flex items-center justify-center text-base sm:text-lg shrink-0" style={{ backgroundColor: 'rgba(99, 102, 241, 0.12)', color: 'var(--accent)' }}>🎨</div>
           <div className="min-w-0">
-            <h3 className="text-xs font-bold truncate" style={{ color: 'var(--text-primary)' }}>شخصیسازی نامحدود</h3>
+            <h3 className="text-xs font-bold truncate" style={{ color: 'var(--text-primary)' }}>شخصی‌سازی نامحدود</h3>
             <p className="text-[11px] truncate mt-0.5" style={{ color: 'var(--text-muted)' }}>انتخاب رنگ، ابعاد و متن</p>
           </div>
         </div>
@@ -828,7 +828,7 @@ export default function Catalog() {
         <div className="card p-3 sm:p-3.5 flex items-center gap-3 rounded-2xl border transition-all hover:border-accent" style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}>
           <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl flex items-center justify-center text-base sm:text-lg shrink-0" style={{ backgroundColor: 'rgba(245, 158, 11, 0.15)', color: '#d97706' }}>📦</div>
           <div className="min-w-0">
-            <h3 className="text-xs font-bold truncate" style={{ color: 'var(--text-primary)' }}>بستهبندی ضدضربه</h3>
+            <h3 className="text-xs font-bold truncate" style={{ color: 'var(--text-primary)' }}>بسته‌بندی ضدضربه</h3>
             <p className="text-[11px] truncate mt-0.5" style={{ color: 'var(--text-muted)' }}>ارسال ایمن به سراسر کشور</p>
           </div>
         </div>
@@ -856,9 +856,9 @@ export default function Catalog() {
             value={sortBy}
             onChange={(e) => setSortBy(e.target.value)}
             className="select-field w-full sm:w-auto min-w-[160px]"
-            aria-label="مرتبسازی محصولات"
+            aria-label="مرتب‌سازی محصولات"
           >
-            <option value="name">مرتبسازی: نام</option>
+            <option value="name">مرتب‌سازی: نام</option>
             <option value="price_asc">قیمت ↑</option>
             <option value="price_desc">قیمت ↓</option>
             <option value="weight">وزن</option>
@@ -910,7 +910,7 @@ export default function Catalog() {
         {collections.length > 0 && (
           <div className="flex flex-col gap-3">
             <h2 className="text-sm font-bold flex items-center gap-1.5" style={{ color: '#ffffff' }}>
-              <span>📦 کالکشنها / مجموعهها</span>
+              <span>📦 کالکشن‌ها / مجموعه‌ها</span>
             </h2>
             {/* One row: slow auto-scroll loop, pauses on hover/interaction, and the
                 user can always scroll it manually (wheel / drag / scrollbar / touch). */}
@@ -992,7 +992,7 @@ export default function Catalog() {
             محصولی یافت نشد
           </p>
           <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
-            فیلترها یا عبارت جستجو را بررسی کنید. شاید دستهبندی یا نام دیگری مد نظرتان باشد.
+            فیلترها یا عبارت جستجو را بررسی کنید. شاید دسته‌بندی یا نام دیگری مد نظرتان باشد.
           </p>
           <Link
             to="/contact"

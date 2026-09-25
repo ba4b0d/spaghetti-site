@@ -8,7 +8,7 @@ describe('PageLoader', () => {
     const { container } = render(<PageLoader />);
 
     expect(screen.getByText('اسپاگتی پرینت')).toBeTruthy();
-    expect(screen.getByText('در حال آمادهسازی چاپ سه بعدی شما')).toBeTruthy();
+    expect(screen.getByText('در حال آماده‌سازی چاپ سه‌بعدی شما')).toBeTruthy();
     expect(container.querySelector('.spaghetti-loader__printer')).toBeTruthy();
   });
 });

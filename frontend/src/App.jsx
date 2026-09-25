@@ -52,7 +52,7 @@ export function PageLoader() {
         </div>
         <p className="spaghetti-loader__eyebrow">SPAGHETTI PRINT</p>
         <h1>اسپاگتی پرینت</h1>
-        <p className="spaghetti-loader__message">در حال آمادهسازی چاپ سه بعدی شما</p>
+        <p className="spaghetti-loader__message">در حال آماده‌سازی چاپ سه‌بعدی شما</p>
         <div className="spaghetti-loader__progress" aria-hidden="true"><span /></div>
       </div>
     </main>

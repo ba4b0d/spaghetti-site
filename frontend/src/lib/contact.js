@@ -31,7 +31,7 @@ export const CHANNELS = [
   {
     id: 'instagram',
     label: 'اینستاگرام',
-    hint: 'نمونه کارها و دایرکت',
+    hint: 'نمونه‌کارها و دایرکت',
     handle: '@YOUR_INSTAGRAM',
     href: 'https://instagram.com/YOUR_INSTAGRAM',
     color: '#E4405F',
