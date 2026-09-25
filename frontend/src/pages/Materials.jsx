@@ -284,7 +284,7 @@ export default function Materials() {
                           className={`p-2 rounded-lg transition-colors ${
                             m.is_default ? 'text-amber-400 bg-amber-500/10' : 'text-slate-400 hover:text-amber-400 hover:bg-slate-800'
                           }`}
-                          title={m.is_default ? 'فیلامنت پیش‌فرض است' : 'تنظیم به عنوان فیلامنت پیش‌فرض'}
+                          title={m.is_default ? 'فیلامنت پیش‌فرض است' : 'تنظیم به‌عنوان فیلامنت پیش‌فرض'}
                         >
                           <Star size={14} className={m.is_default ? 'fill-amber-400' : ''} />
                         </button>

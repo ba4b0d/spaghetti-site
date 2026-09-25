@@ -22,7 +22,7 @@ export const CHANNELS = [
   },
   {
     id: 'whatsapp',
-    label: 'واتساپ',
+    label: 'واتس‌اپ',
     hint: 'پیام و عکس محصول / فایل',
     handle: '09XXXXXXXXX',
     href: 'https://wa.me/989XXXXXXXXX',

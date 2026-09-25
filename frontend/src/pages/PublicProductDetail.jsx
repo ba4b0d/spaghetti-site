@@ -329,9 +329,9 @@ export default function PublicProductDetail() {
     product?.category ||
     'پرینت سه‌بعدی';
 
-  // High-CTR SEO Title Formula: e.g. "خرید فیگور دناتلو لاکپشتهای نینجا ۳ بعدی + انتخاب رنگ"
+  // High-CTR SEO Title Formula: e.g. "خرید فیگور دناتلو لاکپشتهای نینجا ۳‌بعدی + انتخاب رنگ"
   const seoTitle = productName
-    ? `خرید ${productName} (${categoryOrColl}) ۳ بعدی + انتخاب رنگ`
+    ? `خرید ${productName} (${categoryOrColl}) ۳‌بعدی + انتخاب رنگ`
     : undefined;
 
   // High-CTR SEO Description: Preserves your custom notes, with rich fallback

@@ -119,7 +119,7 @@ export default function BlogList() {
             <BookOpen size={28} />
           </div>
           <h3 className="text-lg font-bold text-white mb-2">هنوز مقاله‌ای منتشر نشده است</h3>
-          <p className="text-sm text-slate-400">به زودی مقالات جدیدی در این بخش اضافه خواهند شد.</p>
+          <p className="text-sm text-slate-400">به‌زودی مقالات جدیدی در این بخش اضافه خواهند شد.</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">

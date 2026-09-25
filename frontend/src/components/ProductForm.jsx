@@ -267,7 +267,7 @@ export default function ProductForm({ initialData, onSubmit, onCancel, submitLab
       </div>
 
       <FormField label="محتویات بسته (تعداد / اقلام)" name="package_info" value={form.package_info || ''} onChange={handleChange}>
-        <input type="text" name="package_info" value={form.package_info || ''} onChange={handleChange} className="input-field" placeholder="مثلاً: ۱ عدد یا ۶ عدد به همراه نگهدارنده" />
+        <input type="text" name="package_info" value={form.package_info || ''} onChange={handleChange} className="input-field" placeholder="مثلاً: ۱ عدد یا ۶ عدد به‌همراه نگهدارنده" />
       </FormField>
 
       <FormField label="توضیحات و سئو" name="notes" value={form.notes} onChange={handleChange}>
