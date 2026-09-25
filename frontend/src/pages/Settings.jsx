@@ -174,6 +174,7 @@ export default function Settings() {
 
   const contactFields = [
     { key: 'contact_brand', label: 'نام برند', icon: '🏷️', stringField: true },
+    { key: 'contact_phone', label: 'شماره تماس تلفنی', icon: '📞', stringField: true, hint: 'مثال: 09981923856' },
     { key: 'contact_telegram', label: 'تلگرام', icon: '✈️', stringField: true, hint: 'نام کاربری مثل @username' },
     { key: 'contact_instagram', label: 'اینستاگرام', icon: '📷', stringField: true, hint: 'نام کاربری مثل @username' },
     { key: 'contact_bale', label: 'بله', icon: '💬', stringField: true, hint: 'نام کاربری مثل @username' },

@@ -18,6 +18,7 @@ ALLOWED_PUBLIC_KEYS = {
     "site_title",
     "enable_blog",
     "contact_brand",
+    "contact_phone",
     "contact_telegram",
     "contact_whatsapp",
     "contact_instagram",
@@ -162,6 +163,7 @@ async def upload_branding_asset(request: Request, key: str, file: UploadFile = F
 
 CONTACT_KEYS = [
     "contact_brand",
+    "contact_phone",
     "contact_telegram",
     "contact_whatsapp",
     "contact_instagram",

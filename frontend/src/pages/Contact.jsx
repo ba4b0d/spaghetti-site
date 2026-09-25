@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { MessageCircle, Send, Camera, ExternalLink, ClipboardList } from 'lucide-react';
+import { MessageCircle, Send, Camera, Phone, ExternalLink, ClipboardList } from 'lucide-react';
 import { CONTACT, CHANNELS, displayChannels } from '../lib/contact';
 import { getContact } from '../lib/api';
 import { useSEO, buildOrganizationJsonLd } from '../lib/seo';
 
 const ICONS = {
+  phone: Phone,
   telegram: Send,
   instagram: Camera,
   bale: MessageCircle,
@@ -21,7 +22,13 @@ function mergeChannels(api) {
     // Build href and handle based on channel type
     let href = ch.href;
     let handle = ch.handle;
-    if (ch.id === 'telegram') {
+    if (ch.id === 'phone') {
+      const clean = value.replace(/\s+/g, '');
+      const rawDigits = value.replace(/[^0-9]/g, '');
+      handle = value;
+      const intl = rawDigits.startsWith('98') ? `+${rawDigits}` : rawDigits.startsWith('0') ? `+98${rawDigits.slice(1)}` : `+98${rawDigits}`;
+      href = `tel:${clean.startsWith('+') ? clean : intl}`;
+    } else if (ch.id === 'telegram') {
       const clean = value.replace(/^@/, '');
       handle = `@${clean}`;
       href = `https://t.me/${clean}`;
@@ -41,7 +48,7 @@ function mergeChannels(api) {
 export default function Contact() {
   useSEO({
     title: 'تماس با ما',
-    description: 'راههای ارتباط با اسپاگتی پرینت — تلگرام، اینستاگرام، بله',
+    description: 'راههای ارتباط با اسپاگتی پرینت — تماس تلفنی، تلگرام، اینستاگرام، بله',
     url: '/contact',
     jsonLd: buildOrganizationJsonLd(),
   });
@@ -85,12 +92,13 @@ export default function Contact() {
         {channels.map((ch) => {
           const Icon = ICONS[ch.id] || MessageCircle;
           const isPlaceholder = ch.href.includes('YOUR_') || ch.href.includes('XXXX');
+          const isPhone = ch.id === 'phone';
           return (
             <a
               key={ch.id}
               href={isPlaceholder ? undefined : ch.href}
-              target={isPlaceholder ? undefined : '_blank'}
-              rel={isPlaceholder ? undefined : 'noopener noreferrer'}
+              target={isPlaceholder || isPhone ? undefined : '_blank'}
+              rel={isPlaceholder || isPhone ? undefined : 'noopener noreferrer'}
               className={`contact-card${isPlaceholder ? ' contact-card--soon' : ''}`}
               style={{ '--ch-color': ch.color }}
               aria-disabled={isPlaceholder || undefined}
@@ -106,11 +114,11 @@ export default function Contact() {
                 </div>
                 <p className="contact-card-hint">{ch.hint}</p>
                 {isPlaceholder ? (
-                  <span className="contact-card-cta">به‌زودی — لینک را در تنظیمات پر کنید</span>
+                  <span className="contact-card-cta">بهزودی — لینک را در تنظیمات پر کنید</span>
                 ) : (
                   <span className="contact-card-cta">
-                    باز کردن
-                    <ExternalLink size={12} />
+                    {isPhone ? 'برقراری تماس' : 'باز کردن'}
+                    {isPhone ? <Phone size={12} /> : <ExternalLink size={12} />}
                   </span>
                 )}
               </div>

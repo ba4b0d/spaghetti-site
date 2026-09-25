@@ -13,6 +13,14 @@ export const CONTACT = {
 /** @type {{ id: string, label: string, hint: string, href: string, handle: string, color: string }[]} */
 export const CHANNELS = [
   {
+    id: 'phone',
+    label: 'تماس تلفنی',
+    hint: 'پاسخگویی مستقیم در ساعات کاری',
+    handle: '0998 192 3856',
+    href: 'tel:+989981923856',
+    color: '#10B981',
+  },
+  {
     id: 'telegram',
     label: 'تلگرام',
     hint: 'سریعترین راه برای استعلام و ارسال فایل',
