@@ -16,6 +16,7 @@ import {
   Wallet,
   ShoppingBag,
   Eye,
+  CalendarDays,
 } from 'lucide-react';
 import { getStats, getProducts, getSettings } from '../lib/api';
 import { formatPrice } from '../lib/utils';
@@ -118,6 +119,184 @@ function StatusBadge({ active }) {
     >
       پیش‌نویس
     </span>
+  );
+}
+
+const numberFormat = new Intl.NumberFormat('fa-IR');
+const persianDate = (val) =>
+  new Date(`${val}T12:00:00`).toLocaleDateString('fa-IR', { month: 'short', day: 'numeric' });
+
+function SiteAnalyticsSection({ stats }) {
+  const [period, setPeriod] = useState('daily');
+  const points = (period === 'daily' ? stats?.site_views_daily : stats?.site_views_weekly) || [];
+  const max = Math.max(...points.map((p) => p.views), 1);
+  const labels =
+    period === 'daily'
+      ? points.map((p) => persianDate(p.date))
+      : points.map((p) => `هفته ${persianDate(p.week_start)}`);
+  const topContent = stats?.site_top_content || [];
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-0.5">
+        <div>
+          <h3 className="text-sm font-semibold flex items-center gap-2" style={{ color: '#ffffff' }}>
+            <Eye size={16} style={{ color: 'var(--accent)' }} />
+            بازدید سایت (عمومی)
+          </h3>
+          <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+            ثبت بدون اطلاعات هویتی و کوکی · محاسبه بر اساس منطقه زمانی تهران
+          </p>
+        </div>
+        <div
+          className="flex p-1 rounded-xl self-start sm:self-auto"
+          style={{ backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)' }}
+        >
+          <button
+            type="button"
+            onClick={() => setPeriod('daily')}
+            className="px-3 py-1 text-xs rounded-lg font-medium transition-colors"
+            style={{
+              backgroundColor: period === 'daily' ? 'var(--accent)' : 'transparent',
+              color: period === 'daily' ? '#000000' : 'var(--text-secondary)',
+              fontWeight: period === 'daily' ? '700' : '500',
+            }}
+          >
+            روزانه (۷ روز)
+          </button>
+          <button
+            type="button"
+            onClick={() => setPeriod('weekly')}
+            className="px-3 py-1 text-xs rounded-lg font-medium transition-colors"
+            style={{
+              backgroundColor: period === 'weekly' ? 'var(--accent)' : 'transparent',
+              color: period === 'weekly' ? '#000000' : 'var(--text-secondary)',
+              fontWeight: period === 'weekly' ? '700' : '500',
+            }}
+          >
+            هفتگی (۸ هفته)
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <KpiCard
+          label="بازدید امروز"
+          value={numberFormat.format(stats?.site_views_today ?? 0)}
+          hint="از ساعت ۰۰:۰۰ به وقت تهران"
+          icon={Eye}
+        />
+        <KpiCard
+          label="بازدید این هفته"
+          value={numberFormat.format(stats?.site_views_week ?? 0)}
+          hint="از ابتدای هفته جاری"
+          icon={CalendarDays}
+        />
+        <KpiCard
+          label="کل بازدیدهای ثبت‌شده"
+          value={numberFormat.format(stats?.site_views_total ?? 0)}
+          hint="از زمان فعال‌سازی قابلیت"
+          icon={BarChart3}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+        {/* Chart */}
+        <section className="lg:col-span-8 card p-5 flex flex-col justify-between gap-4">
+          <div className="flex items-center justify-between">
+            <h4 className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
+              {period === 'daily' ? 'روند بازدید روزانه' : 'روند بازدید هفتگی'}
+            </h4>
+            <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+              بیشترین: {numberFormat.format(Math.max(...points.map((p) => p.views), 0))} بازدید
+            </span>
+          </div>
+
+          <div className="space-y-2">
+            <div
+              className="h-40 flex items-end gap-2 pt-6 pb-1 border-b"
+              style={{ borderColor: 'var(--border-color)' }}
+              dir="ltr"
+            >
+              {points.map((pt, idx) => (
+                <div key={idx} className="h-full flex-1 flex flex-col justify-end group relative items-center">
+                  <div
+                    className="w-full max-w-[40px] rounded-t transition-all"
+                    style={{
+                      height: `${Math.max((pt.views / max) * 100, 4)}%`,
+                      backgroundColor: pt.views > 0 ? 'var(--accent)' : 'var(--bg-tertiary)',
+                      opacity: pt.views > 0 ? 0.9 : 0.4,
+                    }}
+                    title={`${labels[idx]}: ${numberFormat.format(pt.views)} بازدید`}
+                  />
+                  <span
+                    className="absolute -top-6 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] px-1.5 py-0.5 rounded pointer-events-none whitespace-nowrap z-10 font-bold"
+                    style={{
+                      backgroundColor: 'var(--bg-tertiary)',
+                      color: 'var(--text-primary)',
+                      border: '1px solid var(--border-color)',
+                    }}
+                  >
+                    {numberFormat.format(pt.views)}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div
+              className="grid text-[10px]"
+              style={{ gridTemplateColumns: `repeat(${Math.max(labels.length, 1)}, minmax(0, 1fr))` }}
+              dir="ltr"
+            >
+              {labels.map((lbl, i) => (
+                <span key={i} className="truncate text-center" style={{ color: 'var(--text-muted)' }} title={lbl}>
+                  {lbl}
+                </span>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Top Content */}
+        <section className="lg:col-span-4 card p-5 flex flex-col justify-between gap-3">
+          <div>
+            <h4 className="text-xs font-semibold mb-3" style={{ color: 'var(--text-primary)' }}>
+              پربازدیدترین صفحات و محصولات
+            </h4>
+            {topContent.length === 0 ? (
+              <EmptyState icon={Eye} text="هنوز بازدیدی ثبت نشده است" sub="بازدیدهای جدید به مرور اضافه می‌شوند" />
+            ) : (
+              <div className="space-y-2">
+                {topContent.map((item, idx) => (
+                  <div
+                    key={idx}
+                    className="p-2.5 rounded-xl flex items-center justify-between gap-2 text-xs"
+                    style={{ backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)' }}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="font-semibold truncate" dir="ltr" style={{ color: 'var(--text-primary)' }}>
+                        {item.path}
+                      </p>
+                      <p className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                        {item.content_type === 'product'
+                          ? 'محصول'
+                          : item.content_type === 'home'
+                          ? 'صفحه اصلی'
+                          : item.content_type === 'blog'
+                          ? 'وبلاگ'
+                          : 'صفحه'}
+                      </p>
+                    </div>
+                    <span className="shrink-0 font-bold text-xs" style={{ color: 'var(--accent)' }}>
+                      {numberFormat.format(item.views)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
   );
 }
 
@@ -238,6 +417,9 @@ export default function Dashboard() {
           icon={Package}
         />
       </div>
+
+      {/* Site view analytics (daily/weekly) */}
+      <SiteAnalyticsSection stats={stats} />
 
       {/* Shop ops this month — board B, not accounting */}
       <div className="space-y-2">

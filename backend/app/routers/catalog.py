@@ -1,16 +1,50 @@
 """Public catalog — no auth required."""
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import Response
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
-from app.models import Product
+from app.models import Product, SiteView
 from app.calculator import calculate_product_costs_from_dicts
 from app.cache import get_settings_dict
 
 router = APIRouter(prefix="/api/v1", tags=["catalog"])
+
+
+class SiteViewCreate(BaseModel):
+    path: str
+
+    @field_validator("path")
+    @classmethod
+    def validate_public_path(cls, value: str) -> str:
+        normalized = value.split("?", 1)[0].split("#", 1)[0]
+        parts = [part for part in normalized.split("/") if part]
+        if not normalized.startswith("/") or len(normalized) > 500:
+            raise ValueError("Only public paths can be tracked")
+        if parts and parts[0] in {"dashboard", "login", "admin", "products", "orders", "settings", "users", "audit"}:
+            raise ValueError("Only public paths can be tracked")
+        return normalized
+
+
+@router.post("/analytics/view", status_code=status.HTTP_204_NO_CONTENT)
+def record_site_view(payload: SiteViewCreate, db: Session = Depends(get_db)):
+    """Record one public SPA page load without collecting personal data."""
+    parts = [part for part in payload.path.split("/") if part]
+    content_type, content_slug = ("home", None) if not parts else ("page", None)
+    if len(parts) == 2 and parts[0] == "catalog":
+        content_type, content_slug = "product", parts[1]
+    elif len(parts) == 2 and parts[0] == "blog":
+        content_type, content_slug = "blog", parts[1]
+    elif parts == ["blog"]:
+        content_type = "blog_index"
+    elif len(parts) == 2 and parts[0] in {"collection", "collections"}:
+        content_type, content_slug = "collection", parts[1]
+    db.add(SiteView(path=payload.path, content_type=content_type, content_slug=content_slug))
+    db.commit()
+
 
 
 def _to_farsi_num(val) -> str:

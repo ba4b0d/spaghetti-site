@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState, useRef } from 'react';
-import { Link, NavLink, useNavigate } from 'react-router-dom';
+import { Link, NavLink, useNavigate, useLocation } from 'react-router-dom';
 import { Menu, X, ChevronDown, Search } from 'lucide-react';
 import { Z_INDEX_STICKY } from '../lib/constants';
 import BrandLogo from './BrandLogo';
-import { getBlogPosts, getCatalogCategories, getPublicBrand } from '../lib/api';
+import { getBlogPosts, getCatalogCategories, getPublicBrand, recordSiteView } from '../lib/api';
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
@@ -26,6 +26,7 @@ const drawerLinkClass = ({ isActive }) =>
   `catalog-drawer-link${isActive ? ' catalog-drawer-link--active' : ''}`;
 
 export default function CatalogLayout({ children }) {
+  const location = useLocation();
   // NOTE: this layout does NOT call useSEO — individual child pages set their
   //       own SEO title/description/canonical. The inline <script> in index.html
   //       provides a synchronous fallback canonical tag on every page load.
@@ -57,6 +58,10 @@ export default function CatalogLayout({ children }) {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    recordSiteView(location.pathname).catch(() => {});
+  }, [location.pathname]);
 
   const closeMenu = useCallback(() => setMenuOpen(false), []);
 
