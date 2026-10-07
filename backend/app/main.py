@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.database import engine, SessionLocal, Base
-from app.models import Settings, Machine, Material, Product, Category, ProductImage, Order, ProductCategory, BlogPost
+from app.models import Settings, Machine, Material, Product, Category, ProductImage, Order, ProductCategory, BlogPost, SiteView
 from app.seed import seed_all
 from fastapi import HTTPException
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -179,6 +179,10 @@ async def lifespan(app: FastAPI):
             print("Creating audit_logs table...")
             from app.models import AuditLog
             AuditLog.__table__.create(bind=engine)
+        if "site_views" not in inspector.get_table_names():
+            print("Creating site_views table...")
+            from app.models import SiteView
+            SiteView.__table__.create(bind=engine)
 
         # Always sync: move any products with old category string but no m2m association
         from app.models import ProductCategory

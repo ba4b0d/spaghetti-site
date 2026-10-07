@@ -9,12 +9,14 @@ Also returns KISS shop-ops monthly order totals (not accounting).
 Results are cached in-memory for 60 seconds.
 """
 import time
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models import Product, Material, Machine, Order
+from app.models import Product, Material, Machine, Order, SiteView
 from app.cache import get_settings_dict
 from app.calculator import calculate_product_costs_from_values
 
@@ -25,6 +27,7 @@ _STATS_TTL = 60  # seconds
 _stats_cache: dict = {}
 
 _OPEN_STATUSES = frozenset({"new", "quoted", "printing", "ready"})
+TEHRAN = ZoneInfo("Asia/Tehran")
 
 
 def _invalidate_stats_cache():
@@ -94,6 +97,40 @@ def _order_ops_stats(db: Session) -> dict:
         "orders_open": open_count,
         "orders_month": month,
         "orders_year": year,
+    }
+
+
+def _site_view_stats(db: Session, now: datetime | None = None) -> dict:
+    """Privacy-safe public-site analytics, grouped by Asia/Tehran calendar."""
+    current = (now or datetime.now(timezone.utc)).astimezone(TEHRAN)
+    events = db.query(SiteView).all()
+
+    def local_date(event: SiteView):
+        value = event.created_at
+        if value.tzinfo is None:  # SQLite returns naive UTC datetimes.
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(TEHRAN).date()
+
+    today = current.date()
+    week_start = today - timedelta(days=today.weekday())
+    daily_dates = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
+    weekly_starts = [week_start - timedelta(weeks=offset) for offset in range(7, -1, -1)]
+    daily_counts = Counter(local_date(event) for event in events)
+    weekly_counts = Counter(
+        local_date(event) - timedelta(days=local_date(event).weekday()) for event in events
+    )
+    top_content = Counter((event.path, event.content_type, event.content_slug) for event in events)
+
+    return {
+        "site_views_today": daily_counts[today],
+        "site_views_week": sum(1 for event in events if local_date(event) >= week_start),
+        "site_views_total": len(events),
+        "site_views_daily": [{"date": day.isoformat(), "views": daily_counts[day]} for day in daily_dates],
+        "site_views_weekly": [{"week_start": day.isoformat(), "views": weekly_counts[day]} for day in weekly_starts],
+        "site_top_content": [
+            {"path": path, "content_type": content_type, "content_slug": content_slug, "views": views}
+            for (path, content_type, content_slug), views in top_content.most_common(5)
+        ],
     }
 
 
@@ -227,6 +264,7 @@ def get_stats(db: Session = Depends(get_db)):
 
     order_ops = _order_ops_stats(db)
     insights = _insights(db)
+    site_views = _site_view_stats(db)
 
     result = {
         "total_products": total_products,
@@ -239,6 +277,7 @@ def get_stats(db: Session = Depends(get_db)):
         "products_per_category": categories,
         **order_ops,
         **insights,
+        **site_views,
     }
 
     _stats_cache["stats"] = {"data": result, "ts": now}

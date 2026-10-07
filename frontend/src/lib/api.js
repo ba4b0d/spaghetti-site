@@ -100,6 +100,7 @@ export const getCatalogCategories = (config) => publicApi.get('/catalog/categori
 export const getCatalogCollections = (config) => publicApi.get('/catalog/collections', config);
 export const getCatalogProduct = (productId, config) => publicApi.get(`/catalog/${productId}`, config);
 export const getCatalogProductBySlug = (slug, config) => publicApi.get(`/catalog/by-slug/${slug}`, config);
+export const recordSiteView = (path) => publicApi.post('/analytics/view', { path });
 export const getBlogPosts = (config) => publicApi.get('/blog', config);
 export const getBlogPostBySlug = (slug, config) => publicApi.get(`/blog/${slug}`, config);
 

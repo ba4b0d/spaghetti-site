@@ -272,6 +272,17 @@ class ProductView(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
+class SiteView(Base):
+    """Minimal public-site view event; deliberately contains no visitor identity."""
+    __tablename__ = "site_views"
+
+    id = Column(Integer, primary_key=True, index=True)
+    path = Column(String(500), nullable=False, index=True)
+    content_type = Column(String(32), nullable=False, default="page")
+    content_slug = Column(String(255), nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+
+
 class AuditLog(Base):
     """Who changed what — products, orders, settings, collections."""
     __tablename__ = "audit_logs"
