@@ -449,27 +449,52 @@ export default function CatalogLayout({ children }) {
         {children}
       </main>
 
-      <footer className="relative border-t py-7 catalog-footer" style={{ borderColor: 'var(--border-color)' }}>
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs">
-          <div className="text-center sm:text-right catalog-footer-copy">
-            <span className="opacity-95">© Spaghettiprints · اسپاگتی پرینت</span>
-            <span className="mx-2 opacity-50">·</span>
-            <span>کاتالوگ محصولات چاپ سه‌بعدی</span>
-            <span className="mx-2 opacity-50">·</span>
-            <span aria-hidden="true">✨</span>
-            <span className="mx-1 opacity-50">·</span>
-            <span>قدرت گرفته از ایده و خیال ما</span>
+      <footer className="relative border-t py-8 catalog-footer" style={{ borderColor: 'var(--border-color)' }}>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 flex flex-col md:flex-row items-center justify-between gap-6 text-xs">
+          <div className="text-center sm:text-right catalog-footer-copy space-y-1">
+            <div className="font-medium text-white/90">
+              <span>© Spaghettiprints · اسپاگتی پرینت</span>
+              <span className="mx-2 opacity-40">·</span>
+              <span>کاتالوگ محصولات چاپ سهبعدی</span>
+            </div>
+            <div className="text-white/60">
+              <span>قدرت گرفته از ایده و خیال ما</span>
+              <span className="mx-1" aria-hidden="true">✨</span>
+            </div>
           </div>
-          <nav className="flex flex-wrap items-center justify-center gap-3" aria-label="پاورقی">
-            <Link to="/" className="catalog-footer-link">کاتالوگ</Link>
-            {blogEnabled && <Link to="/blog" className="catalog-footer-link">وبلاگ</Link>}
-            <Link to="/how-to-order" className="catalog-footer-link">سفارش از کاتالوگ</Link>
-            <Link to="/custom-order" className="catalog-footer-link">سفارش طرح دلخواه</Link>
-            <Link to="/contact" className="catalog-footer-link">تماس با ما</Link>
-            <Link to="/card" className="catalog-footer-link">کارت ویزیت</Link>
-            <Link to="/privacy" className="catalog-footer-link">حریم خصوصی</Link>
-            <Link to="/terms" className="catalog-footer-link">قوانین</Link>
-          </nav>
+
+          <div className="flex flex-col sm:flex-row items-center gap-5">
+            <nav className="flex flex-wrap items-center justify-center gap-3" aria-label="پاورقی">
+              <Link to="/" className="catalog-footer-link">کاتالوگ</Link>
+              {blogEnabled && <Link to="/blog" className="catalog-footer-link">وبلاگ</Link>}
+              <Link to="/how-to-order" className="catalog-footer-link">سفارش از کاتالوگ</Link>
+              <Link to="/custom-order" className="catalog-footer-link">سفارش طرح دلخواه</Link>
+              <Link to="/contact" className="catalog-footer-link">تماس با ما</Link>
+              <Link to="/card" className="catalog-footer-link">کارت ویزیت</Link>
+              <Link to="/privacy" className="catalog-footer-link">حریم خصوصی</Link>
+              <Link to="/terms" className="catalog-footer-link">قوانین</Link>
+            </nav>
+
+            {/* Enamad Trust Badge */}
+            <div className="shrink-0 flex items-center justify-center p-1.5 bg-white/95 rounded-xl border border-white/20 shadow-sm hover:shadow-md transition-all">
+              <a
+                referrerPolicy="origin"
+                target="_blank"
+                rel="noreferrer"
+                href="https://trustseal.enamad.ir/?id=8105853&Code=IdFwUsVT9E4CUh6JfYYzMmF1pN7Sf18z"
+                title="نماد اعتماد الکترونیکی اسپاگتی پرینت"
+                className="block"
+              >
+                <img
+                  referrerPolicy="origin"
+                  src="https://trustseal.enamad.ir/logo.aspx?id=8105853&Code=IdFwUsVT9E4CUh6JfYYzMmF1pN7Sf18z"
+                  alt="نماد اعتماد الکترونیکی"
+                  style={{ cursor: 'pointer', width: '65px', height: '65px', objectFit: 'contain' }}
+                  code="IdFwUsVT9E4CUh6JfYYzMmF1pN7Sf18z"
+                />
+              </a>
+            </div>
+          </div>
         </div>
       </footer>
     </div>
