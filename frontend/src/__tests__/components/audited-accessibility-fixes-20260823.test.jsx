@@ -28,6 +28,7 @@ vi.mock('../../lib/api', () => ({
   getCatalogCategories: testState.api.getCatalogCategories,
   getPublicBrand: testState.api.getPublicBrand,
   getBlogPosts: vi.fn(),
+  recordSiteView: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock('../../lib/seo', () => ({

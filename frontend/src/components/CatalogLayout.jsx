@@ -3,7 +3,7 @@ import { Link, NavLink, useNavigate, useLocation } from 'react-router-dom';
 import { Menu, X, ChevronDown, Search } from 'lucide-react';
 import { Z_INDEX_STICKY } from '../lib/constants';
 import BrandLogo from './BrandLogo';
-import { getBlogPosts, getCatalogCategories, getPublicBrand, recordSiteView } from '../lib/api';
+import { getCatalogCategories, getPublicBrand, recordSiteView } from '../lib/api';
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
