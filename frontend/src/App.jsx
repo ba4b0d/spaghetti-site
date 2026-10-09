@@ -16,6 +16,7 @@ const Machines = lazy(() => import('./pages/Machines'));
 const Settings = lazy(() => import('./pages/Settings'));
 const Calculator = lazy(() => import('./pages/Calculator'));
 const Catalog = lazy(() => import('./pages/Catalog'));
+const CheckoutRequest = lazy(() => import('./pages/CheckoutRequest'));
 const PublicProductDetail = lazy(() => import('./pages/PublicProductDetail'));
 const Contact = lazy(() => import('./pages/Contact'));
 const HowToOrder = lazy(() => import('./pages/HowToOrder'));
@@ -87,6 +88,8 @@ function AppRoutes() {
                 <Route path="/collection/:tag" element={<CatalogLayout><Catalog /></CatalogLayout>} />
                 <Route path="/collections/:tag" element={<CatalogLayout><Catalog /></CatalogLayout>} />
                 <Route path="/catalog/:slug" element={<CatalogLayout><PublicProductDetail /></CatalogLayout>} />
+                <Route path="/checkout" element={<CatalogLayout><CheckoutRequest /></CatalogLayout>} />
+                <Route path="/cart" element={<CatalogLayout><CheckoutRequest /></CatalogLayout>} />
                 <Route path="/contact" element={<CatalogLayout><Contact /></CatalogLayout>} />
                 <Route path="/card" element={<DigitalCard />} />
                 <Route path="/how-to-order" element={<CatalogLayout><HowToOrder /></CatalogLayout>} />

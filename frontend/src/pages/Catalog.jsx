@@ -1,8 +1,9 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { Search, Package, Clock, Weight, Layers, ChevronLeft, ChevronRight, Ruler, Send } from 'lucide-react';
+import { Search, Package, Clock, Weight, Layers, ChevronLeft, ChevronRight, Ruler, Send, ShoppingCart } from 'lucide-react';
 import { getCatalog, getCatalogCategories, getCatalogCollections } from '../lib/api';
 import { formatPrice, formatMinutes } from '../lib/utils';
+import { addItem } from '../lib/cart';
 import { useSEO, buildWebSiteJsonLd, buildOrganizationJsonLd, buildFaqJsonLd } from '../lib/seo';
 
 const FAQ_ITEMS = [
@@ -423,7 +424,19 @@ export default function Catalog() {
   const [activeTag, setActiveTag] = useState(() => routeTag || searchParams.get('tag') || null);
   const [sortBy, setSortBy] = useState('name');
   const [visibleCount, setVisibleCount] = useState(INITIAL_BATCH);
+  const [justAdded, setJustAdded] = useState(null);
   const loadMoreRef = useRef(null);
+  const addTimerRef = useRef(null);
+
+  // Add the product to the persisted cart (ids + qty only; no prices stored).
+  const handleAddToCart = useCallback((productId) => {
+    addItem(productId, 1);
+    setJustAdded(productId);
+    window.clearTimeout(addTimerRef.current);
+    addTimerRef.current = window.setTimeout(() => setJustAdded(null), 1600);
+  }, []);
+
+  useEffect(() => () => window.clearTimeout(addTimerRef.current), []);
 
   // Products section wrapper — scroll target when a collection/category is selected
   const productsSectionRef = useRef(null);
@@ -1153,6 +1166,24 @@ export default function Catalog() {
                     </div>
                   </div>
                 </Link>
+
+                {/* Add to cart — sibling of the Link (interactive elements must not nest) */}
+                {!isBundle && product.id ? (
+                  <button
+                    type="button"
+                    className="absolute bottom-4 left-14 z-[2] inline-flex items-center gap-1 px-2.5 py-1.5 rounded-full text-[11px] font-bold border shadow-sm transition-colors"
+                    style={{
+                      backgroundColor: 'var(--bg-card)',
+                      borderColor: 'var(--border-color)',
+                      color: 'var(--accent)',
+                    }}
+                    aria-label={`افزودن ${displayName(product.name)} به سبد خرید`}
+                    onClick={() => handleAddToCart(product.id)}
+                  >
+                    <ShoppingCart size={13} />
+                    {justAdded === product.id ? 'افزوده شد ✓' : 'افزودن'}
+                  </button>
+                ) : null}
 
                 {/* Telegram share — sits in the bottom-left corner next to the price, outside the Link to avoid nesting */}
                 <a
