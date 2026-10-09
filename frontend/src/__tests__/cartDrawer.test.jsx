@@ -57,6 +57,29 @@ const openDrawer = async (user) => {
 
 const currentPath = () => screen.getByTestId('location').textContent;
 
+// Renders the real CatalogLayout, which subscribes to the cart store — so a
+// cart mutation triggers a genuine parent re-render (the case the unstable
+// inline `onClose` used to break).
+const renderLayout = () =>
+  render(
+    <MemoryRouter initialEntries={['/catalog']}>
+      <Routes>
+        <Route
+          path="/catalog"
+          element={
+            <CatalogLayout>
+              <div>محتوا</div>
+            </CatalogLayout>
+          }
+        />
+      </Routes>
+    </MemoryRouter>
+  );
+
+// Only the header cart trigger carries aria-haspopup="dialog".
+const cartTrigger = () =>
+  screen.getAllByRole('button').find((btn) => btn.getAttribute('aria-haspopup') === 'dialog');
+
 beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
@@ -286,5 +309,117 @@ describe('CatalogLayout background inert', () => {
 
     await waitFor(() => expect(main).not.toHaveAttribute('inert'));
     expect(footer).not.toHaveAttribute('inert');
+  });
+
+  it('makes the header inert while the cart modal is open and clears it on close', async () => {
+    cart.addItem(12, 1);
+    const user = userEvent.setup();
+    const { container } = render(
+      <MemoryRouter initialEntries={['/catalog']}>
+        <Routes>
+          <Route
+            path="/catalog"
+            element={
+              <CatalogLayout>
+                <div>محتوا</div>
+              </CatalogLayout>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    const header = container.querySelector('header');
+    expect(header).not.toHaveAttribute('inert');
+
+    await user.click(cartTrigger());
+    await screen.findByRole('dialog', { name: 'سبد خرید' });
+
+    await waitFor(() => expect(header).toHaveAttribute('inert'));
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'Escape' });
+    });
+
+    await waitFor(() => expect(header).not.toHaveAttribute('inert'));
+  });
+});
+
+// ── focus stability across cart mutations (unstable `onClose`) ───────
+//
+// Regression: the layout subscribes to the cart store, so mutating the cart
+// from inside the drawer re-renders it and used to hand CartDrawer a brand-new
+// inline `onClose`. Because the focus-management effect listed `onClose` as a
+// dependency, it re-ran mid-session: it re-captured `previousFocusRef` (an
+// in-panel control) and re-fired the rAF focus move, yanking focus to the
+// panel header after every `+`/`−`/trash click — and breaking opener restore.
+
+describe('CartDrawer focus stability across cart mutations', () => {
+  it('keeps focus on the stepper through a cart mutation and restores the opener on close', async () => {
+    cart.addItem(12, 1);
+    const user = userEvent.setup();
+    renderLayout();
+
+    const trigger = cartTrigger();
+    expect(trigger).toBeTruthy();
+
+    await user.click(trigger);
+    await screen.findByRole('dialog', { name: 'سبد خرید' });
+
+    const closeButton = screen.getByRole('button', { name: 'بستن سبد خرید' });
+    await waitFor(() => expect(closeButton).toHaveFocus());
+
+    // Mutate the cart: CatalogLayout re-renders (store subscription) and a
+    // fresh `onClose` would previously re-run the drawer's focus effect.
+    const plus = await screen.findByRole('button', { name: /افزایش تعداد/ });
+    plus.focus();
+    await user.click(plus);
+
+    expect(cart.readCart()).toEqual([{ id: 12, qty: 2 }]);
+
+    // Let any (buggy) rAF-driven focus steal land before asserting.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+    expect(plus).toHaveFocus();
+    expect(closeButton).not.toHaveFocus();
+
+    // The opener is still the header trigger, so closing after a mutation
+    // restores focus to it (it must not have captured an in-panel control).
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'Escape' });
+    });
+    await waitFor(() => expect(trigger).toHaveFocus());
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: 'سبد خرید' })).not.toBeInTheDocument()
+    );
+  });
+
+  it('does not re-steal focus when only the onClose identity changes', async () => {
+    cart.addItem(12, 1);
+    const user = userEvent.setup();
+    const view = (onClose) => (
+      <MemoryRouter initialEntries={['/catalog']}>
+        <CartDrawer open onClose={onClose} />
+      </MemoryRouter>
+    );
+
+    const { rerender } = render(view(() => {}));
+
+    const closeButton = screen.getByRole('button', { name: 'بستن سبد خرید' });
+    await waitFor(() => expect(closeButton).toHaveFocus());
+
+    const plus = await screen.findByRole('button', { name: /افزایش تعداد/ });
+    await user.click(plus);
+    await waitFor(() => expect(plus).toHaveFocus());
+
+    // Same `open`, new callback identity → the focus effect must not re-run.
+    rerender(view(() => {}));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+
+    expect(plus).toHaveFocus();
+    expect(closeButton).not.toHaveFocus();
   });
 });

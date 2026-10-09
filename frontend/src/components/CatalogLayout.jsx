@@ -73,6 +73,9 @@ export default function CatalogLayout({ children }) {
   const cartTotal = cartCount(cartItems);
 
   const closeMenu = useCallback(() => setMenuOpen(false), []);
+  // Stable identity: CartDrawer's focus-management effect must not re-run (and
+  // re-steal focus) when the layout re-renders on cart mutations.
+  const closeCart = useCallback(() => setCartOpen(false), []);
 
   const toggleMenu = () => {
     if (!menuOpen) {
@@ -175,7 +178,7 @@ export default function CatalogLayout({ children }) {
     >
       <div className="catalog-ambient" aria-hidden="true" />
 
-      <header className="catalog-topbar" style={{ zIndex: Z_INDEX_STICKY }}>
+      <header className="catalog-topbar" style={{ zIndex: Z_INDEX_STICKY }} inert={cartOpen ? '' : undefined}>
         <div className="catalog-topbar-inner">
           <Link to="/" className="catalog-brand-link flex items-center gap-2.5 sm:gap-3.5 min-w-0">
             <BrandLogo height={85} className="catalog-logo-img shrink-0">
@@ -480,7 +483,7 @@ export default function CatalogLayout({ children }) {
         </nav>
       </aside>
 
-      <CartDrawer open={cartOpen} onClose={() => setCartOpen(false)} />
+      <CartDrawer open={cartOpen} onClose={closeCart} />
 
       <main className="relative flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10" inert={menuOpen || cartOpen ? '' : undefined}>
         {children}

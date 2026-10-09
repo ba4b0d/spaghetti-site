@@ -43,6 +43,17 @@ export default function CartDrawer({ open, onClose }) {
   const panelRef = useRef(null);
   const previousFocusRef = useRef(null);
 
+  // `onClose` must be reachable from the open/close effect WITHOUT being a
+  // dependency. Callers commonly pass an inline arrow (e.g. `() => setOpen(false)`)
+  // whose identity changes on every parent render; because the layout subscribes
+  // to the cart store, mutating the cart inside the drawer re-renders the parent
+  // and would otherwise re-run that effect mid-session — re-capturing the opener
+  // and yanking focus back to the panel header on every `+`/`−`/trash click.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   // Keep the drawer in sync with the shared cart store.
   useEffect(() => subscribe(() => setItems(readCart())), []);
 
@@ -69,7 +80,7 @@ export default function CartDrawer({ open, onClose }) {
 
     const onKey = (event) => {
       if (event.key === 'Escape') {
-        onClose?.();
+        onCloseRef.current?.();
         return;
       }
 
@@ -109,14 +120,22 @@ export default function CartDrawer({ open, onClose }) {
       window.removeEventListener('keydown', onKey);
       cancelAnimationFrame(frame);
     };
-  }, [open, onClose]);
+    // Deliberately NOT depending on `onClose` (read via `onCloseRef`) so a
+    // re-render of the parent mid-session cannot re-run this effect and
+    // re-capture/re-steal focus. The opener is captured once, on open.
+  }, [open]);
 
   // Restore focus to the trigger once the drawer closes.
   useEffect(() => {
     if (open) return undefined;
     const previous = previousFocusRef.current;
     previousFocusRef.current = null;
-    if (previous && previous.isConnected) previous.focus();
+    // Only a control OUTSIDE the panel is a legitimate opener: the panel stays
+    // mounted (inert) after close, so restoring into it would silently no-op
+    // in a real browser.
+    if (previous && previous.isConnected && !panelRef.current?.contains(previous)) {
+      previous.focus();
+    }
     return undefined;
   }, [open]);
 
