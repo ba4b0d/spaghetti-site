@@ -480,15 +480,13 @@ export default function CatalogLayout({ children }) {
               <a
                 referrerPolicy="origin"
                 target="_blank"
-                rel="noreferrer"
                 href="https://trustseal.enamad.ir/?id=8105853&Code=IdFwUsVT9E4CUh6JfYYzMmF1pN7Sf18z"
-                title="نماد اعتماد الکترونیکی اسپاگتی پرینت"
                 className="block"
               >
                 <img
                   referrerPolicy="origin"
                   src="https://trustseal.enamad.ir/logo.aspx?id=8105853&Code=IdFwUsVT9E4CUh6JfYYzMmF1pN7Sf18z"
-                  alt="نماد اعتماد الکترونیکی"
+                  alt=""
                   style={{ cursor: 'pointer', width: '65px', height: '65px', objectFit: 'contain' }}
                   code="IdFwUsVT9E4CUh6JfYYzMmF1pN7Sf18z"
                 />
