@@ -482,11 +482,11 @@ export default function CatalogLayout({ children }) {
 
       <CartDrawer open={cartOpen} onClose={() => setCartOpen(false)} />
 
-      <main className="relative flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10" inert={menuOpen ? '' : undefined}>
+      <main className="relative flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10" inert={menuOpen || cartOpen ? '' : undefined}>
         {children}
       </main>
 
-      <footer className="relative border-t py-8 catalog-footer" style={{ borderColor: 'var(--border-color)' }}>
+      <footer className="relative border-t py-8 catalog-footer" inert={cartOpen ? '' : undefined} style={{ borderColor: 'var(--border-color)' }}>
         <div className="max-w-7xl mx-auto px-4 sm:px-6 flex flex-col md:flex-row items-center justify-between gap-6 text-xs">
           <div className="text-center sm:text-right catalog-footer-copy space-y-1">
             <div className="font-medium text-white/90">

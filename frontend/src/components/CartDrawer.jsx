@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { X, ShoppingBag, Trash2, Plus, Minus, ArrowRight } from 'lucide-react';
 import { getCatalog } from '../lib/api';
@@ -18,9 +18,30 @@ import { Z_INDEX_SIDEBAR, Z_INDEX_OVERLAY } from '../lib/constants';
 
 const PANEL_WIDTH = 'min(92vw, 24rem)';
 
+// Same focusable contract as the mobile nav drawer (CatalogLayout) so the two
+// modals behave identically for keyboard users.
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'textarea:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+const getFocusableElements = (container) =>
+  Array.from(container?.querySelectorAll(FOCUSABLE_SELECTOR) || []).filter(
+    (element) =>
+      !element.hasAttribute('disabled') &&
+      element.getAttribute('aria-hidden') !== 'true' &&
+      element.getAttribute('aria-disabled') !== 'true'
+  );
+
 export default function CartDrawer({ open, onClose }) {
   const [items, setItems] = useState(() => readCart());
   const [catalog, setCatalog] = useState([]);
+  const panelRef = useRef(null);
+  const previousFocusRef = useRef(null);
 
   // Keep the drawer in sync with the shared cart store.
   useEffect(() => subscribe(() => setItems(readCart())), []);
@@ -41,17 +62,63 @@ export default function CartDrawer({ open, onClose }) {
 
   useEffect(() => {
     if (!open) return undefined;
+
+    // Remember the element that opened the drawer so focus can be restored.
+    previousFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
     const onKey = (event) => {
-      if (event.key === 'Escape') onClose?.();
+      if (event.key === 'Escape') {
+        onClose?.();
+        return;
+      }
+
+      if (event.key !== 'Tab') return;
+      const focusableElements = getFocusableElements(panelRef.current);
+      if (focusableElements.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const firstElement = focusableElements[0];
+      const lastElement = focusableElements[focusableElements.length - 1];
+
+      if (!panelRef.current?.contains(document.activeElement)) {
+        event.preventDefault();
+        firstElement.focus();
+      } else if (event.shiftKey && document.activeElement === firstElement) {
+        event.preventDefault();
+        lastElement.focus();
+      } else if (!event.shiftKey && document.activeElement === lastElement) {
+        event.preventDefault();
+        firstElement.focus();
+      }
     };
+
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     window.addEventListener('keydown', onKey);
+
+    // Move focus into the panel once it is rendered/visible.
+    const frame = requestAnimationFrame(() => {
+      const focusableElements = getFocusableElements(panelRef.current);
+      (focusableElements[0] || panelRef.current)?.focus();
+    });
+
     return () => {
       document.body.style.overflow = previousOverflow;
       window.removeEventListener('keydown', onKey);
+      cancelAnimationFrame(frame);
     };
   }, [open, onClose]);
+
+  // Restore focus to the trigger once the drawer closes.
+  useEffect(() => {
+    if (open) return undefined;
+    const previous = previousFocusRef.current;
+    previousFocusRef.current = null;
+    if (previous && previous.isConnected) previous.focus();
+    return undefined;
+  }, [open]);
 
   const byId = useMemo(() => {
     const map = new Map();
@@ -86,6 +153,8 @@ export default function CartDrawer({ open, onClose }) {
       />
       <aside
         id="catalog-cart-drawer"
+        ref={panelRef}
+        tabIndex={-1}
         dir="rtl"
         aria-hidden={!open}
         inert={!open ? '' : undefined}
@@ -230,7 +299,16 @@ export default function CartDrawer({ open, onClose }) {
             to="/checkout"
             className="btn-primary w-full inline-flex items-center justify-center gap-2"
             aria-disabled={items.length === 0}
-            onClick={items.length === 0 ? undefined : onClose}
+            onClick={(event) => {
+              // A disabled CTA must not navigate for pointer OR keyboard users:
+              // native anchors fire a click on Enter, so preventDefault here
+              // blocks both activation paths.
+              if (items.length === 0) {
+                event.preventDefault();
+                return;
+              }
+              onClose?.();
+            }}
             style={items.length === 0 ? { opacity: 0.5, pointerEvents: 'none' } : undefined}
           >
             ادامه و ثبت درخواست
