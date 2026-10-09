@@ -349,7 +349,16 @@ class CommerceRequestItem(Base):
         nullable=False,
         index=True,
     )
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=True, index=True)
+    # Snapshot-preserving link: a permanent product delete must not erase (or
+    # block on) historical review line items, so the FK is nullable and
+    # detaches to NULL rather than cascading. See products.permanent_delete,
+    # which also unlinks explicitly for tables created before this clause.
+    product_id = Column(
+        Integer,
+        ForeignKey("products.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     display_name = Column(String(255), nullable=False, default="")
     qty = Column(Integer, nullable=False, default=1)
     indicative_unit_price_toman = Column(Integer, nullable=True)  # integer Toman estimate

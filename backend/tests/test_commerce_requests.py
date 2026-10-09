@@ -70,20 +70,41 @@ def test_guest_submission_requires_no_auth(client, auth_headers):
     assert r.status_code == 200, r.text
 
 
-def test_price_tampering_is_ignored(client, auth_headers):
-    """A client-supplied price must never be trusted or stored."""
+def test_surplus_price_fields_are_rejected(client, auth_headers):
+    """Surplus fields — including client prices — are rejected, not ignored.
+
+    Task 1 brief Step 2: "Disallow surplus fields on the public payload to
+    avoid silent price acceptance." A tampered request must fail validation
+    (422) and persist nothing.
+    """
     product = _create_product(client, auth_headers, name="کالای قیمتی", price=75000)
 
-    payload = _valid_payload(product["id"], qty=2)
-    payload["items"][0]["unit_price"] = 1
-    payload["items"][0]["unit_toman"] = 1
-    payload["total"] = 1
+    # Surplus field nested on a line item.
+    item_payload = _valid_payload(product["id"], qty=2)
+    item_payload["items"][0]["unit_price"] = 1
+    r = client.post("/api/v1/commerce/requests", json=item_payload)
+    assert r.status_code == 422, r.text
 
-    r = client.post("/api/v1/commerce/requests", json=payload)
+    # Surplus field at the top level.
+    top_payload = _valid_payload(product["id"], qty=2)
+    top_payload["total"] = 1
+    r2 = client.post("/api/v1/commerce/requests", json=top_payload)
+    assert r2.status_code == 422, r2.text
+
+    # Rejected attempts must not have stored anything.
+    listing = client.get("/api/v1/commerce/staff/requests", headers=auth_headers)
+    assert listing.status_code == 200
+    assert listing.json() == []
+
+
+def test_server_snapshots_catalogue_price(client, auth_headers):
+    """The stored indicative price is the server catalogue value, never client data."""
+    product = _create_product(client, auth_headers, name="کالای قیمتی", price=75000)
+
+    r = client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], qty=2))
     assert r.status_code == 200, r.text
-    assert r.json()["state"] == "pending_review"
 
-    # Server snapshots the catalogue indicative price, not the tampered value.
+    # Server snapshots the catalogue indicative price, not any client value.
     listing = client.get("/api/v1/commerce/staff/requests", headers=auth_headers)
     assert listing.status_code == 200
     requests = listing.json()
@@ -147,6 +168,21 @@ def test_too_many_items_rejected(client, auth_headers):
 
 @pytest.mark.parametrize("mobile", ["0812345678", "0912345678a", "091234567890", "9123456789", ""])
 def test_invalid_mobile_rejected(client, auth_headers, mobile):
+    product = _create_product(client, auth_headers)
+    r = client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], mobile=mobile))
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize(
+    "mobile",
+    [
+        "09١٢٣٤٥٦٧٨٩",  # Arabic-Indic digits (isdigit() is True — must be rejected)
+        "0912345678۹",   # ASCII prefix + one Persian digit, correct length
+        "۰۹۱۲۳۴۵۶۷۸۹",   # all Persian-Indic digits
+    ],
+)
+def test_non_ascii_mobile_rejected(client, auth_headers, mobile):
+    """Only ASCII digits are valid: mixed-script numbers are undialable."""
     product = _create_product(client, auth_headers)
     r = client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], mobile=mobile))
     assert r.status_code == 422, r.text
@@ -253,3 +289,140 @@ def test_employee_can_list_requests(client, auth_headers, employee_headers):
     assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"])).status_code == 200
     r = client.get("/api/v1/commerce/staff/requests", headers=employee_headers)
     assert r.status_code == 200
+
+
+def test_staff_listing_is_bounded_and_filterable(client, auth_headers):
+    """The review queue is paginated/filterable but still a plain array."""
+    product = _create_product(client, auth_headers)
+    for _ in range(3):
+        assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"])).status_code == 200
+
+    # No params -> default page, still a bare JSON array (existing clients).
+    all_rows = client.get("/api/v1/commerce/staff/requests", headers=auth_headers).json()
+    assert isinstance(all_rows, list) and len(all_rows) == 3
+
+    # limit caps the page size (newest first).
+    capped = client.get("/api/v1/commerce/staff/requests?limit=2", headers=auth_headers).json()
+    assert [r["receipt_id"] for r in capped] == [r["receipt_id"] for r in all_rows[:2]]
+
+    # offset pages forward without overlap.
+    page2 = client.get(
+        "/api/v1/commerce/staff/requests?limit=2&offset=2", headers=auth_headers
+    ).json()
+    assert [r["receipt_id"] for r in page2] == [all_rows[2]["receipt_id"]]
+
+    # Absurd limits are rejected rather than loading the whole table.
+    assert client.get(
+        "/api/v1/commerce/staff/requests?limit=100000", headers=auth_headers
+    ).status_code == 422
+
+    # state filter narrows the queue.
+    pending = client.get(
+        "/api/v1/commerce/staff/requests?state=pending_review", headers=auth_headers
+    ).json()
+    assert len(pending) == 3
+    assert client.get(
+        "/api/v1/commerce/staff/requests?state=cancelled", headers=auth_headers
+    ).json() == []
+
+
+def _session_engine():
+    """Engine backing the test client's DB dependency override."""
+    from app.database import get_db
+    from app.main import app
+
+    gen = app.dependency_overrides[get_db]()
+    session = next(gen)
+    try:
+        return session.get_bind()
+    finally:
+        session.close()
+
+
+def test_staff_listing_avoids_n_plus_one(client, auth_headers):
+    """Items are eager-loaded: statement count stays flat as requests grow."""
+    from sqlalchemy import event
+
+    product = _create_product(client, auth_headers)
+    for _ in range(5):
+        assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"])).status_code == 200
+
+    engine = _session_engine()
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        r = client.get("/api/v1/commerce/staff/requests", headers=auth_headers)
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert r.status_code == 200
+    assert len(r.json()) == 5
+    # selectinload = a constant number of statements (main + one IN load), not
+    # 1 + N (which would be ~6+ here and grow with the queue).
+    assert len(statements) <= 3, statements
+
+
+# ── Product permanent delete preserves review snapshots ──────────────
+
+def test_permanent_delete_preserves_request_snapshots(client, auth_headers):
+    """Deleting a product detaches (does not delete) historical request items."""
+    product = _create_product(client, auth_headers, name="محصول حذفی", price=42000)
+    assert client.post(
+        "/api/v1/commerce/requests", json=_valid_payload(product["id"], qty=3)
+    ).status_code == 200
+
+    r = client.delete(f"/api/v1/products/{product['id']}/permanent", headers=auth_headers)
+    assert r.status_code == 200, r.text
+
+    # The request and its snapshot survive; only the product link is cleared.
+    rows = client.get("/api/v1/commerce/staff/requests", headers=auth_headers).json()
+    assert len(rows) == 1
+    item = rows[0]["items"][0]
+    assert item["product_id"] is None
+    assert item["display_name"] == "محصول حذفی"
+    assert item["qty"] == 3
+    assert item["indicative_unit_price_toman"] == 42000
+
+
+def test_permanent_delete_handles_legacy_items_table(client, auth_headers):
+    """Route-level unlink covers DBs whose items table predates ondelete=SET NULL.
+
+    SQLite cannot ALTER a foreign key on an existing table, so a pre-existing
+    ``commerce_request_items`` (created without ON DELETE SET NULL) would still
+    raise IntegrityError on a bare product delete. Recreate that legacy shape
+    and prove the explicit unlink keeps the delete succeeding and the snapshot
+    intact.
+    """
+    from sqlalchemy import text
+
+    product = _create_product(client, auth_headers, name="محصول قدیمی", price=42000)
+
+    engine = _session_engine()
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE commerce_request_items"))
+        conn.execute(text(
+            "CREATE TABLE commerce_request_items ("
+            "id INTEGER PRIMARY KEY, "
+            "request_id INTEGER NOT NULL, "
+            "product_id INTEGER, "
+            "display_name VARCHAR(255) NOT NULL DEFAULT '', "
+            "qty INTEGER NOT NULL DEFAULT 1, "
+            "indicative_unit_price_toman INTEGER, "
+            "FOREIGN KEY(request_id) REFERENCES commerce_requests(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(product_id) REFERENCES products(id))"
+        ))
+
+    assert client.post(
+        "/api/v1/commerce/requests", json=_valid_payload(product["id"], qty=2)
+    ).status_code == 200
+
+    r = client.delete(f"/api/v1/products/{product['id']}/permanent", headers=auth_headers)
+    assert r.status_code == 200, r.text
+
+    rows = client.get("/api/v1/commerce/staff/requests", headers=auth_headers).json()
+    assert rows[0]["items"][0]["product_id"] is None
+    assert rows[0]["items"][0]["display_name"] == "محصول قدیمی"

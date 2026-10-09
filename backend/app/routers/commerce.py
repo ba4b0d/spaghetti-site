@@ -10,8 +10,8 @@ Later tasks add invoice draft/approval/revoke and payment endpoints to this
 router. Handlers stay thin; validation and persistence live in
 ``app.services.commerce``.
 """
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator, model_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -30,13 +30,19 @@ VALID_MESSENGERS = ("telegram", "bale")
 
 
 class CommerceRequestItemIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     product_id: int = Field(..., ge=1)
     qty: int = Field(..., ge=MIN_QTY, le=MAX_QTY)
 
 
 class CommerceRequestCreate(BaseModel):
-    # Extra fields (including any client-supplied price) are ignored — the
+    # Surplus fields — including any client-supplied price — are rejected with
+    # a 422 rather than silently ignored (Task 1 brief: "disallow surplus
+    # fields on the public payload to avoid silent price acceptance"). The
     # server snapshots catalogue data and never trusts a client amount.
+    model_config = ConfigDict(extra="forbid")
+
     customer_name: str = Field(..., min_length=1, max_length=120)
     mobile: str
     messenger: str
@@ -56,7 +62,14 @@ class CommerceRequestCreate(BaseModel):
     @classmethod
     def _valid_iranian_mobile(cls, value: str) -> str:
         value = (value or "").strip()
-        if len(value) != 11 or not value.startswith("09") or not value.isdigit():
+        # ASCII digits only: str.isdigit() is true for Arabic-Indic / Persian
+        # digits, and startswith("09") only checks two ASCII chars, so a mixed
+        # value like "09١٢٣٤٥٦٧٨٩" would otherwise be stored undialable.
+        if (
+            len(value) != 11
+            or not value.startswith("09")
+            or not all("0" <= c <= "9" for c in value)
+        ):
             raise ValueError("شماره موبایل باید ۱۱ رقم و با ۰۹ شروع شود")
         return value
 
@@ -106,10 +119,21 @@ def create_request(
 
 @router.get("/staff/requests")
 def list_staff_requests(
-    request: Request,
+    state: str | None = Query(default=None, max_length=20),
+    limit: int = Query(
+        default=commerce_service.DEFAULT_LIST_LIMIT,
+        ge=1,
+        le=commerce_service.MAX_LIST_LIMIT,
+    ),
+    offset: int = Query(default=0, ge=0),
     user=Depends(require_staff_role),
     db: Session = Depends(get_db),
 ):
-    """Staff — newest-first request queue with product snapshots."""
-    rows = commerce_service.list_staff_requests(db)
+    """Staff — newest-first request queue with product snapshots.
+
+    Bounded (``limit``/``offset``) and optionally filtered by ``state`` so the
+    queue cannot return the whole table; the response stays a plain array so
+    existing clients keep working.
+    """
+    rows = commerce_service.list_staff_requests(db, limit=limit, offset=offset, state=state)
     return [commerce_service.serialize_staff_request(r) for r in rows]

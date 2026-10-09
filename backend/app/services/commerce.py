@@ -12,7 +12,7 @@ Design rules enforced here (see plan Global Constraints):
 """
 import secrets
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import CommerceRequest, CommerceRequestItem, Product
 
@@ -20,6 +20,10 @@ from app.models import CommerceRequest, CommerceRequestItem, Product
 MAX_DISTINCT_PRODUCTS = 30
 MIN_QTY = 1
 MAX_QTY = 99
+
+# Staff review-queue bounds (query parameters, enforced again in the router).
+DEFAULT_LIST_LIMIT = 100
+MAX_LIST_LIMIT = 200
 
 # Public receipt prefix — opaque, not a primary key.
 RECEIPT_PREFIX = "REQ"
@@ -158,10 +162,24 @@ def serialize_staff_request(request: CommerceRequest) -> dict:
     }
 
 
-def list_staff_requests(db: Session) -> list[CommerceRequest]:
-    """Newest-first pending-review queue for staff (includes all states)."""
-    return (
+def list_staff_requests(
+    db: Session,
+    *,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    state: str | None = None,
+) -> list[CommerceRequest]:
+    """Newest-first staff review queue (includes all states unless filtered).
+
+    ``selectinload`` eager-loads the line items so serialization does not issue
+    one extra query per request (previously 1 + N). Results are bounded by
+    ``limit``/``offset`` and can be narrowed with ``state``.
+    """
+    query = (
         db.query(CommerceRequest)
+        .options(selectinload(CommerceRequest.items))
         .order_by(CommerceRequest.created_at.desc(), CommerceRequest.id.desc())
-        .all()
     )
+    if state:
+        query = query.filter(CommerceRequest.state == state)
+    return query.offset(offset).limit(limit).all()
