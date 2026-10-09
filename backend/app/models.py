@@ -295,3 +295,65 @@ class AuditLog(Base):
     summary = Column(String, default="")    # human-readable description
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
+
+# ── Commerce: website cart requests (pending staff review) ────────────
+# State machine for a website-submitted request. A request is NEVER payable
+# on its own — staff must convert it into a reviewed invoice (Task 2).
+COMMERCE_REQUEST_STATES = (
+    "pending_review",  # submitted from the storefront, awaiting staff review
+    "converted",       # staff converted it into an invoice
+    "cancelled",       # staff dismissed it
+)
+
+
+class CommerceRequest(Base):
+    """A customer-submitted cart request from the public storefront.
+
+    Contains no authoritative prices: item prices are indicative catalogue
+    snapshots only, and payment is impossible until staff review.
+    """
+    __tablename__ = "commerce_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    receipt_id = Column(String(40), unique=True, nullable=False, index=True)  # opaque public receipt
+    customer_name = Column(String(120), nullable=False)
+    mobile = Column(String(11), nullable=False, index=True)   # Iranian 09xxxxxxxxx
+    messenger = Column(String(20), nullable=False)            # telegram | bale
+    messenger_handle = Column(String(100), default="")
+    address = Column(String(500), default="")
+    note = Column(String(2000), default="")
+    state = Column(String(20), nullable=False, default="pending_review", index=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+
+    items = relationship(
+        "CommerceRequestItem",
+        back_populates="request",
+        cascade="all, delete-orphan",
+        order_by="CommerceRequestItem.id",
+    )
+
+
+class CommerceRequestItem(Base):
+    """Line item snapshot for a website request (product id, name, qty).
+
+    ``indicative_unit_price_toman`` is an optional integer catalogue estimate
+    captured server-side; it is never trusted from the client and never
+    treated as a payable amount.
+    """
+    __tablename__ = "commerce_request_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(
+        Integer,
+        ForeignKey("commerce_requests.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=True, index=True)
+    display_name = Column(String(255), nullable=False, default="")
+    qty = Column(Integer, nullable=False, default=1)
+    indicative_unit_price_toman = Column(Integer, nullable=True)  # integer Toman estimate
+
+    request = relationship("CommerceRequest", back_populates="items")
+    product = relationship("Product", lazy="joined")
+
