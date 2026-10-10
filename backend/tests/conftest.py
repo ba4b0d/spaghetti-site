@@ -129,6 +129,70 @@ def client(monkeypatch):
     app.dependency_overrides.clear()
 
 
+@pytest.fixture(scope="function", autouse=True)
+def _block_outbound_notification_transports(monkeypatch):
+    """Neutralise every live notification transport for every test.
+
+    A developer ``backend/.env`` may enable real Telegram/SMS/SMTP credentials,
+    and any test that posts a commerce request or approves an invoice would then
+    page the owner's phone and inbox on every run. The ``client`` fixture above
+    already blocks the inbound Telegram *poll* thread; this closes the outbound
+    half of the same hole.
+
+    ``app.main`` and ``app.routers.orders`` each import the Telegram sender
+    directly, so patching only ``commerce_notifications`` would leave a live path
+    open — every direct binding is patched too.
+
+    Only the *leaf* senders are stubbed (never ``commerce_notifications.
+    send_telegram_message``) so the per-channel config gate still runs and the
+    dedicated notification tests — which monkeypatch these very attributes
+    themselves, after this autouse fixture — keep asserting real behaviour.
+    """
+    import importlib
+
+    from app.services import commerce_notifications as cn
+
+    class _BlockedTransport:
+        """Fails loudly instead of reaching a real provider."""
+
+        def _blocked(self, *_args, **_kwargs):
+            raise AssertionError(
+                "outbound notification transport reached during a test — "
+                "inject a fake session/smtp_factory or monkeypatch the sender"
+            )
+
+        post = _blocked
+        SMTP = _blocked
+        SMTP_SSL = _blocked
+
+    blocked = _BlockedTransport()
+
+    # SMS.ir — ``post_sms_ir_verify`` replaces ``client`` with this module-level
+    # ``requests`` ONLY when the caller injects no ``session=``. The dedicated
+    # tests always inject one, so they keep exercising the real code path.
+    monkeypatch.setattr(cn, "requests", blocked)
+
+    # Email — ``send_smtp_mail`` falls back to ``smtplib`` ONLY when the caller
+    # injects no ``smtp_factory=``; the dedicated tests always inject one.
+    monkeypatch.setattr(cn, "smtplib", blocked)
+
+    # Telegram — ``send_telegram_notification`` has no injection seam (a raw
+    # ``requests.post`` to api.telegram.org) and is bound separately in three
+    # modules, so patch every binding; the channel wrapper treats False as a
+    # failed send, which is the honest result.
+    def _telegram_stub(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(cn, "send_telegram_notification", _telegram_stub)
+    for module_path in ("app.routers.orders", "app.main"):
+        try:
+            imported = importlib.import_module(module_path)
+        except Exception:  # pragma: no cover — module optional on some branches
+            continue
+        if hasattr(imported, "send_telegram_notification"):
+            monkeypatch.setattr(imported, "send_telegram_notification", _telegram_stub)
+
+
 def _get_token(client, username, password):
     """Login and return token string from HTTP cookie or JSON response."""
     resp = client.post("/api/v1/auth/login", json={
