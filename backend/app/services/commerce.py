@@ -1031,7 +1031,12 @@ def _callback_result_is_failure(result_value) -> bool:
     return text.upper() in ("FAILURE", "FAILED", "ERROR", "NOK")
 
 
-def _verify_confirms(verified: dict, attempt: CommercePaymentAttempt) -> bool:
+def _verify_confirms(
+    verified: dict,
+    attempt: CommercePaymentAttempt,
+    *,
+    tracking_code: str | None = None,
+) -> bool:
     """Strict server-side confirmation against the documented verify payload.
 
     Documented shape (docs "UPG" → verify)::
@@ -1043,6 +1048,10 @@ def _verify_confirms(verified: dict, attempt: CommercePaymentAttempt) -> bool:
     **top-level**. Reading ``status``/``amount`` off the top level (or the
     identity fields out of ``result``) is the earlier bug that made every real
     verification fail.
+
+    When ``tracking_code`` is supplied, the reply must echo it too: a
+    confirmation counts only when it matches the issued amount, the unique
+    ``providerId`` **and** the tracking code we actually verified.
     """
     if not isinstance(verified, dict):
         return False
@@ -1055,6 +1064,43 @@ def _verify_confirms(verified: dict, attempt: CommercePaymentAttempt) -> bool:
         return False
     provider_id = verified.get("providerId") or verified.get("provider_id")
     if provider_id != attempt.provider_id:
+        return False
+    if tracking_code is not None:
+        echoed = verified.get("trackingCode")
+        if echoed is None:
+            echoed = verified.get("tracking_code")
+        if str(echoed or "").strip() != str(tracking_code).strip():
+            return False
+    return True
+
+
+def _verify_reports_authoritative_non_success(
+    verified, attempt: CommercePaymentAttempt
+) -> bool:
+    """True only for a terminal non-success tied to the ticket WE issued.
+
+    A provider non-success whose only link to our attempt is a
+    **callback-supplied** ``trackingCode`` is *not* authoritative: that code may
+    be a forgery, so a "transaction not found"/error reply says nothing about the
+    invoice we actually issued. Only a reply that explicitly reports a
+    non-success **and** echoes our unique ``providerId`` together with the issued
+    ``amount_rial`` proves the provider looked up our ticket. Only then may an
+    attempt be closed as ``failed`` (releasing the invoice lock).
+    """
+    if not isinstance(verified, dict):
+        return False
+    result = verified.get("result")
+    if not isinstance(result, dict):
+        return False
+    status = _int_or_none(result.get("status"))
+    if status is None:
+        return False
+    if status in (DIGIPAY_STATUS_SUCCESS, DIGIPAY_STATUS_PENDING):
+        return False
+    provider_id = verified.get("providerId") or verified.get("provider_id")
+    if provider_id != attempt.provider_id:
+        return False
+    if _int_or_none(verified.get("amount")) != attempt.amount_rial:
         return False
     return True
 
@@ -1084,33 +1130,31 @@ def handle_digipay_callback(
     if attempt.state == "verified":
         return "success"  # idempotent replay
 
-    def _fail(reason: str) -> None:
-        # Only ever called on a *provider-confirmed* non-success. An untrusted
-        # callback-only signal must never reach here (use _hold instead).
-        if attempt.state in ACTIVE_ATTEMPT_STATES:
-            attempt.state = "failed"
-            attempt.last_error = _short(reason)
-            db.commit()
-
     def _hold(reason) -> None:
-        # Never claim a definite failure without a provider-confirmed outcome;
-        # keep the attempt open — still locking the invoice and still visible to
-        # staff — for reconciliation instead.
+        # Never claim a definite failure on an untrusted callback signal: keep
+        # the attempt open — still locking the invoice and still visible to
+        # staff — for reconciliation instead. ``failed`` would release the
+        # active-attempt lock and could let a genuine payment be taken twice.
         if attempt.state in ACTIVE_ATTEMPT_STATES:
             attempt.state = "unknown"
             attempt.last_error = _short(reason)
             db.commit()
 
-    # The callback is an untrusted hint (no signature, no invoice token). It must
-    # never terminally fail the attempt: ``failed`` would release the
-    # active-attempt lock and hide the row from reconciliation, risking a second
-    # payment if the gateway has not already reversed the purchase.
+    # The callback is an untrusted hint (no signature, no invoice token). Its
+    # identity (method/tracking) is PROVISIONAL: it is never authoritative, and
+    # is used only as a staff-visible diagnostic and as a verify *candidate*.
     #
-    # It must also never *poison* the attempt's identity: ``providerId`` is
-    # visible in the redirect, so anyone can POST a forged callback. Only a
-    # self-consistent hint (matching amount, supported method, non-empty
-    # tracking) is persisted — and only the FIRST such hint, so a later forged
-    # callback cannot overwrite the method/tracking a genuine callback pinned.
+    # ``providerId`` is visible in the redirect, so anyone can POST a forged,
+    # self-consistent callback (matching amount, supported type, any tracking)
+    # before the customer's genuine one. Therefore:
+    #
+    #   * validate fully BEFORE persisting anything;
+    #   * persist only the FIRST validated hint (diagnostics), and never treat
+    #     it as authoritative;
+    #   * verify with THIS callback's own candidate, so a genuine callback can
+    #     still settle after an earlier forged one;
+    #   * never terminally fail/unlock here — a non-confirming verify that rests
+    #     only on callback-supplied data must not release the invoice lock.
     cb_amount = _int_or_none(amount)
     cb_type = _int_or_none(type_value)  # method actually used, NOT ticket type (11)
     tracking = (tracking_code or "").strip()
@@ -1134,7 +1178,9 @@ def handle_digipay_callback(
         return "failed"
 
     if attempt.payment_method is None and not attempt.tracking_code:
-        # First validated callback wins; persist its identity exactly once.
+        # First validated callback wins as the staff-visible diagnostic hint. It
+        # is NOT authoritative: only a server-to-server verify that confirms
+        # amount+providerId+tracking settles the attempt.
         attempt.payment_method = cb_type
         attempt.tracking_code = tracking
         db.commit()
@@ -1144,19 +1190,14 @@ def handle_digipay_callback(
         _hold("callback reported failure (unverified)")
         return "failed"
 
-    # Verify against the identity already pinned on the attempt (set by the
-    # first validated callback), never a value a later/forged callback supplies.
-    method = attempt.payment_method
-    pinned_tracking = (attempt.tracking_code or "").strip()
-    if method not in ALLOWED_PAYMENT_METHODS or not pinned_tracking:
-        _hold("callback identity not persistable")
-        return "failed"
-
+    # Verify using THIS callback's validated candidate. Never gate the verify on
+    # a previously stored hint: a genuine callback must be able to settle after a
+    # forged one pinned a bogus identity first.
     try:
         verified = client.verify(
-            tracking_code=pinned_tracking,
+            tracking_code=tracking,
             provider_id=attempt.provider_id,
-            type=method,
+            type=cb_type,
         )
     except Exception as exc:  # noqa: BLE001 - transient → recoverable unknown
         _hold(exc)
@@ -1167,15 +1208,14 @@ def handle_digipay_callback(
     if status == DIGIPAY_STATUS_PENDING:
         _hold("provider verify still pending (9011)")
         return "pending"
-    if _verify_confirms(verified, attempt):
-        settle_verified_payment(db, attempt, tracking_code=pinned_tracking)
+    if _verify_confirms(verified, attempt, tracking_code=tracking):
+        # Confirmed authoritative success: pin the confirmed identity and settle.
+        attempt.payment_method = cb_type
+        settle_verified_payment(db, attempt, tracking_code=tracking)
         return "success"
-    if status is not None and status != DIGIPAY_STATUS_SUCCESS:
-        # The provider explicitly reported a non-success: a definite failure.
-        _fail(f"provider verify status={status}")
-        return "failed"
-    # Unrecognized response, or a provider-success whose identity/amount does not
-    # match the attempt: cannot conclude a failure — keep it open for staff.
+    # Any non-confirming outcome — including a provider non-success for a merely
+    # callback-supplied tracking code, which may be forged — must never terminally
+    # fail or unlock the attempt. Keep it open (lock held) for staff reconcile.
     _hold(f"provider verify did not confirm (status={status})")
     return "failed"
 
@@ -1265,7 +1305,10 @@ def reconcile_payment_attempt(
       never guessed from the ticket type: verifying an IPG payment with
       ``type=11`` would wrongly report failure.
     * A pending/unknown provider status keeps the attempt open; only a
-      provider-confirmed non-success closes it as ``failed``.
+      provider-confirmed non-success **tied to the issued ticket** (the reply
+      echoes our unique ``providerId`` and the issued amount) closes it as
+      ``failed``. A non-success that rests only on a callback-supplied tracking
+      code cannot — such a code may be forged.
     """
     if attempt is None:
         raise CommerceNotFoundError("تراکنش یافت نشد")
@@ -1313,22 +1356,25 @@ def reconcile_payment_attempt(
         db.commit()
         db.refresh(attempt)
         return attempt
-    if _verify_confirms(verified, attempt):
+    if _verify_confirms(verified, attempt, tracking_code=tracking):
         settle_verified_payment(db, attempt, tracking_code=tracking)
         return attempt
 
-    if status is not None and status != DIGIPAY_STATUS_SUCCESS:
-        # The provider explicitly reported a terminal non-success: only now may
-        # staff reconciliation close the attempt (and release the lock).
+    if _verify_reports_authoritative_non_success(verified, attempt):
+        # The provider explicitly reported a terminal non-success for the ticket
+        # WE issued (it echoed our unique ``providerId`` and amount): only now
+        # may staff reconciliation close the attempt and release the lock.
         attempt.state = "failed"
         attempt.last_error = _short(f"reconcile: provider status={status}")
         db.commit()
         db.refresh(attempt)
         return attempt
 
-    # Unrecognized/malformed response, or a provider-success whose
-    # identity/amount does not match this attempt: cannot conclude a failure.
-    # Keep the attempt open so its lock is never silently released.
+    # A non-success whose only link to the attempt is a callback-supplied
+    # tracking code (no providerId/amount linkage), an unrecognized/malformed
+    # reply, or a provider-success whose identity/amount does not match: none can
+    # conclude a failure. Keep the attempt open so its lock is never silently
+    # released — a forged callback must not be able to unlock a payment.
     attempt.last_error = _short(f"reconcile: provider did not confirm (status={status})")
     db.commit()
     db.refresh(attempt)

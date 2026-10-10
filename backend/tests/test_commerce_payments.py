@@ -922,6 +922,140 @@ def test_forged_callback_cannot_overwrite_pinned_identity(client, auth_headers, 
     }
 
 
+def test_forged_first_callback_does_not_block_genuine_settlement(client, auth_headers, fake_provider):
+    """A forged callback arriving FIRST must not pin authority nor block the real one.
+
+    ``providerId`` is exposed in the redirect, so an attacker can POST a
+    self-consistent callback (matching amount, supported type, any bogus
+    tracking) before the customer's genuine one. That forged hint must (a) not
+    terminally fail/unlock the attempt and (b) not prevent the later genuine
+    callback — carrying the real tracking code — from settling exactly once.
+    """
+    from app.models import CommerceInvoice, CommercePaymentAttempt, Order
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    real_amount = attempt.amount_rial
+
+    # The provider only recognises the tracking code it actually issued; any
+    # other code gets a non-success with no providerId/amount linkage (so it is
+    # not authoritative for our ticket).
+    def scripted_verify(*, tracking_code, provider_id, type):
+        fake_provider.verify_calls.append(
+            {"tracking_code": tracking_code, "provider_id": provider_id, "type": type}
+        )
+        if tracking_code == "TRK-REAL":
+            return {
+                "result": {"status": 0},
+                "trackingCode": tracking_code,
+                "providerId": provider_id,
+                "amount": real_amount,
+            }
+        return {"result": {"status": 4, "message": "transaction not found"}}
+
+    fake_provider.verify = scripted_verify
+
+    # Forged callback FIRST (attacker-chosen bogus tracking code).
+    r_forged = client.post(
+        CALLBACK,
+        data=callback_payload(attempt, type="0", trackingCode="FORGED"),
+        follow_redirects=False,
+    )
+    assert "payment=success" not in r_forged.headers["location"]
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "unknown"                                  # held, never failed
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"  # lock held
+    finally:
+        db.close()
+
+    # The invoice is still locked: a second pay click resumes the same session.
+    second = pay(client, token)
+    assert second.status_code == 200, second.text
+    assert second.json()["redirect_url"] == attempt.redirect_url
+
+    # The GENUINE callback now arrives with the real tracking code.
+    r_real = client.post(
+        CALLBACK,
+        data=callback_payload(attempt, type="0", trackingCode="TRK-REAL"),
+        follow_redirects=False,
+    )
+    assert "payment=success" in r_real.headers["location"]
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "verified"
+        assert row.tracking_code == "TRK-REAL"          # confirmed identity recorded
+        assert db.get(CommerceInvoice, invoice_id).state == "paid"
+        assert db.query(Order).count() == 1             # settled exactly once
+    finally:
+        db.close()
+
+    # Replay of the genuine callback stays idempotent (no second order).
+    replay = client.post(
+        CALLBACK,
+        data=callback_payload(attempt, type="0", trackingCode="TRK-REAL"),
+        follow_redirects=False,
+    )
+    assert "payment=success" in replay.headers["location"]
+    db = TestSessionLocal()
+    try:
+        assert db.query(Order).count() == 1
+    finally:
+        db.close()
+
+
+def test_callback_non_success_for_callback_supplied_tracking_keeps_lock(client, auth_headers, fake_provider):
+    """A provider non-success tied ONLY to a callback tracking must not fail/unlock.
+
+    The tracking code was supplied by an untrusted (possibly forged) callback, so
+    the provider's "not found" says nothing about the invoice we issued. The
+    attempt must stay active and its lock held — and staff reconcile must not be
+    able to conclude a failure from it either.
+    """
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    # Explicit non-success, but with no providerId/amount linkage to our ticket.
+    fake_provider.verify = lambda **kw: {"result": {"status": 5, "message": "not found"}}
+    r = client.post(
+        CALLBACK,
+        data=callback_payload(attempt, type="0", trackingCode="BOGUS"),
+        follow_redirects=False,
+    )
+    assert "payment=success" not in r.headers["location"]
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "unknown"                                  # held, NOT failed
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"  # lock held
+    finally:
+        db.close()
+
+    # Staff reconcile cannot conclude a failure from a non-authoritative reply.
+    r2 = client.post(
+        f"{BASE}/staff/payments/{attempt.id}/reconcile",
+        json={"action": "verify"},
+        headers=auth_headers,
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["state"] == "unknown"
+
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"   # still locked
+    finally:
+        db.close()
+
+    # The lock is intact: a second pay click resumes the same payment session.
+    assert pay(client, token).json()["redirect_url"] == attempt.redirect_url
+
+
 def test_reconcile_unknown_verify_response_does_not_unlock(client, auth_headers, fake_provider):
     """An unrecognized/identity-mismatched verify reply is not a failure."""
     from app.models import CommerceInvoice
@@ -970,14 +1104,21 @@ def test_reconcile_unknown_verify_response_does_not_unlock(client, auth_headers,
 
 
 def test_reconcile_provider_confirmed_non_success_fails(client, auth_headers, fake_provider):
-    """Only a provider-confirmed terminal non-success closes the attempt."""
+    """Only a provider-confirmed non-success tied to the issued ticket closes it."""
     from app.services.digipay import DigiPayError
 
     invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
     fake_provider.verify_error = DigiPayError("timeout")
     client.post(CALLBACK, data=callback_payload(attempt, type="0"), follow_redirects=False)
     fake_provider.verify_error = None
-    fake_provider.verify = lambda **kw: {"result": {"status": 5}}
+    # An *authoritative* terminal non-success: the reply is explicitly tied to
+    # the ticket we issued (echoes our unique providerId and the issued amount).
+    fake_provider.verify = lambda **kw: {
+        "result": {"status": 5},
+        "trackingCode": "TRK-1",
+        "providerId": attempt.provider_id,
+        "amount": attempt.amount_rial,
+    }
     r = client.post(
         f"{BASE}/staff/payments/{attempt.id}/reconcile",
         json={"action": "verify"},
@@ -985,6 +1126,38 @@ def test_reconcile_provider_confirmed_non_success_fails(client, auth_headers, fa
     )
     assert r.status_code == 200, r.text
     assert r.json()["state"] == "failed"
+
+
+def test_reconcile_non_authoritative_non_success_keeps_lock(client, auth_headers, fake_provider):
+    """A non-success resting only on a callback-supplied tracking must hold.
+
+    The reply carries no ``providerId``/``amount`` linkage to the issued ticket,
+    so it says nothing about our attempt — the lock must stay held (no unlock).
+    """
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from app.services.digipay import DigiPayError
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    fake_provider.verify_error = DigiPayError("timeout")
+    client.post(CALLBACK, data=callback_payload(attempt, type="0"), follow_redirects=False)
+    fake_provider.verify_error = None
+    # Explicit non-success, but only the callback tracking links it to us.
+    fake_provider.verify = lambda **kw: {"result": {"status": 5, "message": "not found"}}
+    r = client.post(
+        f"{BASE}/staff/payments/{attempt.id}/reconcile",
+        json={"action": "verify"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "unknown"        # held, NOT failed
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"   # lock held
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "unknown"
+    finally:
+        db.close()
 
 
 def test_reconcile_abandon_requires_explicit_reason(client, auth_headers, fake_provider):
