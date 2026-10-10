@@ -1101,20 +1101,19 @@ def handle_digipay_callback(
             attempt.last_error = _short(reason)
             db.commit()
 
-    # The callback is an untrusted hint (no signature, no invoice token). Retain
-    # whatever it pinned (method/tracking) as staff diagnostics, but never let a
-    # callback-only signal terminally fail the attempt: ``failed`` would release
-    # the active-attempt lock and hide the row from reconciliation, risking a
-    # second payment if the gateway has not already reversed the purchase.
+    # The callback is an untrusted hint (no signature, no invoice token). It must
+    # never terminally fail the attempt: ``failed`` would release the
+    # active-attempt lock and hide the row from reconciliation, risking a second
+    # payment if the gateway has not already reversed the purchase.
+    #
+    # It must also never *poison* the attempt's identity: ``providerId`` is
+    # visible in the redirect, so anyone can POST a forged callback. Only a
+    # self-consistent hint (matching amount, supported method, non-empty
+    # tracking) is persisted — and only the FIRST such hint, so a later forged
+    # callback cannot overwrite the method/tracking a genuine callback pinned.
     cb_amount = _int_or_none(amount)
     cb_type = _int_or_none(type_value)  # method actually used, NOT ticket type (11)
     tracking = (tracking_code or "").strip()
-    if cb_type is not None:
-        attempt.payment_method = cb_type
-    if tracking:
-        attempt.tracking_code = tracking
-    if cb_type is not None or tracking:
-        db.commit()
 
     if cb_amount != attempt.amount_rial:
         _hold("callback amount mismatch (unverified)")
@@ -1125,8 +1124,8 @@ def handle_digipay_callback(
         return "failed"
     if cb_type not in ALLOWED_PAYMENT_METHODS:
         # Credit/BNPL/Card are disabled in v1: never verify them automatically,
-        # but keep the callback method/tracking for staff diagnostics and leave
-        # the attempt open (lock held) so this callback cannot hide a payment.
+        # and never persist the untrusted method; hold the attempt open (lock
+        # held) so this callback cannot hide or re-route a real payment.
         _hold(f"unsupported payment method (type={cb_type}); needs manual review")
         return "failed"
 
@@ -1134,16 +1133,30 @@ def handle_digipay_callback(
         _hold("callback missing trackingCode")
         return "failed"
 
+    if attempt.payment_method is None and not attempt.tracking_code:
+        # First validated callback wins; persist its identity exactly once.
+        attempt.payment_method = cb_type
+        attempt.tracking_code = tracking
+        db.commit()
+
     if _callback_result_is_failure(result_value):
         # Unverified hint of failure — keep the attempt open for reconciliation.
         _hold("callback reported failure (unverified)")
         return "failed"
 
+    # Verify against the identity already pinned on the attempt (set by the
+    # first validated callback), never a value a later/forged callback supplies.
+    method = attempt.payment_method
+    pinned_tracking = (attempt.tracking_code or "").strip()
+    if method not in ALLOWED_PAYMENT_METHODS or not pinned_tracking:
+        _hold("callback identity not persistable")
+        return "failed"
+
     try:
         verified = client.verify(
-            tracking_code=tracking,
+            tracking_code=pinned_tracking,
             provider_id=attempt.provider_id,
-            type=cb_type,
+            type=method,
         )
     except Exception as exc:  # noqa: BLE001 - transient → recoverable unknown
         _hold(exc)
@@ -1155,7 +1168,7 @@ def handle_digipay_callback(
         _hold("provider verify still pending (9011)")
         return "pending"
     if _verify_confirms(verified, attempt):
-        settle_verified_payment(db, attempt, tracking_code=tracking)
+        settle_verified_payment(db, attempt, tracking_code=pinned_tracking)
         return "success"
     if status is not None and status != DIGIPAY_STATUS_SUCCESS:
         # The provider explicitly reported a non-success: a definite failure.
@@ -1304,8 +1317,19 @@ def reconcile_payment_attempt(
         settle_verified_payment(db, attempt, tracking_code=tracking)
         return attempt
 
-    attempt.state = "failed"
-    attempt.last_error = _short(f"reconcile: provider status={status}")
+    if status is not None and status != DIGIPAY_STATUS_SUCCESS:
+        # The provider explicitly reported a terminal non-success: only now may
+        # staff reconciliation close the attempt (and release the lock).
+        attempt.state = "failed"
+        attempt.last_error = _short(f"reconcile: provider status={status}")
+        db.commit()
+        db.refresh(attempt)
+        return attempt
+
+    # Unrecognized/malformed response, or a provider-success whose
+    # identity/amount does not match this attempt: cannot conclude a failure.
+    # Keep the attempt open so its lock is never silently released.
+    attempt.last_error = _short(f"reconcile: provider did not confirm (status={status})")
     db.commit()
     db.refresh(attempt)
     return attempt
