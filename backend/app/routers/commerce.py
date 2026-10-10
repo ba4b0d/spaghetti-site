@@ -11,6 +11,7 @@ Staff:
     PUT  /api/v1/commerce/staff/invoices/{id}          revise (drops to draft, kills link)
     POST /api/v1/commerce/staff/invoices/{id}/approve  freeze + issue private link
     POST /api/v1/commerce/staff/invoices/{id}/revoke   invalidate the private link
+    POST /api/v1/commerce/staff/invoices/{id}/notify   re-emit admin alert (retry)
 
 Payment initiation/callback arrive in Task 3. Handlers stay thin; validation
 and persistence live in ``app.services.commerce``.
@@ -23,6 +24,7 @@ from app.audit import log_user
 from app.database import get_db
 from app.routers.auth import limiter, require_staff_role
 from app.services import commerce as commerce_service
+from app.services import commerce_notifications
 from app.services import digipay
 from app.services.commerce import (
     MAX_DISTINCT_PRODUCTS,
@@ -403,6 +405,42 @@ def revoke_invoice(
         f"لغو فاکتور #{invoice.id}",
     )
     return payload
+
+
+@router.post("/staff/invoices/{invoice_id}/notify")
+def resend_invoice_notification(
+    invoice_id: int,
+    user=Depends(require_staff_role),
+    db: Session = Depends(get_db),
+):
+    """Staff — re-emit the admin notification for an invoice's current state.
+
+    There is no durable outbox, so a channel that was down (or unconfigured)
+    when ``invoice_approved`` / ``payment_verified`` originally fired can be
+    retried explicitly here. The invoice is never mutated; the response reports
+    the per-channel result (``sent`` / ``skipped`` / ``failed``) so staff can
+    see whether the retry actually landed.
+    """
+    try:
+        invoice = commerce_service.get_staff_invoice(db, invoice_id)
+    except commerce_service.CommerceNotFoundError as exc:
+        raise _validation_error(exc)
+
+    if invoice.state == "paid":
+        event = commerce_notifications.EVENT_PAYMENT_VERIFIED
+    elif invoice.state == "approved":
+        event = commerce_notifications.EVENT_INVOICE_APPROVED
+    else:
+        raise HTTPException(
+            status_code=400, detail="فاکتور در وضعیتی نیست که اطلاعرسانی داشته باشد"
+        )
+
+    channels = commerce_notifications.notify_admin(event, invoice)
+    log_user(
+        user, db, "notify", "commerce_invoice", invoice.id,
+        f"ارسال مجدد اطلاع فاکتور #{invoice.id}",
+    )
+    return {"invoice_id": invoice.id, "event": event, "channels": channels}
 
 
 @router.get("/invoices/{token}")

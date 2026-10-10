@@ -12,6 +12,7 @@ Design rules enforced here (see plan Global Constraints):
 """
 import hashlib
 import json
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,9 @@ from app.models import (
     OrderItem,
     Product,
 )
+from app.services import commerce_notifications
+
+_logger = logging.getLogger(__name__)
 
 # Public payload envelope (mirrors the Pydantic constraints in the router).
 MAX_DISTINCT_PRODUCTS = 30
@@ -49,6 +53,20 @@ RECEIPT_PREFIX = "REQ"
 
 class CommerceValidationError(Exception):
     """Domain-level rejection of a public commerce payload (maps to HTTP 400)."""
+
+
+def _emit_admin_notification(event: str, subject) -> None:
+    """Fire an *after-commit* admin notification; never affects the transaction.
+
+    Called only once a state change is committed, so a notification (or any
+    unexpected error in the notification layer) can never roll back or lose a
+    committed order/invoice — it is logged and swallowed. Each channel is
+    attempted independently inside ``notify_admin``.
+    """
+    try:
+        commerce_notifications.notify_admin(event, subject)
+    except Exception as exc:  # noqa: BLE001 - notifications are best-effort
+        _logger.warning("admin notification failed event=%s: %s", event, exc)
 
 
 def generate_receipt_id() -> str:
@@ -139,8 +157,8 @@ def create_website_request(
     db.commit()
     db.refresh(request)
 
-    # Task 4 emits the `request_created` admin notification here, *after* this
-    # commit, so a notification failure can never roll back a committed order.
+    # After-commit: alert staff that a website request arrived. Never raises.
+    _emit_admin_notification(commerce_notifications.EVENT_REQUEST_CREATED, request)
     return request
 
 
@@ -455,6 +473,11 @@ def _get_invoice(db: Session, invoice_id: int) -> CommerceInvoice:
     return invoice
 
 
+def get_staff_invoice(db: Session, invoice_id: int) -> CommerceInvoice:
+    """Public lookup for a staff action (raises ``CommerceNotFoundError``)."""
+    return _get_invoice(db, invoice_id)
+
+
 def _apply_items(invoice: CommerceInvoice, normalized_items: list[dict]) -> None:
     invoice.items.clear()
     for item in normalized_items:
@@ -600,6 +623,9 @@ def approve_invoice(db: Session, invoice_id: int) -> tuple[CommerceInvoice, str]
 
     db.commit()
     db.refresh(invoice)
+    # After-commit: the private link/token is NOT broadcast — only the fact of
+    # approval and a minimized summary. Never raises.
+    _emit_admin_notification(commerce_notifications.EVENT_INVOICE_APPROVED, invoice)
     return invoice, raw_token
 
 
@@ -995,6 +1021,11 @@ def settle_verified_payment(
     attempt.last_error = None
     db.commit()
     db.refresh(attempt)
+    # After-commit: this is the single claimed `approved -> paid` transition, so
+    # the paid alert fires exactly once even if the callback is replayed (later
+    # callbacks return via the `state == 'paid'` branch above and never reach
+    # here). Never raises.
+    _emit_admin_notification(commerce_notifications.EVENT_PAYMENT_VERIFIED, invoice)
     return attempt
 
 
