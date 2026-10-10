@@ -24,6 +24,13 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Redact the public invoice bearer token from uvicorn's access log at startup.
+# nginx disables its own access log for the token prefix, but this direct layer
+# keeps the credential out of the backend log too — without turning access
+# logging off. Idempotent; safe if the app is imported more than once.
+from app.log_redaction import install_access_log_redaction
+install_access_log_redaction()
 from fastapi import FastAPI, Depends, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles

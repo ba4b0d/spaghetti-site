@@ -230,7 +230,9 @@ as an untrusted hint — the invoice is settled only after a server-side
   callback: the attempt keeps its verified evidence (`state=verified` +
   tracking/`verified_at`) and is flagged `reconciliation_required` for the
   staff/refund queue above, and the customer is sent to a neutral
-  `payment=pending` result page.
+  `payment=pending` result page. A **replay** of that flagged attempt (a gateway
+  retry or the customer re-submitting the form) returns the same `pending` — it
+  never reports `success` while the invoice is unsettled and no order exists.
 - **Client IP / rate-limit trust behind the proxy.** slowapi keys login and
   callback limits on the client address, which only equals the real client when
   uvicorn trusts the reverse proxy. nginx is pinned to a static IP
@@ -238,9 +240,24 @@ as an untrusted hint — the invoice is settled only after a server-side
   `--forwarded-allow-ips 172.28.0.2` — **never `*`** — and nginx *overwrites*
   `X-Forwarded-For` with the true peer. A direct request to the published
   backend port (whose peer is not the proxy) therefore cannot forge its IP, and
-  two clients behind nginx keep separate rate-limit buckets. The `~* ^/pay/`
-  nginx location disables access logging so the bearer token in the path is
-  never written to the log, while keeping the page's security headers.
+  two clients behind nginx keep separate rate-limit buckets.
+- **The invoice bearer token is kept out of the logs.** The public token is a
+  URL path credential, and the pay page hits it on every load, so it is
+  redacted at **both** layers:
+  - **nginx** disables its access log for the token-bearing paths — the
+    `/pay/<token>` page **and** the `/api/v1/commerce/invoices/<token>…` API
+    the page calls (`GET` and `POST …/pay`). The API prefix uses a dedicated,
+    *longer* `^~` prefix (plus a case-insensitive `~*` companion for mixed-case
+    variants), because an `^~` prefix match stops regex evaluation and would
+    otherwise shadow a plain `~*` block — the token would still be logged. The
+    `/pay/` page keeps its security headers (no-referrer, no-store, CSP).
+  - **backend** installs a `logging.Filter` on `uvicorn.access` that rewrites
+    the token path segment to `<redacted>`, for any case, **without** disabling
+    access logging (`app/log_redaction.py`).
+  - **Residual:** nginx's *error* log can still record the full request line
+    (including the token) when an upstream error embeds the URI. A hardened
+    deployment should lower `error_log` to `crit` so those lines are not kept;
+    the access-log leak is fully closed.
 
 ---
 

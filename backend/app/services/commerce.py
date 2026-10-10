@@ -1301,7 +1301,15 @@ def handle_digipay_callback(
     if attempt is None:
         return "failed"
     if attempt.state == "verified":
-        return "success"  # idempotent replay
+        # A genuine verify whose attempt could NOT be settled is flagged for
+        # staff reconciliation (wrong/stale customer invoice, revoked link). A
+        # replay must NOT report success: the invoice is still unsettled and no
+        # order exists, so a "success" here would contradict the first (pending)
+        # response and mislead the customer. Keep it pending until staff settle
+        # it via reconciliation.
+        if attempt.reconciliation_required:
+            return "pending"
+        return "success"  # idempotent replay of a settled payment
 
     def _hold(reason) -> None:
         # Never claim a definite failure on an untrusted callback signal: keep

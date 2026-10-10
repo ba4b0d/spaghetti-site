@@ -484,7 +484,12 @@ class CommerceInvoiceItem(Base):
 COMMERCE_PAYMENT_ATTEMPT_STATES = (
     "initiating",  # persisted before the ticket request; no redirect yet
     "pending",     # ticket issued, awaiting the provider callback
-    "verified",    # server-side verify confirmed success (settled)
+    # Server-side verify confirmed success. Two sub-cases: the invoice was
+    # settled (the normal case), OR the attempt could not be settled against
+    # its invoice and is flagged ``reconciliation_required`` (genuine money,
+    # wrong/stale/revoked invoice) — never both, and never a settlement claim
+    # when the flag is set.
+    "verified",
     "failed",      # refused/mismatched/revoked (terminal)
     "unknown",     # provider/network error — needs staff reconciliation
 )

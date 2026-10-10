@@ -1398,6 +1398,54 @@ def test_stale_genuine_callback_never_settles_current_invoice(
     assert rows[attempt.id]["state"] == "verified"
 
 
+def test_replayed_reconciliation_callback_stays_pending_not_success(
+    client, auth_headers, fake_provider
+):
+    """N1 — a flagged (unsettled) verified attempt must not replay as success.
+
+    The first callback for a stale attempt returns ``pending`` and flags the
+    attempt for staff. A re-posted callback (gateway retry, or the customer
+    re-submitting the gateway form) must report the *same* pending outcome —
+    never a contradictory ``success`` — while the invoice stays unsettled and
+    the money evidence is preserved.
+    """
+    from app.models import CommerceInvoice, CommercePaymentAttempt, Order
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    _mutate_invoice(invoice_id, revision_delta=1, total_delta=50000)
+    payload = callback_payload(attempt)
+
+    first = client.post(CALLBACK, data=payload, follow_redirects=False)
+    assert first.status_code in (302, 303), first.text
+    assert "payment=pending" in first.headers["location"]
+
+    for _ in range(2):  # replay the identical callback twice
+        replay = client.post(CALLBACK, data=payload, follow_redirects=False)
+        assert replay.status_code in (302, 303), replay.text
+        assert "payment=pending" in replay.headers["location"]
+        assert "payment=success" not in replay.headers["location"]
+        assert token not in replay.headers["location"]
+
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"  # still unpaid
+        refreshed = (
+            db.query(CommercePaymentAttempt)
+            .filter_by(provider_id=attempt.provider_id)
+            .one()
+        )
+        # Money evidence intact; still queued for staff reconciliation.
+        assert refreshed.state == "verified"
+        assert refreshed.reconciliation_required is True
+        assert refreshed.tracking_code == "TRK-1"
+        assert refreshed.verified_at is not None
+        # No order was fabricated by the first callback or either replay.
+        assert db.query(Order).count() == 0
+    finally:
+        db.close()
+
+
 def test_revoked_invoice_verified_payment_preserved_and_queued(
     client, auth_headers, fake_provider
 ):
