@@ -108,6 +108,34 @@ describe('commerceApi public contract', () => {
     expect(commerceClient.post).toHaveBeenCalledWith('/staff/invoices/7/revoke');
   });
 
+  it('reads a public invoice by its private token', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+    const config = { signal: new AbortController().signal };
+
+    mod.getPublicInvoice('tok_ABC-123', config);
+
+    expect(commerceClient.get).toHaveBeenCalledWith('/invoices/tok_ABC-123', config);
+  });
+
+  it('url-encodes the token path so it never lands in a query string', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+
+    mod.getPublicInvoice('a/b?c=1');
+
+    const [url, config] = commerceClient.get.mock.calls[0];
+    expect(url).toBe('/invoices/a%2Fb%3Fc%3D1');
+    expect(url).not.toContain('?');
+    expect(config).toBeUndefined();
+  });
+
+  it('starts a DigiPay payment via the token-scoped pay endpoint', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+
+    mod.payInvoice('tok_XYZ');
+
+    expect(commerceClient.post).toHaveBeenCalledWith('/invoices/tok_XYZ/pay');
+  });
+
   it('does not force a login redirect on a public 401', async () => {
     const { commerceClient } = await loadCommerceApi();
     const errorHandler = commerceClient.interceptors.response.use.mock.calls[0][1];

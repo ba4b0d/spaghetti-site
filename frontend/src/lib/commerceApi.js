@@ -56,4 +56,22 @@ export const approveStaffInvoice = (id) =>
 export const revokeStaffInvoice = (id) =>
   commerceApi.post(`/staff/invoices/${id}/revoke`);
 
+// ── Public invoice payment (Task 3) ──────────────────────────────────
+//
+// The invoice token is a private bearer credential carried in the URL. These
+// two calls are the only place it is sent, always as a URL-encoded path
+// segment; it is never logged and never forwarded anywhere else.
+
+/** Public — minimal read of an approved/paid invoice behind its private token. */
+export const getPublicInvoice = (token, config) =>
+  commerceApi.get(`/invoices/${encodeURIComponent(token)}`, config);
+
+/**
+ * Public — start (or resume) a DigiPay UPG payment for an approved invoice.
+ * Returns `{ state, amount_rial, redirect_url }`; the caller validates
+ * `redirect_url` against the DigiPay allowlist before sending the browser.
+ */
+export const payInvoice = (token) =>
+  commerceApi.post(`/invoices/${encodeURIComponent(token)}/pay`);
+
 export default commerceApi;

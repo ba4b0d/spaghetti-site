@@ -24,6 +24,8 @@ const CustomOrder = lazy(() => import('./pages/CustomOrder'));
 const Privacy = lazy(() => import('./pages/Privacy'));
 const Terms = lazy(() => import('./pages/Terms'));
 const DigitalCard = lazy(() => import('./pages/DigitalCard'));
+const InvoicePayment = lazy(() => import('./pages/InvoicePayment'));
+const PaymentResult = lazy(() => import('./pages/PaymentResult'));
 const UsersPage = lazy(() => import('./pages/Users'));
 const Categories = lazy(() => import('./pages/Categories'));
 const Collections = lazy(() => import('./pages/Collections'));
@@ -93,6 +95,10 @@ function AppRoutes() {
                 <Route path="/cart" element={<CatalogLayout><CheckoutRequest /></CatalogLayout>} />
                 <Route path="/contact" element={<CatalogLayout><Contact /></CatalogLayout>} />
                 <Route path="/card" element={<DigitalCard />} />
+                {/* Generic, token-free result page (backend callback 303 target). */}
+                <Route path="/pay/result" element={<PaymentResult />} />
+                {/* Public private invoice payment page. */}
+                <Route path="/pay/:token" element={<InvoicePayment />} />
                 <Route path="/how-to-order" element={<CatalogLayout><HowToOrder /></CatalogLayout>} />
                 <Route path="/custom-order" element={<CatalogLayout><CustomOrder /></CatalogLayout>} />
                 <Route path="/privacy" element={<CatalogLayout><Privacy /></CatalogLayout>} />
