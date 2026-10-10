@@ -53,6 +53,7 @@ from app.routers.custom_orders import router as custom_orders_router
 from app.routers.customers import router as customers_router
 from app.routers.audit_logs import router as audit_router
 from app.routers.commerce import router as commerce_router
+from app.routers.digipay_callback import router as digipay_callback_router
 from app.telegram_bot import start_telegram_bot_thread, send_telegram_notification
 
 from sqlalchemy import inspect, text
@@ -357,6 +358,7 @@ app.include_router(customers_router)
 app.include_router(audit_router)
 app.include_router(catalog_router)  # No auth — public catalog
 app.include_router(commerce_router)  # Public request intake + staff request listing (auth per route)
+app.include_router(digipay_callback_router)  # DigiPay UPG callback (untrusted form POST, verify server-side)
 
 # ── Static files for uploads with immutable caching ─────────────────
 class CachedStaticFiles(StaticFiles):

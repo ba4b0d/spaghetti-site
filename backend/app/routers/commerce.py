@@ -23,6 +23,7 @@ from app.audit import log_user
 from app.database import get_db
 from app.routers.auth import limiter, require_staff_role
 from app.services import commerce as commerce_service
+from app.services import digipay
 from app.services.commerce import (
     MAX_DISTINCT_PRODUCTS,
     MAX_INVOICE_ITEMS,
@@ -67,6 +68,10 @@ def _validation_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=410, detail=str(exc))
     if isinstance(exc, commerce_service.CommerceStateError):
         return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, commerce_service.CommerceGatewayUnavailableError):
+        return HTTPException(status_code=503, detail=str(exc))
+    if isinstance(exc, commerce_service.CommercePaymentError):
+        return HTTPException(status_code=502, detail=str(exc))
     if isinstance(exc, commerce_service.CommerceConfigError):
         return HTTPException(status_code=500, detail="پیکربندی آدرس عمومی سایت نامعتبر است")
     return HTTPException(status_code=400, detail=str(exc))
@@ -427,3 +432,61 @@ def read_public_invoice(
         http_exc.headers = {**(http_exc.headers or {}), **NO_STORE_HEADERS}
         raise http_exc
     return commerce_service.serialize_public_invoice(invoice)
+
+
+# ── Task 3: public payment initiation ────────────────────────────────
+
+@router.post("/invoices/{token}/pay")
+@limiter.limit("10/minute")
+def pay_invoice(
+    request: Request,
+    response: Response,
+    token: str = Path(..., min_length=1, max_length=200),
+    db: Session = Depends(get_db),
+    client=Depends(digipay.client_dependency),
+):
+    """Public — start (or resume) a DigiPay UPG payment for an approved invoice.
+
+    Creates a durable ``CommercePaymentAttempt``, requests a business ticket and
+    returns the provider's HTTPS ``redirect_url``. Valid only for an approved,
+    unexpired, unpaid invoice; repeated clicks while an attempt is in flight are
+    idempotent. The private bearer token is never forwarded to the gateway.
+    """
+    response.headers.update(NO_STORE_HEADERS)
+
+    if client is None:
+        try:
+            client = digipay.get_client()
+        except digipay.DigiPayConfigError:
+            http_exc = HTTPException(status_code=503, detail="درگاه پرداخت پیکربندی نشده است")
+            http_exc.headers = {**NO_STORE_HEADERS}
+            raise http_exc
+
+    try:
+        callback_url = digipay.build_callback_url()
+    except digipay.DigiPayConfigError as exc:
+        http_exc = HTTPException(status_code=500, detail="پیکربندی درگاه پرداخت نامعتبر است")
+        http_exc.headers = {**NO_STORE_HEADERS}
+        raise http_exc from exc
+
+    try:
+        invoice = commerce_service.resolve_public_invoice(db, token)
+        attempt = commerce_service.start_payment(db, invoice, client, callback_url=callback_url)
+    except (
+        CommerceValidationError,
+        commerce_service.CommerceNotFoundError,
+        commerce_service.CommerceGoneError,
+        commerce_service.CommerceStateError,
+        commerce_service.CommerceConfigError,
+        commerce_service.CommercePaymentError,
+        commerce_service.CommerceGatewayUnavailableError,
+    ) as exc:
+        http_exc = _validation_error(exc)
+        http_exc.headers = {**(http_exc.headers or {}), **NO_STORE_HEADERS}
+        raise http_exc
+
+    return {
+        "state": attempt.state,
+        "amount_rial": attempt.amount_rial,
+        "redirect_url": attempt.redirect_url,
+    }

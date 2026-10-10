@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, String, Boolean, Date, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, Float, String, Boolean, Date, DateTime, ForeignKey, UniqueConstraint, Index, text
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 import re
@@ -474,4 +474,77 @@ class CommerceInvoiceItem(Base):
 
     invoice = relationship("CommerceInvoice", back_populates="items")
     product = relationship("Product", lazy="joined")
+
+
+# ── Commerce: durable payment attempts (Task 3) ───────────────────────
+# A payment attempt is the merchant-side record of one gateway session. It is
+# persisted BEFORE any network call so a crash/timeout still leaves a
+# reconcilable row, and it carries the immutable amount + unique provider
+# reference DigiPay echoes back on the callback.
+COMMERCE_PAYMENT_ATTEMPT_STATES = (
+    "initiating",  # persisted before the ticket request; no redirect yet
+    "pending",     # ticket issued, awaiting the provider callback
+    "verified",    # server-side verify confirmed success (settled)
+    "failed",      # refused/mismatched/revoked (terminal)
+    "unknown",     # provider/network error — needs staff reconciliation
+)
+
+# States that count as "in flight": they block a second concurrent initiation
+# and a staff edit/revoke until the outcome is known.
+ACTIVE_PAYMENT_ATTEMPT_STATES = ("initiating", "pending", "unknown")
+
+PAYMENT_PROVIDER_DIGIPAY = "digipay"
+
+# DigiPay UPG ticket type used in v1. Only the IPG/Wallet direct-payment flow
+# is enabled: credit/BNPL additionally require a `basketDetailsDto` payload and
+# a post-fulfillment `/purchases/deliver` call, so they are intentionally not
+# requested here (see the Task 3 report for the documented limitation).
+DIGIPAY_TICKET_TYPE = 11
+
+
+class CommercePaymentAttempt(Base):
+    """One durable gateway attempt for a CommerceInvoice.
+
+    ``provider_id`` is the unique merchant reference sent to DigiPay and echoed
+    back on the callback, which is how a stateless callback is matched to its
+    invoice without a bearer token in the URL. ``amount_rial`` is the immutable
+    Toman→Rial conversion (total_toman * 10) computed server-side exactly once.
+    """
+    __tablename__ = "commerce_payment_attempts"
+    __table_args__ = (
+        # At most one in-flight attempt per invoice. Released automatically when
+        # an attempt settles (verified/failed), so replay/retry is safe.
+        Index(
+            "uq_commerce_payment_active_invoice",
+            "invoice_id",
+            unique=True,
+            sqlite_where=text("state IN ('initiating', 'pending', 'unknown')"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    invoice_id = Column(
+        Integer,
+        ForeignKey("commerce_invoices.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider = Column(String(20), nullable=False, default=PAYMENT_PROVIDER_DIGIPAY)
+    state = Column(String(20), nullable=False, default="initiating", index=True)
+    provider_id = Column(String(80), nullable=False, unique=True, index=True)
+    amount_rial = Column(Integer, nullable=False, default=0)
+    invoice_revision = Column(Integer, nullable=False, default=1)
+    type = Column(Integer, nullable=False, default=DIGIPAY_TICKET_TYPE)
+    tracking_code = Column(String(80), nullable=True)
+    redirect_url = Column(String(1000), nullable=True)
+    last_error = Column(String(300), nullable=True)
+    verified_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    invoice = relationship("CommerceInvoice", lazy="joined")
 

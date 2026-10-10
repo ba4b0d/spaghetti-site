@@ -11,11 +11,13 @@ Design rules enforced here (see plan Global Constraints):
 - Money kept as integer Toman; no floating point math on amounts.
 """
 import hashlib
+import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
@@ -24,8 +26,11 @@ from app.models import (
     MAX_INVOICE_TOTAL_TOMAN,
     CommerceInvoice,
     CommerceInvoiceItem,
+    CommercePaymentAttempt,
     CommerceRequest,
     CommerceRequestItem,
+    Order,
+    OrderItem,
     Product,
 )
 
@@ -728,3 +733,358 @@ def serialize_public_invoice(invoice: CommerceInvoice) -> dict:
         ),
         "approved_at": invoice.approved_at.isoformat() if invoice.approved_at else None,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Task 3 — durable payment attempts + DigiPay UPG settlement
+# ══════════════════════════════════════════════════════════════════════
+
+TOMAN_TO_RIAL = 10
+PAYMENT_PROVIDER_DIGIPAY = "digipay"
+DIGIPAY_TICKET_TYPE = 11
+ACTIVE_ATTEMPT_STATES = ("initiating", "pending", "unknown")
+PROVIDER_ID_PREFIX = "INV"
+# Public, non-secret confirmation page. The raw bearer token is never persisted,
+# so a gateway callback cannot rebuild the `/pay/{token}` URL — and must not,
+# since that would leak the token into the redirect/logs.
+PAYMENT_RESULT_PATH = "/pay/result"
+
+
+class CommercePaymentError(Exception):
+    """Provider/network failure while initiating or verifying (HTTP 502)."""
+
+
+class CommerceGatewayUnavailableError(Exception):
+    """Payment provider is not configured on this deployment (HTTP 503)."""
+
+
+def _short(value, limit: int = 300) -> str:
+    return str(value)[:limit]
+
+
+def toman_to_rial(total_toman: int) -> int:
+    """Exact integer Toman → Rial conversion, applied once at the boundary."""
+    if isinstance(total_toman, bool) or not isinstance(total_toman, int) or total_toman <= 0:
+        raise CommerceStateError("مبلغ فاکتور نامعتبر است")
+    return total_toman * TOMAN_TO_RIAL
+
+
+def generate_payment_provider_id(invoice: CommerceInvoice) -> str:
+    """Unique, non-secret merchant reference echoed back by the gateway."""
+    return f"{PROVIDER_ID_PREFIX}{invoice.id}-R{invoice.revision}-{secrets.token_hex(8)}"
+
+
+def find_active_payment_attempt(db: Session, invoice: CommerceInvoice) -> CommercePaymentAttempt | None:
+    return (
+        db.query(CommercePaymentAttempt)
+        .filter(
+            CommercePaymentAttempt.invoice_id == invoice.id,
+            CommercePaymentAttempt.state.in_(ACTIVE_ATTEMPT_STATES),
+        )
+        .order_by(CommercePaymentAttempt.id.desc())
+        .first()
+    )
+
+
+def find_payment_attempt_by_provider_id(db: Session, provider_id: str | None) -> CommercePaymentAttempt | None:
+    if not provider_id:
+        return None
+    return (
+        db.query(CommercePaymentAttempt)
+        .filter(CommercePaymentAttempt.provider_id == provider_id)
+        .first()
+    )
+
+
+def assert_payment_allowed(invoice: CommerceInvoice) -> None:
+    """Only an approved, unexpired, unpaid invoice may start a payment."""
+    if invoice.state == "paid" or invoice.order_id is not None:
+        raise CommerceStateError("این فاکتور قبلاً پرداخت شده است")
+    if invoice.state != "approved":
+        raise CommerceStateError("این فاکتور برای پرداخت آماده نیست")
+    if is_link_expired(invoice):
+        raise CommerceGoneError("لینک فاکتور منقضی شده است")
+    assert_payable_total(invoice)
+
+
+def start_payment(
+    db: Session,
+    invoice: CommerceInvoice,
+    client,
+    *,
+    callback_url: str,
+) -> CommercePaymentAttempt:
+    """Create (or resume) the durable attempt and request a UPG ticket.
+
+    Idempotent while an attempt is in flight: a repeated click returns the
+    existing ticket's redirect instead of minting a second session. The
+    attempt row is committed *before* the network call so a crash or timeout
+    still leaves a reconcilable ``unknown``/``initiating`` row.
+    """
+    assert_payment_allowed(invoice)
+    amount_rial = toman_to_rial(invoice.total_toman)
+
+    attempt = find_active_payment_attempt(db, invoice)
+    if attempt is not None and attempt.redirect_url:
+        return attempt
+
+    if attempt is None:
+        attempt = CommercePaymentAttempt(
+            invoice_id=invoice.id,
+            provider=PAYMENT_PROVIDER_DIGIPAY,
+            state="initiating",
+            provider_id=generate_payment_provider_id(invoice),
+            amount_rial=amount_rial,
+            invoice_revision=invoice.revision,
+            type=DIGIPAY_TICKET_TYPE,
+        )
+        db.add(attempt)
+    else:
+        attempt.amount_rial = amount_rial
+        attempt.invoice_revision = invoice.revision
+        attempt.type = DIGIPAY_TICKET_TYPE
+        attempt.state = "initiating"
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a race against a concurrent initiation (partial unique index).
+        db.rollback()
+        existing = find_active_payment_attempt(db, invoice)
+        if existing is not None and existing.redirect_url:
+            return existing
+        raise CommerceStateError("پرداخت دیگری برای این فاکتور در حال انجام است")
+
+    db.refresh(attempt)
+    try:
+        ticket = client.create_ticket(
+            amount_rial=amount_rial,
+            mobile=invoice.mobile,
+            provider_id=attempt.provider_id,
+            callback_url=callback_url,
+        )
+    except Exception as exc:  # noqa: BLE001 - gateway boundary → recoverable
+        attempt.state = "unknown"
+        attempt.last_error = _short(exc)
+        db.commit()
+        raise CommercePaymentError("ارتباط با درگاه پرداخت ناموفق بود") from exc
+
+    attempt.redirect_url = ticket["redirect_url"]
+    attempt.state = "pending"
+    attempt.last_error = None
+    db.commit()
+    db.refresh(attempt)
+    return attempt
+
+
+def _create_legacy_order(db: Session, invoice: CommerceInvoice) -> Order:
+    """One legacy Order (+items) mirroring the paid invoice, paid in full.
+
+    A synthetic shipping line keeps ``sum(items) == paid_amount == total_toman``
+    so the existing order board's accounting stays consistent. Status stays
+    ``new``: fulfillment remains a staff decision, never auto-set to printing.
+    """
+    items = list(invoice.items)
+    qty = sum(i.qty for i in items) or 1
+    order = Order(
+        customer_name=invoice.customer_name,
+        contact=invoice.mobile,
+        product_label=(items[0].description if items else "سفارش آنلاین"),
+        qty=qty,
+        quoted_price=float(invoice.total_toman) / qty,
+        paid_amount=float(invoice.total_toman),
+        status="new",
+        notes=f"پرداخت آنلاین فاکتور #{invoice.id} از طریق دیجی‌پی",
+        is_active=True,
+    )
+    db.add(order)
+    db.flush()
+    for item in items:
+        db.add(
+            OrderItem(
+                order_id=order.id,
+                product_id=item.product_id,
+                product_label=item.description,
+                qty=item.qty,
+                unit_price=float(item.unit_toman),
+            )
+        )
+    if invoice.shipping_toman:
+        db.add(
+            OrderItem(
+                order_id=order.id,
+                product_id=None,
+                product_label="هزینه ارسال",
+                qty=1,
+                unit_price=float(invoice.shipping_toman),
+            )
+        )
+    db.flush()
+    return order
+
+
+def settle_verified_payment(
+    db: Session, attempt: CommercePaymentAttempt, *, tracking_code: str
+) -> CommercePaymentAttempt:
+    """Atomically mark the attempt verified, the invoice paid and link ONE order.
+
+    Safe under replay/concurrency: the ``approved → paid`` transition is claimed
+    with a single conditional UPDATE, so only the first writer creates the
+    legacy order. Later callers see ``state == 'paid'`` and no-op.
+    """
+    invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
+    if invoice is None:
+        raise CommerceNotFoundError("فاکتور یافت نشد")
+
+    if invoice.state == "paid":
+        # Already settled (replay, or a second attempt racing the first).
+        attempt.state = "verified"
+        attempt.tracking_code = attempt.tracking_code or tracking_code
+        attempt.verified_at = attempt.verified_at or _now()
+        db.commit()
+        return attempt
+
+    claimed = (
+        db.query(CommerceInvoice)
+        .filter(CommerceInvoice.id == invoice.id, CommerceInvoice.state == "approved")
+        .update(
+            {CommerceInvoice.state: "paid", CommerceInvoice.updated_at: _now()},
+            synchronize_session=False,
+        )
+    )
+    if claimed == 0:
+        db.rollback()
+        invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
+        if invoice is None or invoice.state != "paid":
+            raise CommerceStateError("وضعیت فاکتور برای تسویه نامعتبر است")
+        attempt.state = "verified"
+        attempt.tracking_code = attempt.tracking_code or tracking_code
+        attempt.verified_at = attempt.verified_at or _now()
+        db.commit()
+        return attempt
+
+    db.expire_all()
+    invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
+    if invoice.order_id is None:
+        order = _create_legacy_order(db, invoice)
+        invoice.order_id = order.id
+
+    attempt.state = "verified"
+    attempt.tracking_code = tracking_code
+    attempt.verified_at = _now()
+    attempt.last_error = None
+    db.commit()
+    db.refresh(attempt)
+    return attempt
+
+
+def _int_or_none(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _callback_result_is_failure(result_value) -> bool:
+    """DigiPay may post ``result`` as a JSON document or a bare status token."""
+    if result_value is None:
+        return False
+    text = str(result_value).strip()
+    if not text:
+        return False
+    if text[:1] in ("{", "["):
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            status = _int_or_none(parsed.get("status"))
+            if status is not None:
+                return status != 0
+            return str(parsed.get("result", "")).strip().upper() in (
+                "FAILURE", "FAILED", "ERROR",
+            )
+    return text.upper() in ("FAILURE", "FAILED", "ERROR", "NOK")
+
+
+def _verify_confirms(verified: dict, attempt: CommercePaymentAttempt) -> bool:
+    """Strict server-side confirmation: status 0 and identity/amount match."""
+    if not isinstance(verified, dict):
+        return False
+    if _int_or_none(verified.get("status")) != 0:
+        return False
+    if _int_or_none(verified.get("amount")) != attempt.amount_rial:
+        return False
+    provider_id = verified.get("providerId") or verified.get("provider_id")
+    if provider_id != attempt.provider_id:
+        return False
+    vtype = _int_or_none(verified.get("type"))
+    if vtype is not None and vtype != attempt.type:
+        return False
+    return True
+
+
+def handle_digipay_callback(
+    db: Session,
+    client,
+    *,
+    provider_id: str | None,
+    amount,
+    tracking_code: str | None,
+    type_value,
+    result_value,
+) -> str:
+    """Process an untrusted provider callback.
+
+    Returns ``success`` | ``failed`` | ``pending``. The callback is treated as a
+    hint only: the invoice is settled solely when a server-to-server verify
+    confirms ``status == 0`` with a matching providerId, amount and type.
+    """
+    attempt = find_payment_attempt_by_provider_id(db, provider_id)
+    if attempt is None:
+        return "failed"
+    if attempt.state == "verified":
+        return "success"  # idempotent replay
+
+    def _fail(reason: str) -> None:
+        if attempt.state in ACTIVE_ATTEMPT_STATES:
+            attempt.state = "failed"
+            attempt.last_error = _short(reason)
+            db.commit()
+
+    if _int_or_none(amount) != attempt.amount_rial:
+        _fail("callback amount mismatch")
+        return "failed"
+    if _int_or_none(type_value) != attempt.type:
+        _fail("callback type mismatch")
+        return "failed"
+    if not (tracking_code or "").strip():
+        _fail("callback missing trackingCode")
+        return "failed"
+    if _callback_result_is_failure(result_value):
+        _fail("callback reported failure")
+        return "failed"
+
+    try:
+        verified = client.verify(
+            tracking_code=tracking_code.strip(),
+            provider_id=attempt.provider_id,
+            type=attempt.type,
+        )
+    except Exception as exc:  # noqa: BLE001 - transient → recoverable unknown
+        if attempt.state in ACTIVE_ATTEMPT_STATES:
+            attempt.state = "unknown"
+            attempt.last_error = _short(exc)
+            db.commit()
+        return "pending"
+
+    if not _verify_confirms(verified, attempt):
+        _fail("provider verify did not confirm")
+        return "failed"
+
+    settle_verified_payment(db, attempt, tracking_code=tracking_code.strip())
+    return "success"
