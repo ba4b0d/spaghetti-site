@@ -114,7 +114,7 @@ Copy `.env.example` to `.env` and configure:
 | `LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`) | `INFO` |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot API token (a non-empty DB Settings `telegram_bot_token` overrides it) | *optional* |
 | `TELEGRAM_ADMIN_CHAT_ID` | Comma-separated admin chat IDs (DB Settings `telegram_admin_chat_id` overrides it) | *optional* |
-| `TELEGRAM_PROXY` | SOCKS5 proxy for the Telegram API, e.g. `socks5://192.168.100.50:10806`. Use the `socks5` scheme, **not** `socks5h`. DB Settings `telegram_proxy` overrides this env value | *optional* |
+| `TELEGRAM_PROXY` | SOCKS5 proxy for the Telegram API, e.g. `socks5://192.168.100.50:10805`. Use the `socks5` scheme, **not** `socks5h`. DB Settings `telegram_proxy` overrides this env value | *optional* |
 | `PUBLIC_SITE_ORIGIN` | Bare HTTPS origin for customer invoice links (a bare `localhost`/`127.0.0.1` host is allowed for dev) | `https://spaghettiprints.ir` |
 | `DIGIPAY_CLIENT_ID` / `DIGIPAY_CLIENT_SECRET` / `DIGIPAY_USERNAME` / `DIGIPAY_PASSWORD` | DigiPay UPG merchant credentials. Leave blank to disable online payment — the pay endpoint then returns `503` instead of pretending to work | *optional* |
 | `DIGIPAY_ENV` | DigiPay UPG base URL selector: `production` or `staging` | `production` |
@@ -203,10 +203,11 @@ as an untrusted hint — the invoice is settled only after a server-side
   `telegram_proxy`). A proxy saved in the admin Settings page therefore wins
   over the env value — do **not** overwrite an existing `telegram_proxy` setting
   without operator approval. The proxy must use the `socks5` scheme (e.g.
-  `socks5://192.168.100.50:10806`), **not** `socks5h`. A reachable SOCKS5 TCP
-  port does **not** prove Telegram HTTPS works through it — DNS resolution
-  through the proxy has been observed to time out (5-15s) — so verify a real
-  send before relying on Telegram alerts. This is why alerts are best-effort and
+  `socks5://192.168.100.50:10805`), **not** `socks5h`. A reachable SOCKS5 TCP
+  port does **not** prove Telegram HTTPS works through it — the previous
+  `:10806` proxy timed out, while a no-credential HTTPS probe via `:10805`
+  reached Telegram (HTTP 302). Verify a real authorized send before relying
+  on Telegram alerts. This is why alerts are best-effort and
   kept off the request path (see the retry endpoints above).
 - **Reconciling unknown / stuck payments.** `GET
   /api/v1/commerce/staff/payments` lists in-flight, aging attempts (bounded;
