@@ -393,6 +393,44 @@ def test_post_sms_ir_verify_http_error_returns_false():
     ) is False
 
 
+def test_send_customer_otp_uses_otp_and_time_template_params(monkeypatch):
+    """Cart-OTP template 337011 substitutes the exact names ``OTP`` / ``TIME``.
+
+    The approved customer template carries ``#OTP#`` (the one-time code) and
+    ``#TIME#`` (validity in minutes). SMS.ir substitutes by exact,
+    case-sensitive name, so the single old ``CODE`` parameter left both
+    placeholders unsubstituted and the customer received the literal text.
+    """
+    # Deterministic regardless of a developer's .env.
+    for var in (
+        "SMS_IR_OTP_TEMPLATE_ID",
+        "SMS_IR_OTP_PARAM_OTP",
+        "SMS_IR_OTP_PARAM_TIME",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SMS_IR_API_KEY", "K")
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        cn, "post_sms_ir_verify", lambda **kw: captured.update(kw) or True
+    )
+
+    from app.services.commerce_otp import OTP_TTL_SECONDS
+
+    assert cn.send_customer_otp("09120000000", "54321") is True
+
+    assert captured["mobile"] == "09120000000"
+    assert captured["template_id"] == 337011  # the customer OTP template
+    params = captured["parameters"]
+    assert [p["name"] for p in params] == ["OTP", "TIME"]
+    assert {p["name"]: p["value"] for p in params} == {
+        "OTP": "54321",
+        "TIME": str(OTP_TTL_SECONDS // 60),
+    }
+    # A 120s TTL renders as 2 minutes in the template's ``#TIME#``.
+    assert {p["name"]: p["value"] for p in params}["TIME"] == "2"
+
+
 def test_smtp_starttls_login_and_send():
     instances = []
     config = {

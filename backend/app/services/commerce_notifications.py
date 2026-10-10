@@ -40,6 +40,7 @@ Design rules enforced here (see spec "Notifications"):
 """
 import html
 import logging
+import math
 import os
 import smtplib
 import ssl
@@ -97,10 +98,16 @@ SMS_PARAM_CODE = "CODE"
 # The one-time code sent to a *customer's own* mobile at checkout is a
 # FUNCTIONAL delivery, independent of the admin-alert channel above: it needs
 # only the API key and its own approved template, never the admin recipient or
-# the COMMERCE_NOTIFY_SMS flag. Placeholder is the UPPERCASE "CODE", matching
-# this provider's case-sensitive substitution convention.
+# the COMMERCE_NOTIFY_SMS flag.
+#
+# Customer template 337011 is approved with the placeholders ``#OTP#`` (the
+# one-time code) and ``#TIME#`` (validity in whole minutes). SMS.ir substitutes
+# by EXACT, case-sensitive name — sending any other name leaves the placeholder
+# literal in the delivered SMS (a real customer received "#OTP#" / "#TIME#"), so
+# these names must match the approved template verbatim.
 OTP_TEMPLATE_ID = 337011
-OTP_CODE_PARAM = "CODE"
+OTP_PARAM_OTP = "OTP"
+OTP_PARAM_TIME = "TIME"
 
 SMTP_TIMEOUT = 15.0
 TLS_STARTTLS = "starttls"
@@ -362,6 +369,18 @@ def post_sms_ir_verify(
         return False
 
 
+def _otp_ttl_minutes() -> str:
+    """The ``#TIME#`` value: the OTP lifetime as whole minutes.
+
+    Imported locally: ``commerce_otp`` imports this module at top level, so a
+    module-level import here would be circular. Rounds up so a TTL that is not
+    a whole number of minutes still tells the customer how long the code lives.
+    """
+    from app.services.commerce_otp import OTP_TTL_SECONDS
+
+    return str(math.ceil(OTP_TTL_SECONDS / 60))
+
+
 def send_customer_otp(mobile: str, code: str) -> bool:
     """Send the storefront one-time code to the customer's own mobile.
 
@@ -373,13 +392,18 @@ def send_customer_otp(mobile: str, code: str) -> bool:
     config = customer_otp_config()
     if config is None:
         return False
-    param_name = _clean("SMS_IR_OTP_PARAM_CODE", OTP_CODE_PARAM) or OTP_CODE_PARAM
+    param_otp = _clean("SMS_IR_OTP_PARAM_OTP", OTP_PARAM_OTP) or OTP_PARAM_OTP
+    param_time = _clean("SMS_IR_OTP_PARAM_TIME", OTP_PARAM_TIME) or OTP_PARAM_TIME
+    parameters = [
+        {"name": param_otp, "value": code},
+        {"name": param_time, "value": _otp_ttl_minutes()},
+    ]
     try:
         acked = post_sms_ir_verify(
             api_key=config["api_key"],
             template_id=config["template_id"],
             mobile=mobile,
-            parameters=[{"name": param_name, "value": code}],
+            parameters=parameters,
         )
     except Exception as exc:  # noqa: BLE001 - provider/network error is a failed send
         logger.warning("SMS.ir customer OTP send error: %s", _safe(exc))
