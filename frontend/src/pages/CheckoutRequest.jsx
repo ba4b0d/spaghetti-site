@@ -241,22 +241,32 @@ export default function CheckoutRequest() {
 
   return (
     <div className="max-w-5xl mx-auto animate-fade-in">
-      <div className="flex items-center gap-2 mb-5">
-        <Link
-          to="/"
-          className="inline-flex items-center gap-1.5 text-sm font-medium hover:opacity-80 transition-opacity"
-          style={{ color: 'var(--text-primary)' }}
-        >
-          <ArrowRight size={16} />
-          بازگشت به کاتالوگ
-        </Link>
-      </div>
+      {/* Page header on the shared brand band (navy→orange) — white foreground. */}
+      <div
+        className="rounded-2xl border p-5 sm:p-6 mb-6"
+        data-testid="checkout-header-band"
+        style={{
+          background: 'var(--brand-header-gradient)',
+          borderColor: 'var(--brand-header-border)',
+          boxShadow: 'var(--brand-header-shadow)',
+          color: 'var(--brand-header-fg)',
+        }}
+      >
+        <div className="flex items-center gap-2 mb-3">
+          <Link
+            to="/"
+            className="inline-flex items-center gap-1.5 text-sm font-medium hover:opacity-80 transition-opacity"
+            style={{ color: 'var(--brand-header-fg)' }}
+          >
+            <ArrowRight size={16} />
+            بازگشت به کاتالوگ
+          </Link>
+        </div>
 
-      <div className="mb-6">
-        <h1 className="text-xl sm:text-2xl font-bold mb-1" style={{ color: 'var(--text-primary)' }}>
+        <h1 className="text-xl sm:text-2xl font-bold mb-1" style={{ color: 'var(--brand-header-fg)' }}>
           ثبت درخواست سفارش
         </h1>
-        <p className="text-xs sm:text-sm" style={{ color: 'var(--text-secondary)' }}>
+        <p className="text-xs sm:text-sm" style={{ color: 'color-mix(in srgb, #fff 82%, transparent)' }}>
           {totalQty} عدد کالا در سبد شما — اطلاعات تماس را وارد کنید تا کارشناسان ما سفارش را بررسی و
           مبلغ نهایی را اعلام کنند.
         </p>
