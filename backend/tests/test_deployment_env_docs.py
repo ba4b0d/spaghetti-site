@@ -28,6 +28,14 @@ REPO_ROOT = BACKEND_DIR.parent
 ENV_EXAMPLE = BACKEND_DIR / ".env.example"
 README = REPO_ROOT / "README.md"
 APP_DIR = BACKEND_DIR / "app"
+ROOT_ENV_EXAMPLE = REPO_ROOT / ".env.example"
+DOCKER_COMPOSE = REPO_ROOT / "docker-compose.yml"
+
+# The env file docker-compose.yml actually loads into the backend container.
+# Compose does NOT inject a root .env into the container, so any doc that claims
+# that (or points deployers at a root .env for the backend) misdirects them into
+# a crash loop: app/routers/auth.py raises at import when JWT_SECRET is unset.
+COMPOSE_ENV_FILE = "backend/.env"
 
 # Keys whose documented value must never be a real secret.
 SECRET_KEYS = {
@@ -48,16 +56,20 @@ SECRET_KEYS = {
 _KEY_TOKEN = re.compile(r"`([A-Z][A-Z0-9_]+)`")
 
 
-def _env_example_entries() -> list[tuple[str, str]]:
-    """(key, value) for every non-comment ``KEY=value`` line."""
+def _env_entries(path: Path) -> list[tuple[str, str]]:
+    """(key, value) for every non-comment ``KEY=value`` line in *path*."""
     entries: list[tuple[str, str]] = []
-    for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
         key, value = stripped.split("=", 1)
         entries.append((key.strip(), value.strip()))
     return entries
+
+
+def _env_example_entries() -> list[tuple[str, str]]:
+    return _env_entries(ENV_EXAMPLE)
 
 
 def _env_example_keys() -> list[str]:
@@ -203,3 +215,88 @@ def test_cors_origins_must_be_the_real_deployed_origin():
     readme = README.read_text(encoding="utf-8").lower()
     assert "cors_origins" in readme
     assert "exact" in readme and "origin" in readme
+
+
+# ── Compose wiring vs. docs — root .env.example drift guard ──────────
+#
+# Regression (I1): a root .env.example claimed "This file is loaded by docker
+# compose when placed in the project root." Compose only loads backend/.env via
+# env_file (and interpolates CORS_ORIGINS), so a deployer who seeded a root .env
+# booted a backend with no JWT_SECRET -> RuntimeError at auth.py import -> crash
+# loop. These tests pin the compose wiring and force the root example to redirect
+# instead of misdirect.
+
+
+def _compose_env_files() -> list[str]:
+    """Paths listed under docker-compose.yml's ``env_file:`` key.
+
+    Parsed as text (no YAML dependency) to match this module's docs-as-text
+    approach. Handles both the scalar and the ``- path`` list form.
+    """
+    files: list[str] = []
+    in_env_file = False
+    indent = 0
+    for line in DOCKER_COMPOSE.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        stripped = line.strip()
+        leading = len(line) - len(line.lstrip())
+        if stripped.startswith("env_file:"):
+            rest = stripped[len("env_file:"):].strip()
+            in_env_file = True
+            indent = leading
+            if rest:
+                rest = rest.strip("[]")
+                files += [
+                    part.strip().strip("'\"")
+                    for part in rest.split(",")
+                    if part.strip()
+                ]
+            continue
+        if in_env_file:
+            if leading > indent and stripped.startswith("-"):
+                files.append(stripped[1:].strip().strip("'\""))
+            elif leading <= indent:
+                in_env_file = False
+    return files
+
+
+def test_docker_compose_loads_backend_env_file():
+    files = _compose_env_files()
+    assert COMPOSE_ENV_FILE in files, (
+        f"docker-compose.yml must load {COMPOSE_ENV_FILE!r} via env_file; Compose "
+        "does not inject a root .env into the backend container."
+    )
+
+
+def test_root_env_example_does_not_claim_docker_compose_loads_it():
+    if not ROOT_ENV_EXAMPLE.exists():
+        return  # deleting the stray root example is an acceptable resolution
+    text = ROOT_ENV_EXAMPLE.read_text(encoding="utf-8").lower()
+    assert "loaded by docker compose" not in text, (
+        "root .env.example falsely claims Docker Compose loads it. Compose only "
+        f"reads {COMPOSE_ENV_FILE!r} (env_file), so a deployer who seeds a root "
+        ".env leaves JWT_SECRET unset and the backend crash-loops at import."
+    )
+
+
+def test_root_env_example_redirects_to_backend_env_example():
+    if not ROOT_ENV_EXAMPLE.exists():
+        return
+    text = ROOT_ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert "backend/.env.example" in text, (
+        "root .env.example must clearly redirect deployers to backend/.env.example"
+    )
+
+
+def test_root_env_example_keys_do_not_drift_from_backend_example():
+    if not ROOT_ENV_EXAMPLE.exists():
+        return
+    backend_keys = set(_env_example_keys())
+    stray = sorted(
+        key for key, _ in _env_entries(ROOT_ENV_EXAMPLE) if key not in backend_keys
+    )
+    assert not stray, (
+        "root .env.example documents keys absent from backend/.env.example: "
+        + ", ".join(stray)
+    )

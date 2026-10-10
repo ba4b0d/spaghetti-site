@@ -105,7 +105,7 @@ docker compose logs -f
 
 ## ⚙️ Environment Variables
 
-Copy `.env.example` to `.env` and configure:
+Copy `backend/.env.example` to `backend/.env` and configure:
 
 | Variable | Description | Default |
 |:---|:---|:---|
