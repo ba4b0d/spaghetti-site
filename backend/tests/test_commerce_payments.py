@@ -683,7 +683,11 @@ def test_callback_rejects_credit_methods_without_verifying(client, auth_headers,
     try:
         assert db.get(CommerceInvoice, invoice_id).state == "approved"
         row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
-        assert row.state == "failed"             # refused safely, lock released
+        # N1: an untrusted callback must NOT terminally fail the attempt — that
+        # would release the invoice lock and hide the row from reconciliation.
+        assert row.state == "unknown"
+        assert row.payment_method == int(ctype)   # callback method retained for staff
+        assert row.tracking_code == "TRK-1"       # callback tracking retained for staff
     finally:
         db.close()
 
@@ -776,3 +780,134 @@ def test_reconcile_rejects_unknown_action(client, auth_headers, fake_provider):
 def test_reconcile_missing_attempt_404(client, auth_headers, fake_provider):
     r = client.post(f"{BASE}/staff/payments/999999/reconcile", json={"action": "abandon"}, headers=auth_headers)
     assert r.status_code == 404
+
+
+# ══════════════════════════════════════════════════════════════════════
+# N1 — untrusted callbacks must not terminally fail or unlock a payment
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"type": "5"},      # unsupported credit method (untrusted callback signal)
+        {"amount": "1"},    # callback amount mismatch (untrusted callback signal)
+    ],
+)
+def test_untrusted_callback_keeps_lock_and_blocks_second_payment(client, auth_headers, fake_provider, override):
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    r = client.post(CALLBACK, data=callback_payload(attempt, **override), follow_redirects=False)
+    assert r.status_code in (302, 303)
+    assert "payment=success" not in r.headers["location"]
+    # Unsupported/mismatched callbacks never trigger a provider verify.
+    assert fake_provider.verify_calls == []
+
+    # The attempt stays active (unknown) → the invoice lock is held, so a second
+    # pay click resumes the same session instead of starting a second payment.
+    second = pay(client, token)
+    assert second.status_code == 200, second.text
+    assert second.json()["redirect_url"] == attempt.redirect_url
+
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"   # never paid
+        rows = db.query(CommercePaymentAttempt).filter_by(invoice_id=invoice_id).all()
+        assert len(rows) == 1                                            # no 2nd attempt
+        assert rows[0].state == "unknown"
+    finally:
+        db.close()
+
+    # Staff can see the held attempt for manual reconciliation.
+    listing = client.get(f"{BASE}/staff/payments", headers=auth_headers)
+    assert listing.status_code == 200, listing.text
+    surfaced = [a for a in listing.json() if a["id"] == attempt.id]
+    assert len(surfaced) == 1
+    assert surfaced[0]["state"] == "unknown"
+
+
+def test_staff_reconcile_settles_after_callback_amount_mismatch(client, auth_headers, fake_provider):
+    """The authoritative server verify settles even when the callback lied."""
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    client.post(CALLBACK, data=callback_payload(attempt, amount="1"), follow_redirects=False)
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "unknown"
+        assert row.payment_method == 11    # callback method retained for diagnostics
+        assert row.tracking_code == "TRK-1"
+    finally:
+        db.close()
+
+    r = client.post(
+        f"{BASE}/staff/payments/{attempt.id}/reconcile",
+        json={"action": "verify"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "verified"
+    assert fake_provider.verify_calls[-1]["type"] == 11
+
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "paid"
+    finally:
+        db.close()
+
+
+def test_reconcile_abandon_requires_explicit_reason(client, auth_headers, fake_provider):
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+
+    # No reason → refused, the attempt is NOT silently released.
+    r = client.post(
+        f"{BASE}/staff/payments/{attempt.id}/reconcile",
+        json={"action": "abandon"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "pending"                        # untouched
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"
+    finally:
+        db.close()
+
+    # A whitespace-only reason is equally refused.
+    r2 = client.post(
+        f"{BASE}/staff/payments/{attempt.id}/reconcile",
+        json={"action": "abandon", "reason": "   "},
+        headers=auth_headers,
+    )
+    assert r2.status_code == 422, r2.text
+
+
+def test_staff_list_exposes_min_age_seconds(client, auth_headers, fake_provider):
+    from app.services.digipay import DigiPayError
+
+    fake_provider.create_error = DigiPayError("network down")
+    invoice_id, token = make_approved(client, auth_headers)
+    assert pay(client, token).status_code in (502, 503)
+    stuck = latest_attempt(invoice_id)
+
+    # A fresh attempt is excluded by a large min-age floor...
+    r = client.get(
+        f"{BASE}/staff/payments",
+        params={"min_age_seconds": 3600},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert all(a["id"] != stuck.id for a in r.json())
+    # ...and included without one.
+    r2 = client.get(f"{BASE}/staff/payments", headers=auth_headers)
+    assert r2.status_code == 200, r2.text
+    assert any(a["id"] == stuck.id for a in r2.json())

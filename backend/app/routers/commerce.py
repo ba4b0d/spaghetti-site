@@ -506,6 +506,7 @@ class PaymentReconcileRequest(BaseModel):
 @router.get("/staff/payments")
 def list_staff_payments(
     state: str | None = Query(default=None, max_length=20),
+    min_age_seconds: int | None = Query(default=None, ge=0),
     limit: int = Query(
         default=commerce_service.DEFAULT_LIST_LIMIT,
         ge=1,
@@ -518,11 +519,16 @@ def list_staff_payments(
     """Staff — in-flight/stuck payment attempts needing attention (bounded).
 
     Read-only: listing never resolves an attempt, it only surfaces the ones
-    that are no longer progressing so a human can reconcile them.
+    that are no longer progressing so a human can reconcile them. Aging
+    (``min_age_seconds``) only filters/re-orders; it never changes state.
     """
     try:
         rows = commerce_service.list_stuck_payment_attempts(
-            db, state=state, limit=limit, offset=offset
+            db,
+            state=state,
+            min_age_seconds=min_age_seconds,
+            limit=limit,
+            offset=offset,
         )
     except CommerceValidationError as exc:
         raise _validation_error(exc)
@@ -541,7 +547,7 @@ def reconcile_staff_payment(
 
     A payment is never failed on age alone: ``verify`` fails only on a
     provider-confirmed non-success, and ``abandon`` is an explicit, audited
-    staff decision that releases the invoice lock.
+    staff decision (requiring a reason) that releases the invoice lock.
     """
     from app.models import CommercePaymentAttempt
 
@@ -552,6 +558,14 @@ def reconcile_staff_payment(
     )
     if attempt is None:
         raise HTTPException(status_code=404, detail="تراکنش یافت نشد")
+
+    if body.action == "abandon" and not body.reason.strip():
+        # Guard against a silent abandon: releasing a lock on a possibly-paid
+        # attempt without a recorded reason could lead to a second payment.
+        raise HTTPException(
+            status_code=422,
+            detail="برای رهاسازی تراکنش، ثبت دلیل الزامی است",
+        )
 
     if client is None and body.action == "verify":
         try:
@@ -565,6 +579,8 @@ def reconcile_staff_payment(
         resolved = commerce_service.reconcile_payment_attempt(
             db, attempt, client, abandon=(body.action == "abandon"), reason=body.reason
         )
+    except commerce_service.CommerceValidationError as exc:
+        raise _validation_error(exc)
     except commerce_service.CommerceGatewayUnavailableError as exc:
         raise _validation_error(exc)
 

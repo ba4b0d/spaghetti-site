@@ -1085,6 +1085,8 @@ def handle_digipay_callback(
         return "success"  # idempotent replay
 
     def _fail(reason: str) -> None:
+        # Only ever called on a *provider-confirmed* non-success. An untrusted
+        # callback-only signal must never reach here (use _hold instead).
         if attempt.state in ACTIVE_ATTEMPT_STATES:
             attempt.state = "failed"
             attempt.last_error = _short(reason)
@@ -1092,37 +1094,45 @@ def handle_digipay_callback(
 
     def _hold(reason) -> None:
         # Never claim a definite failure without a provider-confirmed outcome;
-        # keep the attempt open for staff reconciliation instead.
+        # keep the attempt open — still locking the invoice and still visible to
+        # staff — for reconciliation instead.
         if attempt.state in ACTIVE_ATTEMPT_STATES:
             attempt.state = "unknown"
             attempt.last_error = _short(reason)
             db.commit()
 
-    if _int_or_none(amount) != attempt.amount_rial:
-        _fail("callback amount mismatch")
+    # The callback is an untrusted hint (no signature, no invoice token). Retain
+    # whatever it pinned (method/tracking) as staff diagnostics, but never let a
+    # callback-only signal terminally fail the attempt: ``failed`` would release
+    # the active-attempt lock and hide the row from reconciliation, risking a
+    # second payment if the gateway has not already reversed the purchase.
+    cb_amount = _int_or_none(amount)
+    cb_type = _int_or_none(type_value)  # method actually used, NOT ticket type (11)
+    tracking = (tracking_code or "").strip()
+    if cb_type is not None:
+        attempt.payment_method = cb_type
+    if tracking:
+        attempt.tracking_code = tracking
+    if cb_type is not None or tracking:
+        db.commit()
+
+    if cb_amount != attempt.amount_rial:
+        _hold("callback amount mismatch (unverified)")
         return "failed"
 
-    # ``type`` is the method actually used, NOT the UPG ticket type (11).
-    cb_type = _int_or_none(type_value)
     if cb_type is None:
         _hold("callback missing/invalid type")
         return "failed"
     if cb_type not in ALLOWED_PAYMENT_METHODS:
-        # Credit/BNPL/Card are disabled in v1: refuse without verifying. DigiPay
-        # auto-reverses an unverified purchase, so no money is captured.
-        _fail(f"unsupported payment method (type={cb_type})")
+        # Credit/BNPL/Card are disabled in v1: never verify them automatically,
+        # but keep the callback method/tracking for staff diagnostics and leave
+        # the attempt open (lock held) so this callback cannot hide a payment.
+        _hold(f"unsupported payment method (type={cb_type}); needs manual review")
         return "failed"
 
-    tracking = (tracking_code or "").strip()
     if not tracking:
         _hold("callback missing trackingCode")
         return "failed"
-
-    # Persist the callback-confirmed method + tracking code BEFORE the network
-    # call, so a crash/timeout still leaves a reconcile-able attempt.
-    attempt.payment_method = cb_type
-    attempt.tracking_code = tracking
-    db.commit()
 
     if _callback_result_is_failure(result_value):
         # Unverified hint of failure — keep the attempt open for reconciliation.
@@ -1144,12 +1154,17 @@ def handle_digipay_callback(
     if status == DIGIPAY_STATUS_PENDING:
         _hold("provider verify still pending (9011)")
         return "pending"
-    if not _verify_confirms(verified, attempt):
-        _fail("provider verify did not confirm")
+    if _verify_confirms(verified, attempt):
+        settle_verified_payment(db, attempt, tracking_code=tracking)
+        return "success"
+    if status is not None and status != DIGIPAY_STATUS_SUCCESS:
+        # The provider explicitly reported a non-success: a definite failure.
+        _fail(f"provider verify status={status}")
         return "failed"
-
-    settle_verified_payment(db, attempt, tracking_code=tracking)
-    return "success"
+    # Unrecognized response, or a provider-success whose identity/amount does not
+    # match the attempt: cannot conclude a failure — keep it open for staff.
+    _hold(f"provider verify did not confirm (status={status})")
+    return "failed"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1230,7 +1245,8 @@ def reconcile_payment_attempt(
 
     * A terminal attempt is never touched (idempotent).
     * ``abandon`` is the only way to close an attempt without a provider query —
-      an explicit, audited staff decision (manual reconciliation).
+      an explicit, audited staff decision that **requires a reason**, so a
+      stuck/unknown attempt is never silently released (which could double-pay).
     * Otherwise the provider is queried **only when the method is known** (a
       callback confirmed IPG/Wallet) and a tracking code exists. The method is
       never guessed from the ticket type: verifying an IPG payment with
@@ -1244,8 +1260,13 @@ def reconcile_payment_attempt(
         return attempt
 
     if abandon:
+        reason = (reason or "").strip()
+        if not reason:
+            # A silent abandon could release the lock on an attempt that was in
+            # fact paid (→ a second payment). Require an explicit, audited reason.
+            raise CommerceValidationError("برای رهاسازی تراکنش، ثبت دلیل الزامی است")
         attempt.state = "failed"
-        attempt.last_error = _short(reason or "بسته‌شده توسط کارمند (تسویه دستی)")
+        attempt.last_error = _short(reason)
         db.commit()
         db.refresh(attempt)
         return attempt
