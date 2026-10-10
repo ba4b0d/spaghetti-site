@@ -423,12 +423,11 @@ def test_send_customer_otp_uses_otp_and_time_template_params(monkeypatch):
     assert captured["template_id"] == 337011  # the customer OTP template
     params = captured["parameters"]
     assert [p["name"] for p in params] == ["OTP", "TIME"]
-    assert {p["name"]: p["value"] for p in params} == {
-        "OTP": "54321",
-        "TIME": str(OTP_TTL_SECONDS // 60),
-    }
-    # A 120s TTL renders as 2 minutes in the template's ``#TIME#``.
-    assert {p["name"]: p["value"] for p in params}["TIME"] == "2"
+    values = {p["name"]: p["value"] for p in params}
+    assert values["OTP"] == "54321"
+    # The cart code lives 5 minutes, so the template's ``#TIME#`` renders ``5``.
+    assert values["TIME"] == "5"
+    assert OTP_TTL_SECONDS == 300
 
 
 def test_smtp_starttls_login_and_send():

@@ -171,6 +171,24 @@ def test_issue_sends_one_sms_and_returns_hints(client, fake_sms):
     assert fake_sms.call_args.args[0] == MOBILE
 
 
+def test_cart_otp_ttl_is_five_minutes(client, fake_sms):
+    """The cart code stays valid for five minutes (requirement: 300s).
+
+    The SMS template's ``#TIME#`` placeholder is derived from ``OTP_TTL_SECONDS``
+    (``commerce_notifications._otp_ttl_minutes`` rounds up to whole minutes), so
+    a 300s TTL must render as ``5`` for the customer, and the issue response must
+    advertise the same 300s window.
+    """
+    from app.services import commerce_notifications
+
+    assert OTP_TTL_SECONDS == 300
+    assert commerce_notifications._otp_ttl_minutes() == "5"
+
+    r = _issue(client)
+    assert r.status_code == 200, r.text
+    assert r.json()["expires_in"] == 300
+
+
 def test_issued_code_is_never_echoed_nor_stored_in_plaintext(client, fake_sms):
     r = _issue(client)
     code = _sent_code(fake_sms)

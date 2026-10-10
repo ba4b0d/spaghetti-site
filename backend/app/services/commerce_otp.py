@@ -36,7 +36,7 @@ from app.services import commerce_notifications
 
 # ── Tunables ─────────────────────────────────────────────────────────
 OTP_LENGTH = 5
-OTP_TTL_SECONDS = 120
+OTP_TTL_SECONDS = 300
 OTP_RESEND_COOLDOWN_SECONDS = 60
 OTP_MAX_ATTEMPTS = 5
 OTP_MAX_SENDS_PER_HOUR = 5      # per mobile
