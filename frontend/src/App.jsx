@@ -16,6 +16,7 @@ const Machines = lazy(() => import('./pages/Machines'));
 const Settings = lazy(() => import('./pages/Settings'));
 const Calculator = lazy(() => import('./pages/Calculator'));
 const Catalog = lazy(() => import('./pages/Catalog'));
+const CheckoutRequest = lazy(() => import('./pages/CheckoutRequest'));
 const PublicProductDetail = lazy(() => import('./pages/PublicProductDetail'));
 const Contact = lazy(() => import('./pages/Contact'));
 const HowToOrder = lazy(() => import('./pages/HowToOrder'));
@@ -23,10 +24,13 @@ const CustomOrder = lazy(() => import('./pages/CustomOrder'));
 const Privacy = lazy(() => import('./pages/Privacy'));
 const Terms = lazy(() => import('./pages/Terms'));
 const DigitalCard = lazy(() => import('./pages/DigitalCard'));
+const InvoicePayment = lazy(() => import('./pages/InvoicePayment'));
+const PaymentResult = lazy(() => import('./pages/PaymentResult'));
 const UsersPage = lazy(() => import('./pages/Users'));
 const Categories = lazy(() => import('./pages/Categories'));
 const Collections = lazy(() => import('./pages/Collections'));
 const Orders = lazy(() => import('./pages/Orders'));
+const CommerceAdmin = lazy(() => import('./pages/CommerceAdmin'));
 const CustomOrders = lazy(() => import('./pages/CustomOrders'));
 const Customers = lazy(() => import('./pages/Customers'));
 const AuditLogs = lazy(() => import('./pages/AuditLogs'));
@@ -87,8 +91,14 @@ function AppRoutes() {
                 <Route path="/collection/:tag" element={<CatalogLayout><Catalog /></CatalogLayout>} />
                 <Route path="/collections/:tag" element={<CatalogLayout><Catalog /></CatalogLayout>} />
                 <Route path="/catalog/:slug" element={<CatalogLayout><PublicProductDetail /></CatalogLayout>} />
+                <Route path="/checkout" element={<CatalogLayout><CheckoutRequest /></CatalogLayout>} />
+                <Route path="/cart" element={<CatalogLayout><CheckoutRequest /></CatalogLayout>} />
                 <Route path="/contact" element={<CatalogLayout><Contact /></CatalogLayout>} />
                 <Route path="/card" element={<DigitalCard />} />
+                {/* Generic, token-free result page (backend callback 303 target). */}
+                <Route path="/pay/result" element={<PaymentResult />} />
+                {/* Public private invoice payment page. */}
+                <Route path="/pay/:token" element={<InvoicePayment />} />
                 <Route path="/how-to-order" element={<CatalogLayout><HowToOrder /></CatalogLayout>} />
                 <Route path="/custom-order" element={<CatalogLayout><CustomOrder /></CatalogLayout>} />
                 <Route path="/privacy" element={<CatalogLayout><Privacy /></CatalogLayout>} />
@@ -106,6 +116,7 @@ function AppRoutes() {
         <Route path="/categories" element={<ProtectedRoute><Layout><Categories /></Layout></ProtectedRoute>} />
         <Route path="/collections" element={<ProtectedRoute><Layout><Collections /></Layout></ProtectedRoute>} />
         <Route path="/orders" element={<ProtectedRoute><Layout><Orders /></Layout></ProtectedRoute>} />
+        <Route path="/commerce-admin" element={<ProtectedRoute><Layout><CommerceAdmin /></Layout></ProtectedRoute>} />
         <Route path="/custom-orders" element={<ProtectedRoute><Layout><CustomOrders /></Layout></ProtectedRoute>} />
         <Route path="/customers" element={<ProtectedRoute><Layout><Customers /></Layout></ProtectedRoute>} />
 

@@ -14,10 +14,35 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      # JWT_SECRET is loaded from backend/.env via env_file above.
-      - CORS_ORIGINS=${CORS_ORIGINS:-}
+      # Every other variable — JWT_SECRET, CORS_ORIGINS, COOKIE_SECURE, … — is
+      # loaded from backend/.env via env_file above. Do NOT re-declare them here:
+      # a value in `environment:` takes precedence over `env_file:`, and any
+      # compose-interpolated entry (e.g. CORS_ORIGINS=${CORS_ORIGINS:-}) is
+      # resolved from the *project-root* .env/shell — NOT backend/.env — so it
+      # silently shadows the real backend/.env value with an empty string when
+      # unset. That shadowing was a live bug: CORS_ORIGINS came back empty and
+      # app/main.py fell back to http://localhost:5173 instead of the deployed
+      # origin configured in backend/.env.
+    # The backend is only reached through the frontend nginx proxy on this
+    # network, so uvicorn must trust X-Forwarded-For *only* from nginx. nginx is
+    # pinned to the static IP 172.28.0.2 below; trusting that single fixed host
+    # (never "*") means a direct request to the published :8080 port — whose peer
+    # is not the proxy — cannot forge its client IP, while real clients proxied
+    # through nginx are rate-limited by their true address (slowapi keys on
+    # request.client.host via get_remote_address). The frontend recovers the
+    # true client IP from the Pi edge with the realip module (see
+    # frontend/nginx.conf) and forwards that recovered address here as
+    # X-Forwarded-For.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "172.28.0.2"]
+    networks:
+      commerce_net:
+        ipv4_address: 172.28.0.3
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      # Probe 127.0.0.1, never `localhost`: inside the container `localhost`
+      # resolves to both 127.0.0.1 and ::1, and uvicorn binds IPv4 only, so a
+      # name-based probe can reach ::1 and report the container unhealthy while
+      # it is serving fine.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -33,12 +58,30 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+    # Static IP so the backend can name exactly this proxy in
+    # --forwarded-allow-ips (Docker assigns container IPs dynamically otherwise).
+    networks:
+      commerce_net:
+        ipv4_address: 172.28.0.2
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80"]
+      # Probe 127.0.0.1, never `localhost`: the container's /etc/hosts maps
+      # `localhost` to ::1 as well, and this server listens on IPv4 `:80` only,
+      # so busybox wget to the name hits ::1:80, gets ECONNREFUSED and reports
+      # the frontend unhealthy while it serves traffic normally.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
+
+networks:
+  # Dedicated network with a fixed subnet so nginx can be pinned to a stable IP
+  # that the backend trusts for X-Forwarded-For.
+  commerce_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
 
 volumes:
   db_data:

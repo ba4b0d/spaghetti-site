@@ -15,6 +15,7 @@ import {
   Inbox,
   UserRound,
   ScrollText,
+  Receipt,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth';
 import BrandLogo from './BrandLogo';
@@ -34,6 +35,7 @@ export default function Sidebar({ onLinkClick }) {
           { path: '/dashboard', label: 'داشبورد', icon: LayoutDashboard },
           { path: '/custom-orders', label: 'سفارشات سایت', icon: Inbox },
           { path: '/orders', label: 'سفارش‌ها', icon: ClipboardList },
+          { path: '/commerce-admin', label: 'فاکتور و پرداخت', icon: Receipt },
           { path: '/customers', label: 'مشتریان', icon: UserRound },
           { path: '/products', label: 'محصولات', icon: Package },
           { path: '/materials', label: 'مواد', icon: Layers },

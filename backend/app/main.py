@@ -24,6 +24,13 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Redact the public invoice bearer token from uvicorn's access log at startup.
+# nginx disables its own access log for the token prefix, but this direct layer
+# keeps the credential out of the backend log too — without turning access
+# logging off. Idempotent; safe if the app is imported more than once.
+from app.log_redaction import install_access_log_redaction
+install_access_log_redaction()
 from fastapi import FastAPI, Depends, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -52,6 +59,8 @@ from app.routers.backup import router as backup_router
 from app.routers.custom_orders import router as custom_orders_router
 from app.routers.customers import router as customers_router
 from app.routers.audit_logs import router as audit_router
+from app.routers.commerce import router as commerce_router
+from app.routers.digipay_callback import router as digipay_callback_router
 from app.telegram_bot import start_telegram_bot_thread, send_telegram_notification
 
 from sqlalchemy import inspect, text
@@ -215,6 +224,34 @@ async def lifespan(app: FastAPI):
                 print("Added orders.ready_by column.")
             db.commit()
 
+        # Migration: commerce_payment_attempts.payment_method (Task 3 — the
+        # callback `type` records the method actually used; distinct from the
+        # UPG ticket `type`). Existing installs predate the column.
+        if "commerce_payment_attempts" in inspect(engine).get_table_names():
+            attempt_cols = {
+                c["name"] for c in inspect(engine).get_columns("commerce_payment_attempts")
+            }
+            if "payment_method" not in attempt_cols:
+                print("Adding commerce_payment_attempts.payment_method column...")
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("ALTER TABLE commerce_payment_attempts ADD COLUMN payment_method INTEGER")
+                    )
+                print("Added commerce_payment_attempts.payment_method column.")
+            # Task 3 fix wave: a provider-verified payment that could not settle
+            # against the current invoice keeps its evidence and is surfaced to
+            # staff via this flag (see settle_verified_payment).
+            if "reconciliation_required" not in attempt_cols:
+                print("Adding commerce_payment_attempts.reconciliation_required column...")
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE commerce_payment_attempts "
+                            "ADD COLUMN reconciliation_required BOOLEAN NOT NULL DEFAULT 0"
+                        )
+                    )
+                print("Added commerce_payment_attempts.reconciliation_required column.")
+
         # Migration: products.created_at
         product_cols = {c["name"] for c in inspector.get_columns("products")}
         if "created_at" not in product_cols:
@@ -355,6 +392,8 @@ app.include_router(custom_orders_router)
 app.include_router(customers_router)
 app.include_router(audit_router)
 app.include_router(catalog_router)  # No auth — public catalog
+app.include_router(commerce_router)  # Public request intake + staff request listing (auth per route)
+app.include_router(digipay_callback_router)  # DigiPay UPG callback (untrusted form POST, verify server-side)
 
 # ── Static files for uploads with immutable caching ─────────────────
 class CachedStaticFiles(StaticFiles):

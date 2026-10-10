@@ -493,10 +493,23 @@ def bulk_product_action(body: BulkProductAction, user=Depends(require_staff_role
 
 @router.delete("/products/{product_id}/permanent")
 def permanent_delete_product(product_id: int, user=Depends(require_admin), db: Session = Depends(get_db)):
-    from app.models import Product
+    from app.models import Product, CommerceRequestItem, CommerceInvoiceItem
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
+    # Detach (never delete) historical review line items so the product's
+    # snapshot — display name, qty, indicative price — survives the delete.
+    # The FK is nullable with ondelete=SET NULL, but SQLite cannot ALTER a FK
+    # on an existing table, so also unlink explicitly to cover databases whose
+    # commerce_request_items table predates that clause.
+    db.query(CommerceRequestItem).filter(
+        CommerceRequestItem.product_id == product_id
+    ).update({CommerceRequestItem.product_id: None}, synchronize_session=False)
+    # Same rule for priced invoice snapshots (Task 2): a paid/issued invoice
+    # must keep its frozen description and unit price after a product delete.
+    db.query(CommerceInvoiceItem).filter(
+        CommerceInvoiceItem.product_id == product_id
+    ).update({CommerceInvoiceItem.product_id: None}, synchronize_session=False)
     db.delete(product)
     db.commit()
     invalidate_stats()

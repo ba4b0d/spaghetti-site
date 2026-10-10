@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { Link, NavLink, useNavigate, useLocation } from 'react-router-dom';
-import { Menu, X, ChevronDown, Search } from 'lucide-react';
+import { Menu, X, ChevronDown, Search, ShoppingBag } from 'lucide-react';
 import { Z_INDEX_STICKY } from '../lib/constants';
 import BrandLogo from './BrandLogo';
+import CartDrawer from './CartDrawer';
+import { readCart, subscribe, cartCount } from '../lib/cart';
 import { getCatalogCategories, getPublicBrand, recordSiteView } from '../lib/api';
 
 const FOCUSABLE_SELECTOR = [
@@ -38,6 +40,8 @@ export default function CatalogLayout({ children }) {
   const [megaSearch, setMegaSearch] = useState('');
   const [megaHoveredCat, setMegaHoveredCat] = useState(null);
   const [mobileExpandedCat, setMobileExpandedCat] = useState(null);
+  const [cartOpen, setCartOpen] = useState(false);
+  const [cartItems, setCartItems] = useState(() => readCart());
   const megaRef = useRef(null);
   const drawerRef = useRef(null);
   const menuButtonRef = useRef(null);
@@ -63,7 +67,15 @@ export default function CatalogLayout({ children }) {
     recordSiteView(location.pathname).catch(() => {});
   }, [location.pathname]);
 
+  // Cart badge — mirrors the persisted cart store.
+  useEffect(() => subscribe(() => setCartItems(readCart())), []);
+
+  const cartTotal = cartCount(cartItems);
+
   const closeMenu = useCallback(() => setMenuOpen(false), []);
+  // Stable identity: CartDrawer's focus-management effect must not re-run (and
+  // re-steal focus) when the layout re-renders on cart mutations.
+  const closeCart = useCallback(() => setCartOpen(false), []);
 
   const toggleMenu = () => {
     if (!menuOpen) {
@@ -166,7 +178,7 @@ export default function CatalogLayout({ children }) {
     >
       <div className="catalog-ambient" aria-hidden="true" />
 
-      <header className="catalog-topbar" style={{ zIndex: Z_INDEX_STICKY }}>
+      <header className="catalog-topbar" style={{ zIndex: Z_INDEX_STICKY }} inert={cartOpen ? '' : undefined}>
         <div className="catalog-topbar-inner">
           <Link to="/" className="catalog-brand-link flex items-center gap-2.5 sm:gap-3.5 min-w-0">
             <BrandLogo height={85} className="catalog-logo-img shrink-0">
@@ -322,6 +334,32 @@ export default function CatalogLayout({ children }) {
 
           <div className="catalog-topbar-actions">
             <button
+              type="button"
+              className="relative inline-flex items-center justify-center w-11 h-11 rounded-[0.85rem] shrink-0 transition-colors"
+              style={{
+                border: '1px solid color-mix(in srgb, #fff 30%, transparent)',
+                background: 'color-mix(in srgb, #fff 14%, transparent)',
+                color: '#ffffff',
+                cursor: 'pointer',
+              }}
+              aria-label={cartTotal > 0 ? `سبد خرید، ${cartTotal} کالا` : 'سبد خرید'}
+              aria-haspopup="dialog"
+              aria-expanded={cartOpen}
+              aria-controls="catalog-cart-drawer"
+              onClick={() => setCartOpen(true)}
+            >
+              <ShoppingBag size={20} strokeWidth={2.25} />
+              {cartTotal > 0 ? (
+                <span
+                  className="absolute -top-1 -left-1 min-w-[1.15rem] h-[1.15rem] px-1 rounded-full text-[10px] font-bold inline-flex items-center justify-center tabular-nums"
+                  style={{ backgroundColor: 'var(--brand-orange, #ff9a3d)', color: '#ffffff' }}
+                  aria-hidden="true"
+                >
+                  {cartTotal > 99 ? '99+' : cartTotal}
+                </span>
+              ) : null}
+            </button>
+            <button
               ref={menuButtonRef}
               type="button"
               className="catalog-menu-btn"
@@ -445,11 +483,13 @@ export default function CatalogLayout({ children }) {
         </nav>
       </aside>
 
-      <main className="relative flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10" inert={menuOpen ? '' : undefined}>
+      <CartDrawer open={cartOpen} onClose={closeCart} />
+
+      <main className="relative flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10" inert={menuOpen || cartOpen ? '' : undefined}>
         {children}
       </main>
 
-      <footer className="relative border-t py-8 catalog-footer" style={{ borderColor: 'var(--border-color)' }}>
+      <footer className="relative border-t py-8 catalog-footer" inert={cartOpen ? '' : undefined} style={{ borderColor: 'var(--border-color)' }}>
         <div className="max-w-7xl mx-auto px-4 sm:px-6 flex flex-col md:flex-row items-center justify-between gap-6 text-xs">
           <div className="text-center sm:text-right catalog-footer-copy space-y-1">
             <div className="font-medium text-white/90">

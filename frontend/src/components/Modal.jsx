@@ -27,12 +27,15 @@ export default function Modal({ isOpen, onClose, title, children, size = 'lg' })
   const dialogRef = useRef(null);
   const previousFocusRef = useRef(null);
 
-  const handleEscape = useCallback(
-    (e) => {
-      if (e.key === 'Escape') onClose();
-    },
-    [onClose]
-  );
+  // Keep the latest onClose available to the keydown listener without making it
+  // an effect dependency: a parent that re-creates onClose on every render must
+  // not re-run the open effect, which would re-steal focus mid-typing.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  const handleEscape = useCallback((e) => {
+    if (e.key === 'Escape') onCloseRef.current();
+  }, []);
 
   const handleKeyDown = useCallback((e) => {
     if (e.key !== 'Tab') return;

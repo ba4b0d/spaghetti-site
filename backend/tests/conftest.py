@@ -96,9 +96,19 @@ def setup_test_db():
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
     """FastAPI TestClient with test DB dependency override."""
+    import app.main as app_main
     from app.main import app
+
+    # Entering TestClient runs the app lifespan, whose final step starts a
+    # Telegram *receive-poll* daemon thread. That thread issues live
+    # ``getUpdates`` calls as soon as a bot token is configured — and this
+    # project's Settings table already carries a real token — so without this
+    # guard the whole suite makes outbound Telegram requests. Replace the
+    # thread starter with a no-op so no test can open that socket, whatever the
+    # developer's environment or database holds.
+    monkeypatch.setattr(app_main, "start_telegram_bot_thread", lambda: None)
 
     def _override_get_db():
         db = TestSessionLocal()

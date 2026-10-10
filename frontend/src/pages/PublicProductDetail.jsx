@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useParams, Link } from 'react-router-dom';
 import {
@@ -12,11 +12,13 @@ import {
   Send,
   MessageCircle,
   Box,
+  ShoppingCart,
   Maximize2,
   X,
 } from 'lucide-react';
 import { getCatalog, getCatalogProductBySlug, getCatalogProduct } from '../lib/api';
 import { formatPrice } from '../lib/utils';
+import { addItem } from '../lib/cart';
 import { useSEO, buildProductJsonLd, buildBreadcrumbJsonLd, absoluteUrl } from '../lib/seo';
 import { Z_INDEX_MODAL_PORTAL } from '../lib/constants';
 
@@ -464,6 +466,20 @@ export default function PublicProductDetail() {
     return `https://t.me/share/url?url=${url}&text=${text}`;
   }, [shareUrl, shareText]);
 
+  // Add to cart — stores ids + qty only; prices are never trusted client-side.
+  const [added, setAdded] = useState(false);
+  const addedTimerRef = useRef(null);
+
+  const handleAddToCart = useCallback(() => {
+    if (!product?.id) return;
+    addItem(product.id, 1);
+    setAdded(true);
+    window.clearTimeout(addedTimerRef.current);
+    addedTimerRef.current = window.setTimeout(() => setAdded(false), 1800);
+  }, [product?.id]);
+
+  useEffect(() => () => window.clearTimeout(addedTimerRef.current), []);
+
   if (loading) {
     return (
       <div className="max-w-5xl mx-auto animate-fade-in">
@@ -667,10 +683,18 @@ export default function PublicProductDetail() {
           })()}
 
           {/* CTAs */}
-          <div className="pt-4 mt-auto border-t flex flex-col sm:flex-row gap-3" style={{ borderColor: 'var(--border-color)' }}>
+          <div className="pt-4 mt-auto border-t flex flex-col sm:flex-row gap-3 flex-wrap" style={{ borderColor: 'var(--border-color)' }}>
+            <button
+              type="button"
+              className="btn-primary flex-1 inline-flex items-center justify-center gap-2"
+              onClick={handleAddToCart}
+            >
+              <ShoppingCart size={18} />
+              {added ? 'به سبد خرید اضافه شد ✓' : 'افزودن به سبد خرید'}
+            </button>
             <Link
               to="/contact"
-              className="btn-primary flex-1 inline-flex items-center justify-center gap-2"
+              className="btn-secondary flex-1 inline-flex items-center justify-center gap-2"
             >
               <MessageCircle size={18} />
               تماس برای سفارش
@@ -686,6 +710,9 @@ export default function PublicProductDetail() {
               اشتراک در تلگرام
             </a>
           </div>
+          <p className="sr-only" aria-live="polite">
+            {added ? 'محصول به سبد خرید اضافه شد' : ''}
+          </p>
         </div>
       </div>
 
