@@ -5,16 +5,20 @@
 // The /pay/<token> URL embeds a private bearer token, so the served document
 // must (a) never let the token escape via a Referer header, (b) never be
 // cached, and (c) never be routed to the upstream meta-preview handler that
-// echoed the raw URI back in og:url/canonical. These are properties of the
+// echoes the raw URI back in og:url/canonical. These are properties of the
 // nginx config, not of the React code, so they are asserted here against the
 // real config file rather than mocked.
 //
-// Why a hand-rolled parser instead of a trivial `toContain`: the same
-// directives appear at several levels, and nginx's `add_header` inheritance
-// is positional — once a location declares any `add_header`, the server-level
-// security headers are dropped for that location. The test therefore scopes
-// assertions to the /pay/ location block and separately proves the server
-// level still declares the baseline policy.
+// Why a hand-rolled parser + location matcher instead of a trivial
+// `toContain`: the same directives appear at several levels, nginx's
+// `add_header` inheritance is positional, and — the whole point of this file —
+// nginx location SELECTION has non-obvious precedence (exact > longest `^~`
+// prefix > first regex > longest plain prefix) and prefix matching is
+// CASE-SENSITIVE. React Router v7 matches the same routes case-insensitively,
+// so a naive `^~ /pay/` prefix left /PAY/<token> and /Pay/<token> falling
+// through to `location /` (losing no-referrer/no-store AND hitting the
+// meta-preview echo). This test models nginx's algorithm and proves every case
+// variant is captured.
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 
@@ -31,6 +35,15 @@ const stripComments = (text) =>
 
 const CONF = stripComments(RAW);
 
+/** Split an nginx location selector into { type, target }. */
+function classify(selector) {
+  if (/^=\s*/.test(selector)) return { type: '=', target: selector.replace(/^=\s*/, '').trim() };
+  if (/^\^~\s*/.test(selector)) return { type: '^~', target: selector.replace(/^\^~\s*/, '').trim() };
+  if (/^~\*\s*/.test(selector)) return { type: '~*', target: selector.replace(/^~\*\s*/, '').trim() };
+  if (/^~\s*/.test(selector)) return { type: '~', target: selector.replace(/^~\s*/, '').trim() };
+  return { type: 'prefix', target: selector.trim() };
+}
+
 /** Extract every `location <selector> { ... }` block (locations never nest). */
 function parseLocations(text) {
   const locations = [];
@@ -44,10 +57,45 @@ function parseLocations(text) {
       if (text[i] === '{') depth += 1;
       else if (text[i] === '}') depth -= 1;
     }
-    locations.push({ selector, body: text.slice(re.lastIndex, i - 1) });
+    locations.push({
+      selector,
+      body: text.slice(re.lastIndex, i - 1),
+      ...classify(selector),
+    });
     re.lastIndex = i;
   }
   return locations;
+}
+
+/**
+ * Model nginx server-level location selection:
+ *   1. exact (`=`) wins outright;
+ *   2. otherwise remember the LONGEST matching prefix (`^~` or plain);
+ *      if that longest prefix is `^~`, it wins and regexes are skipped;
+ *   3. otherwise the FIRST matching regex (`~` case-sensitive, `~*` insens.)
+ *      wins;
+ *   4. if no regex matches, the longest prefix wins (here: `location /`).
+ * Prefix matching is case-sensitive on the Linux runtime.
+ */
+function matchLocation(locations, uri) {
+  const exact = locations.find((l) => l.type === '=' && l.target === uri);
+  if (exact) return exact;
+
+  let bestPrefix = null;
+  for (const l of locations) {
+    if ((l.type === '^~' || l.type === 'prefix') && uri.startsWith(l.target)) {
+      if (!bestPrefix || l.target.length > bestPrefix.target.length) bestPrefix = l;
+    }
+  }
+  if (bestPrefix && bestPrefix.type === '^~') return bestPrefix;
+
+  for (const l of locations) {
+    if (l.type === '~' || l.type === '~*') {
+      const re = new RegExp(l.target, l.type === '~*' ? 'i' : '');
+      if (re.test(uri)) return l;
+    }
+  }
+  return bestPrefix;
 }
 
 /** add_header directives declared directly in one block body. */
@@ -71,9 +119,27 @@ const headerValue = (headers, name) => {
 };
 
 const locations = parseLocations(CONF);
-const payLocation = locations.find((l) => /(^|\s)\^~\s*\/pay\//.test(` ${l.selector}`));
-const rootLocation = locations.find((l) => l.selector === '/');
-const htmlLocation = locations.find((l) => l.selector.includes('html'));
+const payLocations = locations.filter(
+  (l) => (l.type === '^~' || l.type === 'prefix' || l.type === '~' || l.type === '~*') &&
+         /^\^?\/pay\//i.test(l.target)
+);
+const payLocation = payLocations[0];
+const rootLocation = locations.find((l) => l.type === 'prefix' && l.target === '/');
+const staticLocation = locations.find((l) => l.type === '~*' && /\\\.\(/.test(l.target));
+const htmlLocation = locations.find((l) => l.type === '~*' && /\\\.html\$/.test(l.target));
+
+// Every case variant of the payment prefix that must resolve to the hardened
+// pay location (both the token page and the token-free result page).
+const PAY_URIS = [
+  '/pay/abc123token',
+  '/PAY/abc123token',
+  '/Pay/abc123token',
+  '/pAy/abc123token',
+  '/pay/result',
+  '/PAY/result',
+  '/Pay/Result',
+];
+const BOT_UA = 'TelegramBot/1.0';
 
 // Server-level security headers, i.e. the directives declared outside every
 // location (top of the server block). Asserted to be replicated in /pay/.
@@ -83,27 +149,69 @@ const SERVER_SECURITY_HEADERS = [
   ['Permissions-Policy', 'camera=(), microphone=(), geolocation=()'],
 ];
 
+describe('nginx location matcher faithfully models nginx precedence', () => {
+  // Sanity: if these fail the rest of the file is meaningless.
+  const prefixOnly = [
+    { type: '^~', target: '/pay/', selector: '^~ /pay/', body: '' },
+    { type: 'prefix', target: '/', selector: '/', body: '' },
+  ];
+  const withRegex = [
+    { type: '~*', target: '^/pay/', selector: '~* ^/pay/', body: '' },
+    { type: 'prefix', target: '/', selector: '/', body: '' },
+  ];
+  it('treats prefix matching as case-SENSITIVE (the original bug)', () => {
+    expect(matchLocation(prefixOnly, '/pay/x').selector).toBe('^~ /pay/');
+    // /PAY/ does not match the case-sensitive prefix, so it falls to `/`.
+    expect(matchLocation(prefixOnly, '/PAY/x').selector).toBe('/');
+  });
+  it('treats `~*` regexes as case-INSENSITIVE and checks them before `/`', () => {
+    expect(matchLocation(withRegex, '/PAY/x').selector).toBe('~* ^/pay/');
+    expect(matchLocation(withRegex, '/pay/x').selector).toBe('~* ^/pay/');
+  });
+});
+
 describe('frontend/nginx.conf — token-bearing /pay/ route', () => {
-  it('is a ^~ prefix location for /pay/ (wins over `location /` and skips regex locations)', () => {
-    expect(payLocation, 'no `location ^~ /pay/` block found').toBeTruthy();
-    expect(payLocation.selector).toMatch(/^\^~\s*\/pay\//);
-
-    // `^~` prefix beats the plain `location /` prefix by length and disables
-    // regex matching, so a social crawler hitting /pay/<token> can never fall
-    // through to the `location /` bot UA branch.
-    expect(rootLocation).toBeTruthy();
-    expect(rootLocation.body).toMatch(/TelegramBot/);
-    expect(payLocation.body).not.toMatch(/TelegramBot/);
+  it('matches the pay route with a case-insensitive regex (not a case-sensitive prefix)', () => {
+    expect(payLocations.length, 'no pay location found').toBeGreaterThan(0);
+    expect(payLocation.type, 'pay location must be a case-insensitive regex').toBe('~*');
+    expect(payLocation.target).toMatch(/^\^\/pay\//);
+    // No `^~ /pay/` (case-sensitive-only) prefix may remain: it would open the
+    // /PAY/ and /Pay/ bypass again.
+    expect(
+      locations.some((l) => l.type === '^~' && l.target === '/pay/'),
+      'stale case-sensitive `^~ /pay/` prefix still present'
+    ).toBe(false);
   });
 
-  it('forces Referrer-Policy: no-referrer on the document response', () => {
-    expect(headerValue(addHeaders(payLocation.body), 'Referrer-Policy')).toBe('no-referrer');
+  it('places the pay regex before the static-asset regex (so /pay/*.js cannot slip through)', () => {
+    const payIdx = locations.indexOf(payLocation);
+    const staticIdx = locations.indexOf(staticLocation);
+    expect(payIdx).toBeGreaterThanOrEqual(0);
+    expect(staticIdx).toBeGreaterThan(payIdx);
   });
 
-  it('forces Cache-Control: no-store so the payment page is never cached', () => {
-    const cc = headerValue(addHeaders(payLocation.body), 'Cache-Control');
+  it.each(PAY_URIS)('routes %s to the hardened pay location (browser)', (uri) => {
+    const hit = matchLocation(locations, uri);
+    expect(hit, `no location matched ${uri}`).toBeTruthy();
+    expect(hit.type, `${uri} matched a case-sensitive/insecure location`).toBe('~*');
+    expect(hit.target).toMatch(/^\^\/pay\//);
+    // Hardening must travel with the location that actually serves the URI.
+    expect(headerValue(addHeaders(hit.body), 'Referrer-Policy')).toBe('no-referrer');
+    const cc = headerValue(addHeaders(hit.body), 'Cache-Control');
     expect(cc).toBeTruthy();
     expect(cc.toLowerCase()).toContain('no-store');
+  });
+
+  it.each(PAY_URIS)('never sends %s to the bot meta-preview branch', (uri) => {
+    // UA only matters inside `location /`; the pay location must win first so
+    // the requested $uri (the token) is never echoed by meta-preview.
+    const hit = matchLocation(locations, uri);
+    expect(hit).not.toBe(rootLocation);
+    expect(hit.body).not.toMatch(/meta-preview/);
+    expect(hit.body).not.toMatch(/proxy_pass/);
+    expect(hit.body).not.toMatch(/TelegramBot/);
+    // The crawler UA is asserted here so the intent (bot traffic) is explicit.
+    expect(BOT_UA).toMatch(/TelegramBot/);
   });
 
   it('restates every server-level security header (add_header does not inherit)', () => {
@@ -115,11 +223,6 @@ describe('frontend/nginx.conf — token-bearing /pay/ route', () => {
     const serverCsp = headerValue(addHeaders(CONF), 'Content-Security-Policy');
     expect(serverCsp, 'server-level CSP not found').toBeTruthy();
     expect(headerValue(headers, 'Content-Security-Policy')).toBe(serverCsp);
-  });
-
-  it('never proxies /pay/ upstream (keeps the token out of meta-preview/backend logs)', () => {
-    expect(payLocation.body).not.toMatch(/proxy_pass/);
-    expect(payLocation.body).not.toMatch(/meta-preview/);
   });
 
   it('keeps the SPA fallback to /index.html so deep links and refresh work', () => {
@@ -138,6 +241,23 @@ describe('frontend/nginx.conf — token-bearing /pay/ route', () => {
     );
     // The HTML rule still disables caching for the SPA entry point.
     expect(headerValue(addHeaders(htmlLocation.body), 'Cache-Control')).toContain('no-store');
+  });
+
+  it('preserves the other server routes', () => {
+    expect(locations.some((l) => l.type === '^~' && l.target === '/api/')).toBe(true);
+    expect(locations.some((l) => l.type === '^~' && l.target === '/uploads/')).toBe(true);
+    expect(locations.some((l) => l.type === '=' && l.target === '/sw.js')).toBe(true);
+
+    // A normal SPA route still falls through to `location /` (unchanged), and
+    // the bot branch still lives there for non-payment routes.
+    expect(matchLocation(locations, '/catalog/xyz')).toBe(rootLocation);
+    expect(rootLocation.body).toMatch(/TelegramBot/);
+    expect(rootLocation.body).toMatch(/meta-preview/);
+
+    // Static assets still hit the immutable-cache branch.
+    const asset = matchLocation(locations, '/assets/index-abc123.js');
+    expect(asset).toBe(staticLocation);
+    expect(headerValue(addHeaders(staticLocation.body), 'Cache-Control')).toBe('public, immutable');
   });
 
   it('has balanced braces (cheap syntax guard before nginx -t runs in the image)', () => {
