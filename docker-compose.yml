@@ -14,8 +14,15 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      # JWT_SECRET is loaded from backend/.env via env_file above.
-      - CORS_ORIGINS=${CORS_ORIGINS:-}
+      # Every other variable — JWT_SECRET, CORS_ORIGINS, COOKIE_SECURE, … — is
+      # loaded from backend/.env via env_file above. Do NOT re-declare them here:
+      # a value in `environment:` takes precedence over `env_file:`, and any
+      # compose-interpolated entry (e.g. CORS_ORIGINS=${CORS_ORIGINS:-}) is
+      # resolved from the *project-root* .env/shell — NOT backend/.env — so it
+      # silently shadows the real backend/.env value with an empty string when
+      # unset. That shadowing was a live bug: CORS_ORIGINS came back empty and
+      # app/main.py fell back to http://localhost:5173 instead of the deployed
+      # origin configured in backend/.env.
     # The backend is only reached through the frontend nginx proxy on this
     # network, so uvicorn must trust X-Forwarded-For *only* from nginx. nginx is
     # pinned to the static IP 172.28.0.2 below; trusting that single fixed host
