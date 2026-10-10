@@ -266,3 +266,46 @@ describe('frontend/nginx.conf — token-bearing /pay/ route', () => {
     expect(opens).toBe(closes);
   });
 });
+
+// ── Two-tier trusted edge: realip recovery of the true client IP ──────────
+// Production path: client → Pi5 edge reverse proxy (192.168.100.50) → this
+// nginx → backend. The edge replaces X-Forwarded-For with the real client, but
+// the peer THIS nginx sees is the edge, so plain $remote_addr is the edge's own
+// address for every visitor and the backend's rate-limit key collapses to one
+// shared bucket. realip rewrites $remote_addr from X-Forwarded-For, but ONLY
+// when the immediate peer is trusted. We trust exactly the one edge address
+// (never a range, never `*`), and keep forwarding the recovered $remote_addr —
+// never a client-supplied chain.
+describe('frontend/nginx.conf — two-tier trusted edge (realip)', () => {
+  const serverLevel = CONF.slice(0, CONF.indexOf('location '));
+  const realIpFrom = (CONF.match(/set_real_ip_from\s+\S+;/g) || []).map((s) =>
+    s.replace(/set_real_ip_from\s+/, '').replace(/;$/, '')
+  );
+
+  it('trusts exactly the Pi edge address, and only it', () => {
+    expect(realIpFrom).toEqual(['192.168.100.50']);
+    // No wildcard / range trust that would let a direct caller spoof its IP.
+    expect(CONF).not.toMatch(/set_real_ip_from\s+(all|\*|0\.0\.0\.0\/0|::\/0)/);
+  });
+
+  it('recovers the client from X-Forwarded-For, recursively', () => {
+    expect(serverLevel).toMatch(/real_ip_header\s+X-Forwarded-For;/);
+    expect(serverLevel).toMatch(/real_ip_recursive\s+on;/);
+  });
+
+  it('forwards the recovered $remote_addr and never a client-supplied chain', () => {
+    expect(CONF).toMatch(/proxy_set_header\s+X-Forwarded-For\s+\$remote_addr;/);
+    expect(CONF).not.toMatch(/proxy_set_header\s+X-Forwarded-For\s+\$proxy_add_x_forwarded_for;/);
+    expect(CONF).not.toMatch(/proxy_set_header\s+X-Forwarded-For\s+\$http_x_forwarded_for;/);
+    expect(CONF).toMatch(/proxy_set_header\s+X-Real-IP\s+\$remote_addr;/);
+  });
+
+  it('configures realip server-wide, before $remote_addr is forwarded', () => {
+    expect(serverLevel).toMatch(/set_real_ip_from/);
+    const headerIdx = CONF.indexOf('real_ip_header X-Forwarded-For;');
+    expect(headerIdx).toBeGreaterThanOrEqual(0);
+    expect(headerIdx).toBeLessThan(
+      CONF.indexOf('proxy_set_header X-Forwarded-For $remote_addr;')
+    );
+  });
+});

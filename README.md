@@ -238,14 +238,32 @@ as an untrusted hint — the invoice is settled only after a server-side
   `payment=pending` result page. A **replay** of that flagged attempt (a gateway
   retry or the customer re-submitting the form) returns the same `pending` — it
   never reports `success` while the invoice is unsettled and no order exists.
-- **Client IP / rate-limit trust behind the proxy.** slowapi keys login and
-  callback limits on the client address, which only equals the real client when
-  uvicorn trusts the reverse proxy. nginx is pinned to a static IP
-  (`172.28.0.2`) on the compose network and the backend is started with
-  `--forwarded-allow-ips 172.28.0.2` — **never `*`** — and nginx *overwrites*
-  `X-Forwarded-For` with the true peer. A direct request to the published
-  backend port (whose peer is not the proxy) therefore cannot forge its IP, and
-  two clients behind nginx keep separate rate-limit buckets.
+- **Client IP / rate-limit trust behind the proxy (two tiers).** slowapi keys
+  login and callback limits on the client address (`request.client.host`),
+  which only equals the real client when *both* proxy tiers are handled:
+  - **Edge → frontend nginx.** In production the request path is
+    `client → Pi5 edge reverse proxy (192.168.100.50) → frontend nginx →
+    backend`. The edge replaces `X-Forwarded-For` with the real client, but the
+    peer the frontend nginx sees is the edge, so `$remote_addr` would otherwise
+    be the edge for everyone. The frontend recovers the client with nginx's
+    realip module — `set_real_ip_from 192.168.100.50` (the exact edge, never a
+    range and never `*`), `real_ip_header X-Forwarded-For`, `real_ip_recursive
+    on` — and then forwards the recovered `$remote_addr` (it *overwrites* the
+    forwarded chain, never appends it). A caller hitting the published `:3000`
+    port directly is not the trusted edge, so its real peer is kept and a forged
+    `X-Forwarded-For` is ignored.
+  - **frontend nginx → backend.** nginx is pinned to a static IP
+    (`172.28.0.2`) on the compose network and the backend is started with
+    `--forwarded-allow-ips 172.28.0.2` — **never `*`** — so a direct request to
+    the published backend port (whose peer is not the proxy) cannot forge its
+    IP, and two clients behind nginx keep separate rate-limit buckets.
+- **Container healthchecks probe `127.0.0.1`, not `localhost`.** Inside the
+  containers `localhost` resolves to `127.0.0.1` *and* `::1`, while nginx
+  (`listen 80;`) and uvicorn (`--host 0.0.0.0`) bind IPv4 only, so a
+  `localhost` probe can hit the unbound `::1` and report a perfectly healthy
+  container **unhealthy** (which blocks `depends_on: service_healthy`
+  dependents). Both compose healthchecks therefore target
+  `http://127.0.0.1:<port>`.
 - **The invoice bearer token is kept out of the logs.** The public token is a
   URL path credential, and the pay page hits it on every load, so it is
   redacted at **both** layers:

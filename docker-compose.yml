@@ -29,13 +29,20 @@ services:
     # (never "*") means a direct request to the published :8080 port — whose peer
     # is not the proxy — cannot forge its client IP, while real clients proxied
     # through nginx are rate-limited by their true address (slowapi keys on
-    # request.client.host via get_remote_address).
+    # request.client.host via get_remote_address). The frontend recovers the
+    # true client IP from the Pi edge with the realip module (see
+    # frontend/nginx.conf) and forwards that recovered address here as
+    # X-Forwarded-For.
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "172.28.0.2"]
     networks:
       commerce_net:
         ipv4_address: 172.28.0.3
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      # Probe 127.0.0.1, never `localhost`: inside the container `localhost`
+      # resolves to both 127.0.0.1 and ::1, and uvicorn binds IPv4 only, so a
+      # name-based probe can reach ::1 and report the container unhealthy while
+      # it is serving fine.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -57,7 +64,11 @@ services:
       commerce_net:
         ipv4_address: 172.28.0.2
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80"]
+      # Probe 127.0.0.1, never `localhost`: the container's /etc/hosts maps
+      # `localhost` to ::1 as well, and this server listens on IPv4 `:80` only,
+      # so busybox wget to the name hits ::1:80, gets ECONNREFUSED and reports
+      # the frontend unhealthy while it serves traffic normally.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80"]
       interval: 30s
       timeout: 10s
       retries: 3
