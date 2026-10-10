@@ -16,6 +16,7 @@ vi.mock('../lib/api', () => ({
 }));
 
 import * as cart from '../lib/cart';
+import { formatPrice } from '../lib/utils';
 import CheckoutRequest from '../pages/CheckoutRequest';
 
 const CART_KEY = 'spaghetti_cart_v1';
@@ -159,5 +160,55 @@ describe('CheckoutRequest', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('برخی محصولات موجود یا فعال نیستند');
     expect(cart.readCart()).toEqual([{ id: 12, qty: 2 }]);
+  });
+});
+
+// ── estimated cart total (item 4) ────────────────────────────────────
+
+describe('CheckoutRequest estimated total', () => {
+  it('shows the indicative total as qty × catalogue price, clearly labelled as an estimate', async () => {
+    cart.addItem(12, 2);
+    renderCheckout();
+
+    await screen.findByText(/جاکلیدی تستی/);
+
+    expect(await screen.findByText('تخمین قیمت')).toBeDefined();
+    const total = await screen.findByTestId('checkout-estimated-total');
+    // 2 × 30,000 = 60,000, formatted with the project's Toman formatter.
+    expect(total.textContent).toBe(formatPrice(60000));
+  });
+
+  it('falls back gracefully and never fabricates a number when the product has no price', async () => {
+    catalogApiMock.getCatalog.mockResolvedValue({
+      data: [{ id: 12, name: 'جاکلیدی بی‌قیمت', final_price: null, slug: 'no-price-keychain' }],
+    });
+    cart.addItem(12, 1);
+    renderCheckout();
+
+    await screen.findByText(/جاکلیدی بی‌قیمت/);
+
+    const total = await screen.findByTestId('checkout-estimated-total');
+    expect(total.textContent).toBe('قیمت تماس بگیرید');
+  });
+
+  it('never sends a price in the request payload', async () => {
+    cart.addItem(12, 2);
+    commerceApiMock.submitCommerceRequest.mockResolvedValue({
+      data: { receipt_id: 'REQ-XYZ', state: 'pending_review' },
+    });
+    renderCheckout();
+    await screen.findByText(/جاکلیدی تستی/);
+
+    fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
+    fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
+    fireEvent.click(screen.getByRole('button', { name: 'ثبت درخواست' }));
+
+    await waitFor(() => expect(commerceApiMock.submitCommerceRequest).toHaveBeenCalledTimes(1));
+    const payload = commerceApiMock.submitCommerceRequest.mock.calls[0][0];
+    expect(Object.keys(payload).sort()).toEqual(
+      ['customer_name', 'items', 'messenger', 'mobile'].sort()
+    );
+    expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
+    expect(JSON.stringify(payload)).not.toContain('60000');
   });
 });

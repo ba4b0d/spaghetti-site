@@ -4,6 +4,7 @@ import { ShoppingBag, Trash2, Plus, Minus, Loader2, CheckCircle2, ArrowRight, Se
 import { getCatalog } from '../lib/api';
 import { submitCommerceRequest } from '../lib/commerceApi';
 import { readCart, updateQuantity, removeItem, subscribe, clearCart } from '../lib/cart';
+import { formatPrice } from '../lib/utils';
 
 /**
  * Public checkout — turns the browser cart into a persisted request.
@@ -94,6 +95,19 @@ export default function CheckoutRequest() {
     () => cartItems.map((item) => ({ ...item, product: byId.get(Number(item.id)) || null })),
     [cartItems, byId]
   );
+
+  // Indicative estimated total (qty × catalogue display price). Purely local —
+  // never sent to the server, which prices the request after staff review.
+  const estimate = useMemo(() => {
+    let sum = 0;
+    let unpricedCount = 0;
+    for (const line of lines) {
+      const unit = Number(line.product?.final_price || line.product?.suggested_price || 0);
+      if (unit > 0) sum += unit * line.qty;
+      else unpricedCount += 1;
+    }
+    return { sum, unpricedCount, lineCount: lines.length };
+  }, [lines]);
 
   const setField = useCallback(
     (key) => (event) => {
@@ -303,6 +317,28 @@ export default function CheckoutRequest() {
               </div>
             );
           })}
+          {lines.length > 0 ? (
+            <div
+              className="flex items-center justify-between gap-2 text-sm pt-3 border-t"
+              style={{ borderColor: 'var(--border-color)' }}
+            >
+              <span style={{ color: 'var(--text-muted)' }}>تخمین قیمت</span>
+              <span
+                className="font-bold tabular-nums"
+                style={{ color: 'var(--text-primary)' }}
+                data-testid="checkout-estimated-total"
+              >
+                {estimate.unpricedCount === estimate.lineCount
+                  ? 'قیمت تماس بگیرید'
+                  : formatPrice(estimate.sum)}
+              </span>
+            </div>
+          ) : null}
+          {lines.length > 0 && estimate.unpricedCount > 0 && estimate.unpricedCount < estimate.lineCount ? (
+            <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+              قیمت {estimate.unpricedCount} قلم از اقلام شما پس از بررسی اعلام می‌شود.
+            </p>
+          ) : null}
           <p className="text-[11px] leading-relaxed pt-1" style={{ color: 'var(--text-muted)' }}>
             سبد خرید فقط شناسه و تعداد کالا را نگه میدارد؛ قیمتها پس از بررسی توسط کارشناسان محاسبه
             و اعلام میشوند.

@@ -18,6 +18,7 @@ const apiMock = vi.hoisted(() => ({
 vi.mock('../lib/api', () => apiMock);
 
 import * as cart from '../lib/cart';
+import { formatPrice } from '../lib/utils';
 import CartDrawer from '../components/CartDrawer';
 import CatalogLayout from '../components/CatalogLayout';
 
@@ -421,5 +422,38 @@ describe('CartDrawer focus stability across cart mutations', () => {
 
     expect(plus).toHaveFocus();
     expect(closeButton).not.toHaveFocus();
+  });
+});
+
+// ── estimated cart total (item 4) ───────────────────────────────────
+
+describe('CartDrawer estimated total', () => {
+  it('shows the indicative total (qty × catalogue price) with an estimate label', async () => {
+    cart.addItem(12, 2);
+    const user = userEvent.setup();
+    render(<DrawerHarness />);
+    await openDrawer(user);
+
+    await screen.findByText('جاکلیدی تستی');
+
+    expect(await screen.findByText('تخمین قیمت')).toBeInTheDocument();
+    const total = await screen.findByTestId('cart-estimated-total');
+    // 2 × 30,000 = 60,000, formatted with the project's Toman formatter.
+    expect(total.textContent).toBe(formatPrice(60000));
+  });
+
+  it('falls back to "قیمت تماس بگیرید" when no line has a published price', async () => {
+    apiMock.getCatalog.mockResolvedValue({
+      data: [{ id: 12, name: 'جاکلیدی تستی', slug: 'test-keychain' }],
+    });
+    cart.addItem(12, 1);
+    const user = userEvent.setup();
+    render(<DrawerHarness />);
+    await openDrawer(user);
+
+    await screen.findByText('جاکلیدی تستی');
+
+    const total = await screen.findByTestId('cart-estimated-total');
+    expect(total.textContent).toBe('قیمت تماس بگیرید');
   });
 });
