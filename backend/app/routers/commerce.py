@@ -200,22 +200,27 @@ def create_request(
 
     Ownership of ``mobile`` is proven FIRST: the submitted OTP must match the
     issued challenge, otherwise the request is rejected and — crucially — no
-    request row is written. Returns an opaque receipt identifier only; no
-    invoice or payment link is produced before staff review. The admin alert is
-    dispatched as a *background* task after the response, so a slow
-    Telegram/SMS/SMTP transport cannot delay the customer's acknowledgement.
+    request row is written. The proof is consumed in the SAME transaction as
+    the request: the claim is left uncommitted (``commit=False``) and committed
+    together with the new row, so a rejected creation (empty cart, inactive
+    product, …) rolls the claim back and leaves the customer's code usable
+    instead of stranding them for the cooldown. Single-use is still guaranteed
+    under concurrent submits by the service's atomic claim — only one verifier
+    can win, so only one request row is ever written per challenge. Returns an
+    opaque receipt identifier only; no invoice or payment link is produced
+    before staff review. The admin alert is dispatched as a *background* task
+    after the transaction commits, so a slow Telegram/SMS/SMTP transport cannot
+    delay the customer's acknowledgement.
     """
     try:
         commerce_otp.verify_challenge(
-            db, body.otp_challenge_id, body.otp_code, body.mobile
+            db,
+            body.otp_challenge_id,
+            body.otp_code,
+            body.mobile,
+            commit=False,
         )
-    except commerce_otp.OtpError as exc:
-        # Invalid / expired / unknown / exhausted all answer 400 with a generic
-        # Persian message — the failure never reveals whether the mobile exists.
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    try:
-        created = commerce_service.create_website_request(
+        created = commerce_service.prepare_website_request(
             db,
             customer_name=body.customer_name,
             mobile=body.mobile,
@@ -224,11 +229,23 @@ def create_request(
             address=body.address,
             note=body.note,
             items=[{"product_id": i.product_id, "qty": i.qty} for i in body.items],
-            background_tasks=background_tasks,
         )
+        # Atomic create + consume: both land, or neither does.
+        db.commit()
+    except commerce_otp.OtpError as exc:
+        # Invalid / expired / unknown / exhausted all answer 400 with a generic
+        # Persian message — the failure never reveals whether the mobile exists.
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
     except CommerceValidationError as exc:
+        # Request rejected: the uncommitted OTP claim is rolled back, so the
+        # proof stays usable until it expires.
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # After-commit alert (built against the committed row), then the minimal
+    # public acknowledgement.
+    commerce_service.notify_request_created(created, background_tasks=background_tasks)
     return commerce_service.serialize_public_receipt(created)
 
 

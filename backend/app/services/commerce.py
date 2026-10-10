@@ -85,7 +85,7 @@ def _indicative_price_toman(product: Product) -> int | None:
     return price_int if price_int > 0 else None
 
 
-def create_website_request(
+def prepare_website_request(
     db: Session,
     *,
     customer_name: str,
@@ -95,9 +95,14 @@ def create_website_request(
     address: str = "",
     note: str = "",
     items: list[dict],
-    background_tasks=None,
 ) -> CommerceRequest:
-    """Persist a pending-review website request with server-side item snapshots.
+    """Validate + build a pending-review website request and flush it.
+
+    Same validation as ``create_website_request`` but deliberately does **not**
+    commit: the caller owns the transaction boundary so the request can be
+    committed atomically alongside another change (e.g. consuming the cart
+    OTP), making a rejected creation roll both back together. Returns the
+    request with ``id``/``items`` populated via ``flush()``.
 
     ``items`` is a list of ``{"product_id": int, "qty": int}``. Any other keys
     (including client-supplied prices) are deliberately ignored.
@@ -157,16 +162,55 @@ def create_website_request(
         )
 
     db.add(request)
-    db.commit()
-    db.refresh(request)
+    db.flush()  # assign request.id / item rows without ending the transaction
+    return request
 
-    # After-commit: alert staff that a website request arrived. Delivery is
-    # deferred to a background task (payload snapshotted now) so the public
-    # response is never gated by the transport. Never raises.
+
+def notify_request_created(request: CommerceRequest, *, background_tasks=None) -> None:
+    """After-commit admin alert that a website request arrived. Never raises.
+
+    Public wrapper around ``_emit_admin_notification`` so a caller that commits
+    the request itself (rather than via ``create_website_request``) can still
+    fire the alert once the transaction is durable.
+    """
     _emit_admin_notification(
         commerce_notifications.EVENT_REQUEST_CREATED, request,
         background_tasks=background_tasks,
     )
+
+
+def create_website_request(
+    db: Session,
+    *,
+    customer_name: str,
+    mobile: str,
+    messenger: str,
+    messenger_handle: str = "",
+    address: str = "",
+    note: str = "",
+    items: list[dict],
+    background_tasks=None,
+) -> CommerceRequest:
+    """Persist a pending-review website request with server-side item snapshots.
+
+    Commits the request then, after commit, alerts staff (delivery deferred to
+    ``background_tasks`` when provided). ``items`` is a list of
+    ``{"product_id": int, "qty": int}``; any other keys (including
+    client-supplied prices) are deliberately ignored.
+    """
+    request = prepare_website_request(
+        db,
+        customer_name=customer_name,
+        mobile=mobile,
+        messenger=messenger,
+        messenger_handle=messenger_handle,
+        address=address,
+        note=note,
+        items=items,
+    )
+    db.commit()
+    db.refresh(request)
+    notify_request_created(request, background_tasks=background_tasks)
     return request
 
 

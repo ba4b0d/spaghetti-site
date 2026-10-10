@@ -421,3 +421,159 @@ def test_happy_path_creates_the_request(client, auth_headers, fake_sms):
 
     # The challenge is consumed by the successful request.
     assert _challenge_rows(MOBILE)[0]["consumed_at"] is not None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Concurrency / atomicity regressions
+# ══════════════════════════════════════════════════════════════════════
+
+def test_concurrent_issue_sends_exactly_one_sms(fake_sms, monkeypatch):
+    """Two simultaneous issues for one mobile must yield one SMS, one row.
+
+    A check-then-insert without serialization lets both issuers read "no recent
+    challenge" before either writes, so both send a (costly, real) SMS. The
+    service takes SQLite's write lock up front (``BEGIN IMMEDIATE``), so the
+    second issuer blocks until the first commits and then sees its row. The
+    ``_latest_for_mobile`` delay widens the check→insert window so an
+    unserialized implementation would reliably double-send here.
+    """
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tests.conftest import TestSessionLocal
+
+    real_latest = commerce_otp._latest_for_mobile
+
+    def slow_latest(db, mobile):  # noqa: ANN001 - test seam
+        time.sleep(0.05)
+        return real_latest(db, mobile)
+
+    monkeypatch.setattr(commerce_otp, "_latest_for_mobile", slow_latest)
+
+    barrier = threading.Barrier(2)
+
+    def _run():
+        db = TestSessionLocal()
+        try:
+            barrier.wait(timeout=5)
+            try:
+                commerce_otp.issue_challenge(db, MOBILE, client_ip="203.0.113.7")
+                return "sent"
+            except commerce_otp.OtpThrottled:
+                return "throttled"
+        finally:
+            db.close()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        results = [fut.result() for fut in [ex.submit(_run) for _ in range(2)]]
+
+    assert sorted(results) == ["sent", "throttled"], results
+    assert fake_sms.call_count == 1
+    # Exactly one live challenge survives (the loser wrote nothing).
+    assert len([c for c in _challenge_rows(MOBILE) if c["consumed_at"] is None]) == 1
+
+
+def test_stale_verifier_loses_the_single_use_race(client, fake_sms):
+    """A verifier holding a stale view cannot consume an already-claimed code.
+
+    Session A loads the challenge (``consumed_at is None``), session B then
+    verifies it, and A finally submits the *correct* code against its stale
+    copy. The atomic conditional claim only matches an unconsumed row, so A's
+    UPDATE affects 0 rows and it is rejected — exactly one verifier wins.
+    """
+    from app.models import CommerceOtpChallenge
+    from tests.conftest import TestSessionLocal
+
+    issued = _issue(client).json()
+    code = _sent_code(fake_sms)
+    cid = issued["challenge_id"]
+
+    db_a = TestSessionLocal()
+    db_b = TestSessionLocal()
+    try:
+        stale = db_a.query(CommerceOtpChallenge).filter_by(id=cid).first()
+        assert stale is not None and stale.consumed_at is None
+
+        # B consumes the challenge first (real, committed claim).
+        commerce_otp.verify_challenge(db_b, cid, code, MOBILE)
+
+        # A replays the same correct code from its stale identity-map view.
+        with pytest.raises(commerce_otp.OtpInvalid):
+            commerce_otp.verify_challenge(db_a, cid, code, MOBILE)
+    finally:
+        db_a.close()
+        db_b.close()
+
+
+def test_commit_false_claim_rolls_back_with_the_caller(client, fake_sms):
+    """A successful ``commit=False`` claim is undone when the caller rolls back.
+
+    This is the seam the request endpoint relies on: a failed creation rolls
+    the (uncommitted) OTP claim back, leaving the proof usable.
+    """
+    from tests.conftest import TestSessionLocal
+
+    issued = _issue(client).json()
+    code = _sent_code(fake_sms)
+    cid = issued["challenge_id"]
+
+    db = TestSessionLocal()
+    try:
+        commerce_otp.verify_challenge(db, cid, code, MOBILE, commit=False)
+        # Not durable while the caller's transaction is open...
+        db.rollback()
+    finally:
+        db.close()
+    assert _challenge_rows(MOBILE)[0]["consumed_at"] is None
+
+    # ...so the (still unexpired) proof can be used once, for real.
+    db2 = TestSessionLocal()
+    try:
+        challenge = commerce_otp.verify_challenge(db2, cid, code, MOBILE)
+        assert challenge.consumed_at is not None
+    finally:
+        db2.close()
+
+
+def test_commit_false_claim_persists_when_the_caller_commits(client, fake_sms):
+    from tests.conftest import TestSessionLocal
+
+    issued = _issue(client).json()
+    code = _sent_code(fake_sms)
+
+    db = TestSessionLocal()
+    try:
+        commerce_otp.verify_challenge(
+            db, issued["challenge_id"], code, MOBILE, commit=False
+        )
+        db.commit()
+    finally:
+        db.close()
+    assert _challenge_rows(MOBILE)[0]["consumed_at"] is not None
+
+
+def test_commit_false_failed_attempt_survives_the_caller_rollback(client, fake_sms):
+    """Wrong-code bookkeeping is durable even when the caller rolls back.
+
+    Otherwise a brute-forcer could reset the attempt budget simply by making
+    the request creation fail and rolling it back.
+    """
+    from tests.conftest import TestSessionLocal
+
+    issued = _issue(client).json()
+    wrong = _wrong_code(_sent_code(fake_sms))
+
+    db = TestSessionLocal()
+    try:
+        with pytest.raises(commerce_otp.OtpInvalid):
+            commerce_otp.verify_challenge(
+                db, issued["challenge_id"], wrong, MOBILE, commit=False
+            )
+        db.rollback()  # caller abandons its request
+    finally:
+        db.close()
+
+    rows = _challenge_rows(MOBILE)
+    assert rows[0]["attempts"] == 1
+    assert rows[0]["consumed_at"] is None

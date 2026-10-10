@@ -439,3 +439,69 @@ def test_permanent_delete_handles_legacy_items_table(client, auth_headers):
     rows = client.get("/api/v1/commerce/staff/requests", headers=auth_headers).json()
     assert rows[0]["items"][0]["product_id"] is None
     assert rows[0]["items"][0]["display_name"] == "محصول قدیمی"
+
+
+# ── OTP consumption is atomic with request creation ──────────────────
+
+def _otp_payload(product_id, qty=1, **overrides):
+    """A payload bound to ONE explicit challenge (unlike ``_valid_payload``)."""
+    payload = {
+        "customer_name": "رضا",
+        "mobile": "09123456789",
+        "messenger": "telegram",
+        "items": [{"product_id": product_id, "qty": qty}],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_failed_creation_does_not_burn_the_otp(client, auth_headers):
+    """A rejected creation (inactive product) must leave the code usable.
+
+    The OTP is claimed in the same transaction as the request, so a validation
+    failure rolls the claim back. The customer can retry with the *same* code
+    instead of being stranded until the resend cooldown expires.
+    """
+    active = _create_product(client, auth_headers, name="فعال", price=50000)
+    inactive = _create_product(client, auth_headers, name="غیرفعال", price=50000)
+    upd = client.put(
+        f"/api/v1/products/{inactive['id']}", json={"is_active": False}, headers=auth_headers
+    )
+    assert upd.status_code in (200, 201), upd.text
+
+    otp = issue_test_otp()  # one challenge, deliberately reused across attempts
+
+    rejected = client.post(
+        "/api/v1/commerce/requests",
+        json=_otp_payload(inactive["id"], **otp),
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert client.get(
+        "/api/v1/commerce/staff/requests", headers=auth_headers
+    ).json() == []
+
+    # Same challenge + code, valid cart: the failed attempt did NOT consume it.
+    ok = client.post(
+        "/api/v1/commerce/requests",
+        json=_otp_payload(active["id"], **otp),
+    )
+    assert ok.status_code == 200, ok.text
+    assert len(client.get(
+        "/api/v1/commerce/staff/requests", headers=auth_headers
+    ).json()) == 1
+
+
+def test_otp_is_single_use_across_two_submissions(client, auth_headers):
+    """After a successful request the challenge is consumed — no reuse."""
+    product = _create_product(client, auth_headers)
+    otp = issue_test_otp()
+
+    first = client.post("/api/v1/commerce/requests", json=_otp_payload(product["id"], **otp))
+    assert first.status_code == 200, first.text
+
+    second = client.post("/api/v1/commerce/requests", json=_otp_payload(product["id"], **otp))
+    assert second.status_code == 400, second.text
+
+    assert len(client.get(
+        "/api/v1/commerce/staff/requests", headers=auth_headers
+    ).json()) == 1
