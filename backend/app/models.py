@@ -366,3 +366,112 @@ class CommerceRequestItem(Base):
     request = relationship("CommerceRequest", back_populates="items")
     product = relationship("Product", lazy="joined")
 
+
+# ── Commerce: staff-reviewed invoices + private payment links (Task 2) ──
+# An invoice is the ONLY payable commerce artifact. A website request can
+# never be paid directly; staff must convert it into a reviewed invoice.
+COMMERCE_INVOICE_STATES = (
+    "draft",     # being prepared/edited by staff — no payable link exists
+    "approved",  # frozen; a private, expiring bearer link exists
+    "paid",      # confirmed payment (Task 3); terminal for edits
+    "revoked",   # staff invalidated the link
+)
+
+# Private invoice links expire after 7 days (spec: "links expire after 7 days").
+INVOICE_LINK_TTL_DAYS = 7
+
+# Hard ceiling for a single invoice total, in integer Toman. Enforced both on
+# staff create/edit and (Task 3) on the payment transition so a tampered row
+# can never reach a provider above its limit.
+MAX_INVOICE_TOTAL_TOMAN = 50_000_000
+
+
+class CommerceInvoice(Base):
+    """A staff-reviewed invoice with an optional private token link.
+
+    Only ``token_hash`` is persisted — the raw bearer token is returned once,
+    at approval time, and never stored or logged. Monetary values are integer
+    Toman.
+    """
+    __tablename__ = "commerce_invoices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Optional link back to the website request this invoice was built from.
+    # SET NULL (not CASCADE): a permanent request delete must not erase an
+    # issued invoice. The request is marked ``converted`` when linked.
+    request_id = Column(
+        Integer,
+        ForeignKey("commerce_requests.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    customer_name = Column(String(120), nullable=False, default="")
+    mobile = Column(String(11), nullable=False, default="", index=True)
+    messenger = Column(String(20), nullable=False, default="telegram")
+    messenger_handle = Column(String(100), default="")
+    address = Column(String(500), default="")
+    # Customer-visible finalized specification (shown on the private pay page).
+    specification = Column(String(2000), default="")
+    # Staff-only note; never exposed through any public endpoint.
+    internal_note = Column(String(2000), default="")
+    shipping_toman = Column(Integer, nullable=False, default=0)
+    total_toman = Column(Integer, nullable=False, default=0)  # items + shipping
+    state = Column(String(20), nullable=False, default="draft", index=True)
+    revision = Column(Integer, nullable=False, default=1)
+    token_hash = Column(String(64), nullable=True, unique=True, index=True)  # sha256 hex
+    token_expires_at = Column(DateTime, nullable=True, index=True)
+    approved_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    # Exactly one legacy fulfillment Order may be linked to a paid invoice.
+    order_id = Column(
+        Integer,
+        ForeignKey("orders.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    items = relationship(
+        "CommerceInvoiceItem",
+        back_populates="invoice",
+        cascade="all, delete-orphan",
+        order_by="CommerceInvoiceItem.id",
+    )
+    request = relationship("CommerceRequest", lazy="joined")
+
+
+class CommerceInvoiceItem(Base):
+    """Line item snapshot for an invoice (description/qty/unit price frozen).
+
+    ``product_id`` is a nullable, detaching link: a permanent product delete
+    must not erase (or block on) the historical priced snapshot.
+    """
+    __tablename__ = "commerce_invoice_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    invoice_id = Column(
+        Integer,
+        ForeignKey("commerce_invoices.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    product_id = Column(
+        Integer,
+        ForeignKey("products.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    description = Column(String(255), nullable=False, default="")
+    qty = Column(Integer, nullable=False, default=1)
+    unit_toman = Column(Integer, nullable=False, default=0)
+    line_total_toman = Column(Integer, nullable=False, default=0)
+
+    invoice = relationship("CommerceInvoice", back_populates="items")
+    product = relationship("Product", lazy="joined")
+

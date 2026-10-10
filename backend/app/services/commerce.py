@@ -10,11 +10,24 @@ Design rules enforced here (see plan Global Constraints):
 - Only *active* catalogue products may be requested.
 - Money kept as integer Toman; no floating point math on amounts.
 """
+import hashlib
+import os
 import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 from sqlalchemy.orm import Session, selectinload
 
-from app.models import CommerceRequest, CommerceRequestItem, Product
+from app.models import (
+    COMMERCE_INVOICE_STATES,
+    INVOICE_LINK_TTL_DAYS,
+    MAX_INVOICE_TOTAL_TOMAN,
+    CommerceInvoice,
+    CommerceInvoiceItem,
+    CommerceRequest,
+    CommerceRequestItem,
+    Product,
+)
 
 # Public payload envelope (mirrors the Pydantic constraints in the router).
 MAX_DISTINCT_PRODUCTS = 30
@@ -183,3 +196,526 @@ def list_staff_requests(
     if state:
         query = query.filter(CommerceRequest.state == state)
     return query.offset(offset).limit(limit).all()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Task 2 — reviewed invoices + private expiring links
+# ══════════════════════════════════════════════════════════════════════
+
+# Invoice payload bounds (mirrored by the Pydantic layer in the router).
+MAX_INVOICE_ITEMS = 100
+MAX_INVOICE_ITEM_QTY = 999
+MAX_INVOICE_DESCRIPTION = 255
+
+# A private link stays valid for 7 days from approval.
+INVOICE_LINK_TTL = timedelta(days=INVOICE_LINK_TTL_DAYS)
+
+# Default public site origin for the shared pay link (overridable per deploy).
+DEFAULT_PUBLIC_SITE_ORIGIN = "https://spaghettiprints.ir"
+INVOICE_PAY_PATH = "/pay"
+TOKEN_BYTES = 32
+
+# Anything but a settled payment may be edited (which returns it to draft).
+EDITABLE_INVOICE_STATES = ("draft", "approved", "revoked")
+
+
+class CommerceNotFoundError(Exception):
+    """Requested commerce entity does not exist (maps to HTTP 404)."""
+
+
+class CommerceGoneError(Exception):
+    """Token existed but is no longer usable (expired/revoked) (maps to HTTP 410)."""
+
+
+class CommerceStateError(Exception):
+    """The entity exists but is not in a state that allows this action (HTTP 409)."""
+
+
+class CommerceConfigError(Exception):
+    """The deployment origin is misconfigured (maps to HTTP 500)."""
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Attach UTC to naive datetimes read back from SQLite."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+# ── Private token handling ───────────────────────────────────────────
+
+def hash_invoice_token(raw_token: str) -> str:
+    """Deterministic SHA-256 hex digest of a raw bearer token."""
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def generate_invoice_token() -> tuple[str, str]:
+    """Return ``(raw_token, token_hash)`` — only the hash is persisted."""
+    raw = secrets.token_urlsafe(TOKEN_BYTES)
+    return raw, hash_invoice_token(raw)
+
+
+def _is_production() -> bool:
+    env = (os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "").strip().lower()
+    return env in ("production", "prod")
+
+
+def public_site_origin() -> str:
+    """Validated public origin used to build customer-facing share links.
+
+    Defaults to the production site. HTTPS is mandatory whenever ``APP_ENV``
+    is production/prod so a private bearer link is never emitted over plain
+    HTTP; a non-HTTPS origin is only tolerated in local development.
+    """
+    raw = (os.getenv("PUBLIC_SITE_ORIGIN") or DEFAULT_PUBLIC_SITE_ORIGIN).strip().rstrip("/")
+    parsed = urlsplit(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise CommerceConfigError("PUBLIC_SITE_ORIGIN must be a valid absolute URL")
+    # Only a bare origin is accepted — no path, query string, fragment or
+    # userinfo. Anything else (e.g. ``https://evil.example/path?leak=1``) could
+    # route the private bearer link to an attacker-controlled location or leak
+    # the token through a redirect/query string.
+    if parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise CommerceConfigError(
+            "PUBLIC_SITE_ORIGIN must be a bare origin (no path, query, fragment or userinfo)"
+        )
+    if parsed.scheme != "https" and _is_production():
+        raise CommerceConfigError("PUBLIC_SITE_ORIGIN must use HTTPS in production")
+    return raw
+
+
+def build_share_url(raw_token: str) -> str:
+    """Full private pay URL for a freshly issued token."""
+    return f"{public_site_origin()}{INVOICE_PAY_PATH}/{raw_token}"
+
+
+def is_link_expired(invoice: CommerceInvoice) -> bool:
+    expires = _as_utc(invoice.token_expires_at)
+    return expires is not None and expires <= _now()
+
+
+# ── Money / item validation ──────────────────────────────────────────
+
+def _require_int(value, *, field: str, minimum: int, maximum: int) -> int:
+    """Strict integer-Toman bound check (no floats, no bools, no coercion)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CommerceValidationError(f"{field} باید عدد صحیح باشد")
+    if value < minimum or value > maximum:
+        raise CommerceValidationError(f"{field} خارج از محدوده مجاز است")
+    return value
+
+
+def _normalize_invoice_items(db: Session, items: list[dict]) -> list[dict]:
+    """Validate and normalize invoice lines; snapshots stay authoritative."""
+    if not items:
+        raise CommerceValidationError("فاکتور باید حداقل یک آیتم داشته باشد")
+    if len(items) > MAX_INVOICE_ITEMS:
+        raise CommerceValidationError("تعداد آیتمهای فاکتور بیش از حد مجاز است")
+
+    normalized: list[dict] = []
+    for raw in items:
+        try:
+            description = str(raw.get("description") or "").strip()
+        except AttributeError:
+            raise CommerceValidationError("آیتم فاکتور نامعتبر است")
+        if not description:
+            raise CommerceValidationError("شرح آیتم الزامی است")
+        if len(description) > MAX_INVOICE_DESCRIPTION:
+            raise CommerceValidationError("شرح آیتم بسیار طولانی است")
+
+        raw_product_id = raw.get("product_id")
+        if raw_product_id is None or raw_product_id == "":
+            product_id = None
+        else:
+            product_id = _require_int(
+                raw_product_id, field="شناسه محصول", minimum=1, maximum=2_147_483_647
+            )
+
+        qty = _require_int(raw.get("qty"), field="تعداد", minimum=1, maximum=MAX_INVOICE_ITEM_QTY)
+        unit = _require_int(
+            raw.get("unit_toman"), field="قیمت واحد", minimum=1, maximum=MAX_INVOICE_TOTAL_TOMAN
+        )
+        normalized.append(
+            {
+                "product_id": product_id,
+                "description": description,
+                "qty": qty,
+                "unit_toman": unit,
+                "line_total_toman": qty * unit,
+            }
+        )
+
+    product_ids = {i["product_id"] for i in normalized if i["product_id"] is not None}
+    if product_ids:
+        found = {
+            p.id
+            for p in db.query(Product).filter(Product.id.in_(product_ids)).all()
+        }
+        if product_ids - found:
+            raise CommerceValidationError("برخی محصولات انتخابشده یافت نشدند")
+    return normalized
+
+
+def compute_invoice_totals(normalized_items: list[dict], shipping_toman: int) -> tuple[int, int, int]:
+    """Return ``(items_subtotal, shipping, total)`` in integer Toman.
+
+    The total ceiling is enforced here so every mutation path (create, edit and
+    the Task 3 payment transition, which reuses this helper) shares one bound.
+    """
+    subtotal = sum(item["line_total_toman"] for item in normalized_items)
+    total = subtotal + shipping_toman
+    if total > MAX_INVOICE_TOTAL_TOMAN:
+        raise CommerceValidationError("مبلغ کل فاکتور بیش از حد مجاز است")
+    if total <= 0:
+        raise CommerceValidationError("مبلغ کل فاکتور باید مثبت باشد")
+    return subtotal, shipping_toman, total
+
+
+def assert_payable_total(invoice: CommerceInvoice) -> None:
+    """Defensive re-check before issuing/using a payable link (Task 3 reuse)."""
+    if not isinstance(invoice.total_toman, int) or invoice.total_toman <= 0:
+        raise CommerceStateError("مبلغ فاکتور نامعتبر است")
+    if invoice.total_toman > MAX_INVOICE_TOTAL_TOMAN:
+        raise CommerceStateError("مبلغ فاکتور بیش از حد مجاز است")
+
+
+# ── Payment-attempt coordination (Task 3 hook) ───────────────────────
+
+def _payment_attempt_model():
+    """The Task 3 ``CommercePaymentAttempt`` model, if it has landed yet."""
+    from app import models
+
+    return getattr(models, "CommercePaymentAttempt", None)
+
+
+def has_inflight_payment_attempt(db: Session, invoice: CommerceInvoice) -> bool:
+    """True while an unsettled payment attempt exists for this invoice."""
+    model = _payment_attempt_model()
+    if model is None:
+        return False
+    return (
+        db.query(model)
+        .filter(
+            model.invoice_id == invoice.id,
+            model.state.in_(("initiating", "pending", "unknown")),
+        )
+        .count()
+        > 0
+    )
+
+
+def _invalidate_pending_payment_attempts(db: Session, invoice: CommerceInvoice) -> int:
+    """Fail any in-flight attempts so a revised invoice cannot be paid twice.
+
+    A no-op until Task 3 defines ``CommercePaymentAttempt``; kept here so
+    revision semantics are already correct when payments land.
+    """
+    model = _payment_attempt_model()
+    if model is None:
+        return 0
+    rows = (
+        db.query(model)
+        .filter(
+            model.invoice_id == invoice.id,
+            model.state.in_(("initiating", "pending", "unknown")),
+        )
+        .all()
+    )
+    for row in rows:
+        row.state = "failed"
+    return len(rows)
+
+
+# ── Staff mutations ──────────────────────────────────────────────────
+
+def _get_invoice(db: Session, invoice_id: int) -> CommerceInvoice:
+    invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == invoice_id).first()
+    if invoice is None:
+        raise CommerceNotFoundError("فاکتور یافت نشد")
+    return invoice
+
+
+def _apply_items(invoice: CommerceInvoice, normalized_items: list[dict]) -> None:
+    invoice.items.clear()
+    for item in normalized_items:
+        invoice.items.append(CommerceInvoiceItem(**item))
+
+
+def create_staff_invoice(
+    db: Session,
+    *,
+    customer_name: str,
+    mobile: str,
+    items: list[dict],
+    request_id: int | None = None,
+    messenger: str = "telegram",
+    messenger_handle: str = "",
+    address: str = "",
+    specification: str = "",
+    internal_note: str = "",
+    shipping_toman: int = 0,
+) -> CommerceInvoice:
+    """Create a draft invoice — from a website request or a manual/chat order."""
+    shipping = _require_int(
+        shipping_toman, field="هزینه ارسال", minimum=0, maximum=MAX_INVOICE_TOTAL_TOMAN
+    )
+    normalized = _normalize_invoice_items(db, items)
+    _, _, total = compute_invoice_totals(normalized, shipping)
+
+    linked_request: CommerceRequest | None = None
+    if request_id is not None:
+        request_id = _require_int(request_id, field="شناسه درخواست", minimum=1, maximum=2_147_483_647)
+        linked_request = (
+            db.query(CommerceRequest).filter(CommerceRequest.id == request_id).first()
+        )
+        if linked_request is None:
+            raise CommerceNotFoundError("درخواست یافت نشد")
+        if linked_request.state != "pending_review":
+            raise CommerceStateError("این درخواست قبلاً بررسی شده است")
+
+    invoice = CommerceInvoice(
+        request_id=linked_request.id if linked_request else None,
+        customer_name=customer_name.strip(),
+        mobile=mobile.strip(),
+        messenger=messenger,
+        messenger_handle=(messenger_handle or "").strip(),
+        address=(address or "").strip(),
+        specification=(specification or "").strip(),
+        internal_note=(internal_note or "").strip(),
+        shipping_toman=shipping,
+        total_toman=total,
+        state="draft",
+        revision=1,
+    )
+    _apply_items(invoice, normalized)
+    db.add(invoice)
+    if linked_request is not None:
+        linked_request.state = "converted"
+    db.commit()
+    db.refresh(invoice)
+    return invoice
+
+
+def update_staff_invoice(
+    db: Session,
+    invoice_id: int,
+    *,
+    customer_name: str,
+    mobile: str,
+    items: list[dict],
+    messenger: str = "telegram",
+    messenger_handle: str = "",
+    address: str = "",
+    specification: str = "",
+    internal_note: str = "",
+    shipping_toman: int = 0,
+) -> CommerceInvoice:
+    """Revise a non-settled invoice: bump revision, drop to draft, kill the link.
+
+    The link is invalidated because the payable amount/specification changed;
+    any in-flight payment attempt is failed for the same reason.
+    """
+    invoice = _get_invoice(db, invoice_id)
+    if invoice.state == "paid":
+        raise CommerceStateError("فاکتور پرداختشده قابل ویرایش نیست")
+    if has_inflight_payment_attempt(db, invoice):
+        raise CommerceStateError("پرداخت در حال انجام است؛ پس از تعیین نتیجه قابل ویرایش است")
+
+    shipping = _require_int(
+        shipping_toman, field="هزینه ارسال", minimum=0, maximum=MAX_INVOICE_TOTAL_TOMAN
+    )
+    normalized = _normalize_invoice_items(db, items)
+    _, _, total = compute_invoice_totals(normalized, shipping)
+
+    _invalidate_pending_payment_attempts(db, invoice)
+
+    invoice.customer_name = customer_name.strip()
+    invoice.mobile = mobile.strip()
+    invoice.messenger = messenger
+    invoice.messenger_handle = (messenger_handle or "").strip()
+    invoice.address = (address or "").strip()
+    invoice.specification = (specification or "").strip()
+    invoice.internal_note = (internal_note or "").strip()
+    invoice.shipping_toman = shipping
+    invoice.total_toman = total
+    invoice.revision = (invoice.revision or 1) + 1
+    invoice.state = "draft"
+    invoice.token_hash = None
+    invoice.token_expires_at = None
+    invoice.approved_at = None
+    invoice.revoked_at = None
+    _apply_items(invoice, normalized)
+
+    db.commit()
+    db.refresh(invoice)
+    return invoice
+
+
+def approve_invoice(db: Session, invoice_id: int) -> tuple[CommerceInvoice, str]:
+    """Freeze the invoice and issue a fresh private link.
+
+    Returns ``(invoice, raw_token)`` — the raw token is returned exactly once
+    and never persisted or logged. Re-approving (e.g. after expiry or a
+    revoke) simply mints a new token and invalidates the previous one.
+    """
+    invoice = _get_invoice(db, invoice_id)
+    if invoice.state == "paid":
+        raise CommerceStateError("فاکتور پرداختشده قابل تأیید مجدد نیست")
+    # Validate the deploy origin BEFORE any mutation/commit: a misconfigured
+    # deployment must never leave an invoice frozen as 'approved' while its
+    # share link is broken or attacker-controlled.
+    public_site_origin()
+    if has_inflight_payment_attempt(db, invoice):
+        raise CommerceStateError(
+            "پرداخت در حال انجام است؛ پس از تعیین نتیجه قابل تأیید مجدد است"
+        )
+    assert_payable_total(invoice)
+
+    raw_token, token_hash = generate_invoice_token()
+    invoice.token_hash = token_hash
+    invoice.token_expires_at = _now() + INVOICE_LINK_TTL
+    invoice.state = "approved"
+    invoice.approved_at = _now()
+    invoice.revoked_at = None
+
+    db.commit()
+    db.refresh(invoice)
+    return invoice, raw_token
+
+
+def revoke_invoice(db: Session, invoice_id: int) -> CommerceInvoice:
+    """Invalidate the private link; idempotent for an already-revoked invoice."""
+    invoice = _get_invoice(db, invoice_id)
+    if invoice.state == "paid":
+        raise CommerceStateError("فاکتور پرداختشده قابل لغو نیست")
+    if has_inflight_payment_attempt(db, invoice):
+        raise CommerceStateError("پرداخت در حال انجام است؛ پس از تعیین نتیجه قابل لغو است")
+
+    _invalidate_pending_payment_attempts(db, invoice)
+    invoice.state = "revoked"
+    invoice.revoked_at = _now()
+    invoice.token_hash = None
+    invoice.token_expires_at = None
+
+    db.commit()
+    db.refresh(invoice)
+    return invoice
+
+
+def list_staff_invoices(
+    db: Session,
+    *,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    state: str | None = None,
+) -> list[CommerceInvoice]:
+    """Newest-first invoice queue, optionally filtered by state."""
+    if state is not None and state not in COMMERCE_INVOICE_STATES:
+        raise CommerceValidationError("وضعیت فاکتور نامعتبر است")
+    query = (
+        db.query(CommerceInvoice)
+        .options(selectinload(CommerceInvoice.items))
+        .order_by(CommerceInvoice.created_at.desc(), CommerceInvoice.id.desc())
+    )
+    if state:
+        query = query.filter(CommerceInvoice.state == state)
+    return query.offset(offset).limit(limit).all()
+
+
+# ── Public token read ────────────────────────────────────────────────
+
+def resolve_public_invoice(db: Session, raw_token: str) -> CommerceInvoice:
+    """Look up a live invoice by its raw bearer token.
+
+    Unknown/revoked/never-approved tokens are 404; a token past its expiry is
+    410 so the pay page can show a distinct "expired" state.
+    """
+    if not raw_token or len(raw_token) > 200:
+        raise CommerceNotFoundError("لینک نامعتبر است")
+    invoice = (
+        db.query(CommerceInvoice)
+        .options(selectinload(CommerceInvoice.items))
+        .filter(CommerceInvoice.token_hash == hash_invoice_token(raw_token))
+        .first()
+    )
+    if invoice is None or invoice.state not in ("approved", "paid"):
+        raise CommerceNotFoundError("لینک فاکتور یافت نشد")
+    if invoice.state == "approved" and is_link_expired(invoice):
+        raise CommerceGoneError("لینک فاکتور منقضی شده است")
+    return invoice
+
+
+# ── Serialization ────────────────────────────────────────────────────
+
+def serialize_invoice_item(item: CommerceInvoiceItem) -> dict:
+    return {
+        "product_id": item.product_id,
+        "description": item.description,
+        "qty": item.qty,
+        "unit_toman": item.unit_toman,
+        "line_total_toman": item.line_total_toman,
+    }
+
+
+def serialize_staff_invoice(invoice: CommerceInvoice) -> dict:
+    """Staff view — full detail, but never the raw or hashed token."""
+    return {
+        "id": invoice.id,
+        "request_id": invoice.request_id,
+        "customer_name": invoice.customer_name,
+        "mobile": invoice.mobile,
+        "messenger": invoice.messenger,
+        "messenger_handle": invoice.messenger_handle,
+        "address": invoice.address,
+        "specification": invoice.specification,
+        "internal_note": invoice.internal_note,
+        "shipping_toman": invoice.shipping_toman,
+        "total_toman": invoice.total_toman,
+        "state": invoice.state,
+        "revision": invoice.revision,
+        "order_id": invoice.order_id,
+        "has_active_link": invoice.state == "approved" and not is_link_expired(invoice),
+        "token_expires_at": (
+            invoice.token_expires_at.isoformat() if invoice.token_expires_at else None
+        ),
+        "approved_at": invoice.approved_at.isoformat() if invoice.approved_at else None,
+        "revoked_at": invoice.revoked_at.isoformat() if invoice.revoked_at else None,
+        "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
+        "updated_at": invoice.updated_at.isoformat() if invoice.updated_at else None,
+        "items": [serialize_invoice_item(i) for i in invoice.items],
+    }
+
+
+def serialize_public_invoice(invoice: CommerceInvoice) -> dict:
+    """Minimal pay-page payload.
+
+    Deliberately excludes every contact/PII field (name, mobile, messenger,
+    address) and staff-only notes. The token itself is never echoed back.
+    """
+    return {
+        "id": invoice.id,
+        "state": invoice.state,
+        "revision": invoice.revision,
+        "shipping_toman": invoice.shipping_toman,
+        "total_toman": invoice.total_toman,
+        "specification": invoice.specification,
+        "items": [
+            {
+                "description": i.description,
+                "qty": i.qty,
+                "unit_toman": i.unit_toman,
+                "line_total_toman": i.line_total_toman,
+            }
+            for i in invoice.items
+        ],
+        "expires_at": (
+            invoice.token_expires_at.isoformat() if invoice.token_expires_at else None
+        ),
+        "approved_at": invoice.approved_at.isoformat() if invoice.approved_at else None,
+    }

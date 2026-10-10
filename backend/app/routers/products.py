@@ -493,7 +493,7 @@ def bulk_product_action(body: BulkProductAction, user=Depends(require_staff_role
 
 @router.delete("/products/{product_id}/permanent")
 def permanent_delete_product(product_id: int, user=Depends(require_admin), db: Session = Depends(get_db)):
-    from app.models import Product, CommerceRequestItem
+    from app.models import Product, CommerceRequestItem, CommerceInvoiceItem
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -505,6 +505,11 @@ def permanent_delete_product(product_id: int, user=Depends(require_admin), db: S
     db.query(CommerceRequestItem).filter(
         CommerceRequestItem.product_id == product_id
     ).update({CommerceRequestItem.product_id: None}, synchronize_session=False)
+    # Same rule for priced invoice snapshots (Task 2): a paid/issued invoice
+    # must keep its frozen description and unit price after a product delete.
+    db.query(CommerceInvoiceItem).filter(
+        CommerceInvoiceItem.product_id == product_id
+    ).update({CommerceInvoiceItem.product_id: None}, synchronize_session=False)
     db.delete(product)
     db.commit()
     invalidate_stats()
