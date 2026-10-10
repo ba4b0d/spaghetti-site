@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { Search, Package, Clock, Weight, Layers, ChevronLeft, ChevronRight, Ruler, Share2, Check, ShoppingCart } from 'lucide-react';
+import { Search, Package, Clock, Weight, Layers, ChevronLeft, ChevronRight, Ruler, ShoppingCart } from 'lucide-react';
 import { getCatalog, getCatalogCategories, getCatalogCollections } from '../lib/api';
 import { formatPrice, formatMinutes } from '../lib/utils';
 import { addItem } from '../lib/cart';
@@ -296,87 +296,6 @@ function isWithinDays(isoDate, days = 14) {
   cutoff.setDate(cutoff.getDate() - days);
   cutoff.setHours(0, 0, 0, 0);
   return date >= cutoff;
-}
-
-/** Resolve the canonical share URL for a product or collection bundle card. */
-function productShareUrl(product) {
-  let path = '/catalog';
-  if (product.isCollectionBundle && product.collectionTag) {
-    path = `/collection/${encodeURIComponent(product.collectionTag)}`;
-  } else if (product.slug) {
-    path = `/catalog/${product.slug}`;
-  }
-  if (typeof window !== 'undefined' && window.location?.origin) {
-    return `${window.location.origin}${path}`;
-  }
-  return path;
-}
-
-/**
- * Generic product share control.
- *
- * Rendered as a SIBLING of the card's wrapping <Link> (never inside it) so it
- * never nests interactive elements. Prefers the Web Share API and falls back to
- * copying the product URL to the clipboard, with a transient confirmation.
- */
-function ProductShareButton({ product }) {
-  const [copied, setCopied] = useState(false);
-  const timerRef = useRef(null);
-
-  useEffect(
-    () => () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    },
-    []
-  );
-
-  const handleShare = useCallback(
-    async (event) => {
-      // Never let the click bubble into the card <Link> navigation.
-      event.stopPropagation();
-      event.preventDefault();
-
-      const url = productShareUrl(product);
-      const name = displayName(product.name);
-      const text = product.product_id ? `${name} — کد: ${product.product_id}` : name;
-
-      if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
-        try {
-          await navigator.share({ title: name, text, url });
-        } catch {
-          /* User dismissed the share sheet — nothing else to do. */
-        }
-        return;
-      }
-
-      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        try {
-          await navigator.clipboard.writeText(url);
-          setCopied(true);
-          if (timerRef.current) clearTimeout(timerRef.current);
-          timerRef.current = setTimeout(() => setCopied(false), 1800);
-        } catch {
-          /* Clipboard blocked (permissions / insecure context) — ignore. */
-        }
-      }
-    },
-    [product]
-  );
-
-  const label = copied ? 'کپی شد ✓' : 'اشتراک‌گذاری محصول';
-
-  return (
-    <button
-      type="button"
-      className="absolute top-2.5 left-2.5 z-[3] p-2 rounded-full border shadow-sm transition-colors bg-[var(--bg-card)] text-[var(--text-secondary)] hover:text-[var(--accent)]"
-      style={{ borderColor: 'var(--border-color)' }}
-      aria-label={label}
-      title={label}
-      onClick={handleShare}
-    >
-      {copied ? <Check size={13} /> : <Share2 size={13} />}
-    </button>
-  );
 }
 
 function displayName(name) {
@@ -1126,7 +1045,7 @@ export default function Catalog() {
                     {/* bottom gradient on image */}
                     <div className="catalog-img-fade pointer-events-none" aria-hidden="true" />
 
-                    <div className="absolute top-2.5 inset-x-2.5 flex items-start justify-between gap-2 pointer-events-none z-[1] pl-12">
+                    <div className="absolute top-2.5 inset-x-2.5 flex items-start justify-between gap-2 pointer-events-none z-[1]">
                       {product.product_id ? (
                         <span className="catalog-code-badge">{product.product_id}</span>
                       ) : (
@@ -1258,11 +1177,6 @@ export default function Catalog() {
                     {justAdded === product.id ? 'افزوده شد ✓' : 'افزودن'}
                   </button>
                 ) : null}
-
-                {/* Generic share — a SIBLING of the Link (interactive elements
-                    must not nest), pinned to the image's trailing corner and
-                    clear of the add-to-cart button and the price. */}
-                <ProductShareButton product={product} />
               </article>
             );
           })}

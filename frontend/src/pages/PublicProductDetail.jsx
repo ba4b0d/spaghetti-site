@@ -9,7 +9,8 @@ import {
   ChevronRight,
   Ruler,
   ArrowRight,
-  Send,
+  Share2,
+  Check,
   MessageCircle,
   Box,
   ShoppingCart,
@@ -449,8 +450,10 @@ export default function PublicProductDetail() {
 
   const shareUrl = useMemo(() => {
     if (typeof window === 'undefined') return '';
+    const path = product?.slug ? `/catalog/${product.slug}` : null;
+    if (path && window.location?.origin) return `${window.location.origin}${path}`;
     return window.location.href;
-  }, []);
+  }, [product?.slug]);
 
   const shareText = useMemo(() => {
     if (!product) return '';
@@ -459,12 +462,6 @@ export default function PublicProductDetail() {
     const priceText = price ? ` — ${formatPrice(price)}` : '';
     return `${name}${priceText}`;
   }, [product]);
-
-  const telegramShareUrl = useMemo(() => {
-    const url = encodeURIComponent(shareUrl);
-    const text = encodeURIComponent(shareText);
-    return `https://t.me/share/url?url=${url}&text=${text}`;
-  }, [shareUrl, shareText]);
 
   // Add to cart — stores ids + qty only; prices are never trusted client-side.
   const [added, setAdded] = useState(false);
@@ -479,6 +476,38 @@ export default function PublicProductDetail() {
   }, [product?.id]);
 
   useEffect(() => () => window.clearTimeout(addedTimerRef.current), []);
+
+  // Generic share — Web Share API when the device exposes it, otherwise copy
+  // the product URL to the clipboard with a transient, accessible confirmation.
+  const [shareCopied, setShareCopied] = useState(false);
+  const shareTimerRef = useRef(null);
+
+  const handleShare = useCallback(async () => {
+    const url = shareUrl;
+    const name = displayName(product?.name);
+
+    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+      try {
+        await navigator.share({ title: name, text: shareText, url });
+      } catch {
+        /* User dismissed the share sheet — nothing else to do. */
+      }
+      return;
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(url);
+        setShareCopied(true);
+        window.clearTimeout(shareTimerRef.current);
+        shareTimerRef.current = window.setTimeout(() => setShareCopied(false), 1800);
+      } catch {
+        /* Clipboard blocked (permissions / insecure context) — ignore. */
+      }
+    }
+  }, [shareUrl, shareText, product?.name]);
+
+  useEffect(() => () => window.clearTimeout(shareTimerRef.current), []);
 
   if (loading) {
     return (
@@ -699,19 +728,21 @@ export default function PublicProductDetail() {
               <MessageCircle size={18} />
               تماس برای سفارش
             </Link>
-            <a
-              href={telegramShareUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="btn-secondary inline-flex items-center justify-center gap-2"
-              style={{ backgroundColor: '#27a7e7', color: '#ffffff', borderColor: 'transparent' }}
+            <button
+              type="button"
+              onClick={handleShare}
+              className="btn-secondary inline-flex items-center justify-center shrink-0 self-start sm:self-center w-11 h-11 p-0"
+              aria-label={shareCopied ? 'کپی شد ✓' : 'اشتراک‌گذاری محصول'}
+              title={shareCopied ? 'کپی شد ✓' : 'اشتراک‌گذاری محصول'}
             >
-              <Send size={18} />
-              اشتراک در تلگرام
-            </a>
+              {shareCopied ? <Check size={18} /> : <Share2 size={18} />}
+            </button>
           </div>
           <p className="sr-only" aria-live="polite">
             {added ? 'محصول به سبد خرید اضافه شد' : ''}
+          </p>
+          <p className="sr-only" role="status" aria-live="polite">
+            {shareCopied ? 'لینک محصول کپی شد' : ''}
           </p>
         </div>
       </div>
