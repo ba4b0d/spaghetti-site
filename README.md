@@ -109,15 +109,17 @@ Copy `.env.example` to `.env` and configure:
 
 | Variable | Description | Default |
 |:---|:---|:---|
-| `JWT_SECRET` | Secret key for JWT signing (≥32 chars) | *required* |
+| `JWT_SECRET` | Secret key for JWT signing (≥32 chars). Read by `app/routers/auth.py`; the name is `JWT_SECRET` (**not** `JWT_SECRET_KEY`) and startup fails without it | *required* |
+| `INITIAL_ADMIN_PASSWORD` | Bootstrap admin password. **Only applied on the first start with an empty users table** (brand-new database/volume); once any user exists it is ignored and the existing admin hash is preserved — it never resets the live admin. Unset ⇒ a one-time random password is generated and printed | *optional* |
 | `COOKIE_SECURE` | Set `true` for HTTPS production | `false` |
 | `LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`) | `INFO` |
+| `CORS_ORIGINS` | Comma-separated list of the **exact** frontend origin(s) allowed cross-origin (scheme + host + port, no trailing slash). Must be the real deployed origin, e.g. `https://spaghettiprints.ir` | localhost dev |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot API token (a non-empty DB Settings `telegram_bot_token` overrides it) | *optional* |
 | `TELEGRAM_ADMIN_CHAT_ID` | Comma-separated admin chat IDs (DB Settings `telegram_admin_chat_id` overrides it) | *optional* |
 | `TELEGRAM_PROXY` | SOCKS5 proxy for the Telegram API, e.g. `socks5://192.168.100.50:10805`. Use the `socks5` scheme, **not** `socks5h`. DB Settings `telegram_proxy` overrides this env value | *optional* |
-| `PUBLIC_SITE_ORIGIN` | Bare HTTPS origin for customer invoice links (a bare `localhost`/`127.0.0.1` host is allowed for dev) | `https://spaghettiprints.ir` |
+| `PUBLIC_SITE_ORIGIN` | Bare **HTTPS** origin for customer invoice links (no path/query/fragment/userinfo). Plain HTTP is rejected unless the host is an explicit local dev host (`localhost`/`127.0.0.1`/`::1`) | `https://spaghettiprints.ir` |
 | `DIGIPAY_CLIENT_ID` / `DIGIPAY_CLIENT_SECRET` / `DIGIPAY_USERNAME` / `DIGIPAY_PASSWORD` | DigiPay UPG merchant credentials. Leave blank to disable online payment — the pay endpoint then returns `503` instead of pretending to work | *optional* |
-| `DIGIPAY_ENV` | DigiPay UPG base URL selector: `production` or `staging` | `production` |
+| `DIGIPAY_ENV` | DigiPay UPG base URL selector: `production` → `api.mydigipay.com`, `staging` (or `uat`/`test`) → `uat.mydigipay.info`. **Caution:** `staging` points every payment (and its redirect allowlist) at the UAT host — never combine it with live merchant credentials; leave as `production` | `production` |
 | `DIGIPAY_BASE_URL` | Optional HTTPS host override (DigiPay hosts only; any other host is refused) | *optional* |
 | `DIGIPAY_CALLBACK_URL` | Optional absolute HTTPS callback; defaults to `PUBLIC_SITE_ORIGIN` + `/api/v1/commerce/digipay/callback` | *optional* |
 | `COMMERCE_NOTIFY_TELEGRAM` | Enable Telegram admin alerts (`0`/`false` to silence) | `1` |
@@ -146,9 +148,12 @@ Copy `.env.example` to `.env` and configure:
 | System Settings | `http://localhost:5173/settings` | ✅ (admin) |
 | Interactive API Docs | `http://localhost:8000/docs` | ❌ |
 
-On first startup, set `INITIAL_ADMIN_PASSWORD` to choose the bootstrap
-administrator password. If it is unset, the backend generates and prints a
-one-time random password. The administrator must change it on first login.
+On first startup with an **empty** users table, set `INITIAL_ADMIN_PASSWORD` to
+choose the bootstrap administrator password. If it is unset, the backend
+generates and prints a one-time random password. This value is read **only**
+while no user exists: once an admin is present it is ignored and the stored
+password hash is preserved (the variable never resets or overwrites a live
+admin). The administrator must change the password on first login.
 
 ---
 
