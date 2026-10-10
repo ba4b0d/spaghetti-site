@@ -321,6 +321,39 @@ def test_no_invoice_token_or_share_link_in_broadcast():
     assert "/pay/" not in blob
 
 
+def test_sms_parameters_use_approved_uppercase_names():
+    """SMS.ir matches approved-template parameter names EXACTLY (case-sensitive).
+
+    Template ``309349`` is approved with placeholders ``#EVENT#`` / ``#CODE#``;
+    lowercase ``event`` / ``code`` are not substituted and the provider rejects
+    the send. The payload must therefore carry the exact uppercase names — this
+    is the contract, not a style choice.
+    """
+    inv = _fake_invoice()
+    payload = cn.build_payload(cn.EVENT_INVOICE_APPROVED, inv)
+    sms = payload["sms"]
+
+    assert [p["name"] for p in sms] == ["EVENT", "CODE"]
+    assert {p["name"]: p["value"] for p in sms} == {"EVENT": "فاکتور", "CODE": "#42"}
+    # No lowercase variant may sneak back in.
+    assert all(p["name"] == p["name"].upper() for p in sms)
+
+
+@pytest.mark.parametrize(
+    "event,expected",
+    [
+        (cn.EVENT_REQUEST_CREATED, "درخواست"),
+        (cn.EVENT_INVOICE_APPROVED, "فاکتور"),
+        (cn.EVENT_PAYMENT_VERIFIED, "پرداخت"),
+    ],
+)
+def test_sms_parameter_names_are_uppercase_for_every_event(event, expected):
+    inv = _fake_invoice()
+    sms = cn.build_payload(event, inv)["sms"]
+    assert [p["name"] for p in sms] == ["EVENT", "CODE"]
+    assert {p["name"]: p["value"] for p in sms}["EVENT"] == expected
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Transport unit tests (SMS.ir / SMTP)
 # ══════════════════════════════════════════════════════════════════════
@@ -332,7 +365,7 @@ def test_post_sms_ir_verify_shape_and_ack():
         api_key="KEY1",
         template_id=100,
         mobile="09120000000",
-        parameters=[{"name": "event", "value": "پرداخت"}],
+        parameters=[{"name": "EVENT", "value": "پرداخت"}],
         session=session,
     )
     assert ok is True
@@ -341,7 +374,7 @@ def test_post_sms_ir_verify_shape_and_ack():
     assert call["headers"]["x-api-key"] == "KEY1"
     assert call["json"]["mobile"] == "09120000000"
     assert call["json"]["templateId"] == 100
-    assert call["json"]["parameters"] == [{"name": "event", "value": "پرداخت"}]
+    assert call["json"]["parameters"] == [{"name": "EVENT", "value": "پرداخت"}]
     assert call["timeout"] is not None
 
 

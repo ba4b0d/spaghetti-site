@@ -124,7 +124,7 @@ Copy `backend/.env.example` to `backend/.env` and configure:
 | `DIGIPAY_CALLBACK_URL` | Optional absolute HTTPS callback; defaults to `PUBLIC_SITE_ORIGIN` + `/api/v1/commerce/digipay/callback` | *optional* |
 | `COMMERCE_NOTIFY_TELEGRAM` | Enable Telegram admin alerts (`0`/`false` to silence) | `1` |
 | `COMMERCE_NOTIFY_SMS` | Enable SMS.ir admin alerts | `1` |
-| `SMS_IR_API_KEY` / `SMS_IR_TEMPLATE_ID` / `SMS_IR_ADMIN_MOBILE` | SMS.ir API key + approved admin-alert template id + recipient. All three required together or the channel is skipped | *optional* |
+| `SMS_IR_API_KEY` / `SMS_IR_TEMPLATE_ID` / `SMS_IR_ADMIN_MOBILE` | SMS.ir API key + approved admin-alert template id + recipient. All three required together or the channel is skipped. The approved template's parameter placeholders must match the names the app sends **exactly, case-sensitively** (the admin-alert template `309349` is approved with `#EVENT#` / `#CODE#`, sent uppercase as `EVENT` / `CODE`); a differently-cased name is not substituted and the send is rejected | *optional* |
 | `COMMERCE_NOTIFY_SMTP` | Enable SMTP admin alerts | `1` |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_ADMIN_TO` | Admin mailbox. All required together (no fallback mailbox); incomplete config disables the channel | *optional* |
 | `SMTP_TLS` | `starttls` (port 587) or `ssl` (port 465) | `starttls` |

@@ -280,9 +280,14 @@ def _assert_invoice_and_single_order(invoice_id, *, expected_toman, expected_ord
 
 
 def _sms_event_values(records):
-    """The ``event`` label of each SMS fan-out (one parameter list per event)."""
+    """The ``EVENT`` label of each SMS fan-out (one parameter list per event).
+
+    SMS.ir requires the *exact* approved-template parameter name; template
+    ``309349`` is approved with ``#EVENT#`` / ``#CODE#`` (uppercase), so the
+    fan-out must carry ``EVENT`` — a lowercase ``event`` is not substituted.
+    """
     return [
-        next(p["value"] for p in params if p["name"] == "event")
+        next(p["value"] for p in params if p["name"] == "EVENT")
         for params in records["sms"]
     ]
 

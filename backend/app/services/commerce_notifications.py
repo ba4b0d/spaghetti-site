@@ -24,7 +24,10 @@ Design rules enforced here (see spec "Notifications"):
   piece of user-supplied text so a crafted name/description cannot inject markup.
 * SMS.ir posts to ``/v1/send/verify`` with ``x-api-key`` and a configured
   approved template id; delivery is claimed only on a provider acknowledgement
-  (``status == 1``).
+  (``status == 1``). SMS.ir substitutes template parameters by **exact,
+  case-sensitive name**, so the payload must use the template's approved names
+  verbatim (``EVENT`` / ``CODE`` for template ``309349``) — a differently-cased
+  name is not substituted and the send is rejected.
 * SMTP requires host, port, username, password, from and to plus an explicit
   TLS mode (STARTTLS or SSL). There is deliberately **no** fallback to a
   personal mailbox: incomplete config disables the channel.
@@ -81,6 +84,15 @@ FLAG_SMTP = "COMMERCE_NOTIFY_SMTP"
 
 SMS_IR_VERIFY_URL = "https://api.sms.ir/v1/send/verify"
 SMS_TIMEOUT = 10.0
+
+# Approved SMS.ir template parameter names. The provider substitutes parameters
+# by EXACT, case-sensitive name, so these must match the approved template's
+# placeholders verbatim. Template 309349 (admin alert) is approved with
+# ``#EVENT#`` / ``#CODE#`` — the names are UPPERCASE. Emitting lowercase
+# ``event`` / ``code`` is not substituted and the send is rejected.
+SMS_PARAM_EVENT = "EVENT"
+SMS_PARAM_CODE = "CODE"
+
 SMTP_TIMEOUT = 15.0
 TLS_STARTTLS = "starttls"
 TLS_SSL = "ssl"
@@ -268,9 +280,10 @@ def build_payload(event: str, subject) -> dict:
         email_lines.append(f"سفارش: #{order_id}")
 
     # ── SMS (approved template parameters, no PII) ──
+    # Exact, case-sensitive names matching the approved template placeholders.
     sms_parameters = [
-        {"name": "event", "value": _SMS_EVENT_LABELS.get(event, event)},
-        {"name": "code", "value": code},
+        {"name": SMS_PARAM_EVENT, "value": _SMS_EVENT_LABELS.get(event, event)},
+        {"name": SMS_PARAM_CODE, "value": code},
     ]
 
     return {
