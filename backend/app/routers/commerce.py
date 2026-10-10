@@ -12,11 +12,21 @@ Staff:
     POST /api/v1/commerce/staff/invoices/{id}/approve  freeze + issue private link
     POST /api/v1/commerce/staff/invoices/{id}/revoke   invalidate the private link
     POST /api/v1/commerce/staff/invoices/{id}/notify   re-emit admin alert (retry)
+    POST /api/v1/commerce/staff/requests/{id}/notify   re-emit request alert (retry)
 
 Payment initiation/callback arrive in Task 3. Handlers stay thin; validation
 and persistence live in ``app.services.commerce``.
 """
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+)
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from sqlalchemy.orm import Session
 
@@ -132,13 +142,16 @@ class CommerceRequestCreate(BaseModel):
 @limiter.limit("5/minute")
 def create_request(
     request: Request,
+    background_tasks: BackgroundTasks,
     body: CommerceRequestCreate,
     db: Session = Depends(get_db),
 ):
     """Public — record a pending-review website cart request.
 
     Returns an opaque receipt identifier only; no invoice or payment link is
-    produced before staff review.
+    produced before staff review. The admin alert is dispatched as a *background*
+    task after the response, so a slow Telegram/SMS/SMTP transport cannot delay
+    the customer's acknowledgement.
     """
     try:
         created = commerce_service.create_website_request(
@@ -150,6 +163,7 @@ def create_request(
             address=body.address,
             note=body.note,
             items=[{"product_id": i.product_id, "qty": i.qty} for i in body.items],
+            background_tasks=background_tasks,
         )
     except CommerceValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -352,12 +366,19 @@ def update_staff_invoice(
 @router.post("/staff/invoices/{invoice_id}/approve")
 def approve_invoice(
     invoice_id: int,
+    background_tasks: BackgroundTasks,
     user=Depends(require_staff_role),
     db: Session = Depends(get_db),
 ):
-    """Staff — freeze the invoice and return the one-time private share link."""
+    """Staff — freeze the invoice and return the one-time private share link.
+
+    The approval alert is dispatched as a *background* task after the response,
+    so a slow transport cannot delay the staff UI.
+    """
     try:
-        invoice, raw_token = commerce_service.approve_invoice(db, invoice_id)
+        invoice, raw_token = commerce_service.approve_invoice(
+            db, invoice_id, background_tasks=background_tasks
+        )
         share_url = commerce_service.build_share_url(raw_token)
     except (
         CommerceValidationError,
@@ -407,8 +428,44 @@ def revoke_invoice(
     return payload
 
 
+@router.post("/staff/requests/{request_id}/notify")
+@limiter.limit("10/minute")
+def resend_request_notification(
+    request: Request,
+    request_id: int,
+    user=Depends(require_staff_role),
+    db: Session = Depends(get_db),
+):
+    """Staff — re-emit the ``request_created`` admin alert for a website request.
+
+    There is no durable outbox, so a channel that was down (or unconfigured) when
+    the request first arrived can be retried explicitly here. The request is never
+    mutated; the response reports the per-channel result so staff can see whether
+    the retry landed. Rate-limited because each call fans out to live transports.
+    """
+    try:
+        row = commerce_service.get_staff_request(db, request_id)
+    except commerce_service.CommerceNotFoundError as exc:
+        raise _validation_error(exc)
+
+    channels = commerce_notifications.notify_admin(
+        commerce_notifications.EVENT_REQUEST_CREATED, row
+    )
+    log_user(
+        user, db, "notify", "commerce_request", row.id,
+        f"ارسال مجدد اطلاع درخواست #{row.id}",
+    )
+    return {
+        "request_id": row.id,
+        "event": commerce_notifications.EVENT_REQUEST_CREATED,
+        "channels": channels,
+    }
+
+
 @router.post("/staff/invoices/{invoice_id}/notify")
+@limiter.limit("10/minute")
 def resend_invoice_notification(
+    request: Request,
     invoice_id: int,
     user=Depends(require_staff_role),
     db: Session = Depends(get_db),
@@ -419,7 +476,8 @@ def resend_invoice_notification(
     when ``invoice_approved`` / ``payment_verified`` originally fired can be
     retried explicitly here. The invoice is never mutated; the response reports
     the per-channel result (``sent`` / ``skipped`` / ``failed``) so staff can
-    see whether the retry actually landed.
+    see whether the retry actually landed. Rate-limited because each call fans
+    out to live transports.
     """
     try:
         invoice = commerce_service.get_staff_invoice(db, invoice_id)
@@ -577,6 +635,7 @@ def list_staff_payments(
 def reconcile_staff_payment(
     attempt_id: int,
     body: PaymentReconcileRequest,
+    background_tasks: BackgroundTasks,
     user=Depends(require_staff_role),
     db: Session = Depends(get_db),
     client=Depends(digipay.client_dependency),
@@ -615,7 +674,8 @@ def reconcile_staff_payment(
 
     try:
         resolved = commerce_service.reconcile_payment_attempt(
-            db, attempt, client, abandon=(body.action == "abandon"), reason=body.reason
+            db, attempt, client, abandon=(body.action == "abandon"), reason=body.reason,
+            background_tasks=background_tasks,
         )
     except commerce_service.CommerceValidationError as exc:
         raise _validation_error(exc)

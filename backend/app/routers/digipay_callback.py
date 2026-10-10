@@ -13,7 +13,7 @@ The response is always a redirect to a public, non-secret confirmation page
 (``/pay/result?payment=...``); the private bearer token is never persisted and
 so is never echoed into a Location header or the access log.
 """
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
@@ -42,6 +42,7 @@ def _result_redirect(outcome: str) -> RedirectResponse:
 @limiter.limit("120/minute")
 def digipay_callback(
     request: Request,
+    background_tasks: BackgroundTasks,
     provider_id: str | None = Form(default=None, alias="providerId"),
     amount: str | None = Form(default=None),
     tracking_code: str | None = Form(default=None, alias="trackingCode"),
@@ -66,5 +67,6 @@ def digipay_callback(
         tracking_code=tracking_code,
         type_value=type_value,
         result_value=result_value,
+        background_tasks=background_tasks,
     )
     return _result_redirect(outcome)

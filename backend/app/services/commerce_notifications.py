@@ -11,6 +11,11 @@ Design rules enforced here (see spec "Notifications"):
 
 * ``notify_admin`` is called *after* the DB commit and **never raises** to the
   caller: a channel failure can never roll back (or lose) a committed order.
+  Network sends are dispatched through ``FastAPI`` ``BackgroundTasks`` (see
+  ``schedule_admin_delivery``) so the customer/staff HTTP response is not gated
+  by a slow Telegram/SMS/SMTP round-trip; the payload is snapshotted to plain
+  strings **before** the task is scheduled, so no ORM object or DB session is
+  touched after the request closes.
 * Every channel is opt-in through its own configuration. Missing credentials or
   a disabled toggle means the channel is *skipped*, never silently "sent"
   (public launch must not imply a channel works when it does not).
@@ -39,7 +44,7 @@ from email.message import EmailMessage
 
 import requests
 
-from app.telegram_bot import send_telegram_notification
+from app.telegram_bot import get_telegram_config, send_telegram_notification
 
 logger = logging.getLogger(__name__)
 
@@ -350,8 +355,24 @@ def send_smtp_mail(
 
 
 # ── Channels ─────────────────────────────────────────────────────────
+def _telegram_configured() -> bool:
+    """True when a bot token and at least one admin chat id are available.
+
+    Used only to disambiguate a ``False`` from ``send_telegram_notification``:
+    that helper returns ``False`` both for *unconfigured* and for a *failed*
+    send, which must not be conflated (a real outage reported as a silent skip
+    would hide a broken admin alert).
+    """
+    try:
+        token, chat_ids, _proxy = get_telegram_config()
+    except Exception as exc:  # noqa: BLE001 - config lookup must never raise
+        logger.warning("telegram config lookup failed: %s", _safe(exc))
+        return False
+    return bool(token and chat_ids)
+
+
 def send_telegram_message(text: str) -> str:
-    """Telegram channel; SKIPPED when the bot is not configured."""
+    """Telegram channel; SKIPPED when unconfigured, FAILED on a send error."""
     if not _flag_enabled(FLAG_TELEGRAM):
         return SKIPPED
     try:
@@ -359,7 +380,10 @@ def send_telegram_message(text: str) -> str:
     except Exception as exc:  # noqa: BLE001 - a channel failure is isolated
         logger.warning("telegram admin notification error: %s", _safe(exc))
         return FAILED
-    return SENT if ok else SKIPPED
+    if ok:
+        return SENT
+    # A configured-but-failing bot must be reported FAILED, not masked as a skip.
+    return FAILED if _telegram_configured() else SKIPPED
 
 
 def send_sms_alert(parameters: list) -> str:
@@ -410,26 +434,68 @@ def _run_channel(name: str, event: str, send) -> str:
     return status
 
 
+def deliver_payload(event: str, payload: dict) -> dict:
+    """Deliver a pre-built payload; touches no DB/ORM and never raises.
+
+    This is what actually runs (via ``BackgroundTasks``) after the response is
+    sent. ``payload`` must be the plain-dict snapshot from ``build_payload`` —
+    because it holds no ORM object, delivery stays valid even though the request
+    (and its DB session) has already closed. Each channel is attempted
+    independently and a top-level guard ensures a background task can never
+    raise into the ASGI layer after the response was produced.
+    """
+    try:
+        return {
+            "telegram": _run_channel(
+                "telegram", event, lambda: send_telegram_message(payload["telegram"])
+            ),
+            "sms": _run_channel("sms", event, lambda: send_sms_alert(payload["sms"])),
+            "email": _run_channel(
+                "email", event,
+                lambda: send_email_alert(payload["email_subject"], payload["email_body"]),
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 - never leak out of a background task
+        logger.warning("commerce notification delivery failed event=%s: %s", event, _safe(exc))
+        return {"telegram": FAILED, "sms": FAILED, "email": FAILED}
+
+
 def notify_admin(event: str, subject) -> dict:
-    """Fire the admin notification for ``event`` about ``subject``.
+    """Fire the admin notification for ``event`` about ``subject`` synchronously.
 
     Call **after** the DB commit. Returns ``{channel: "sent"|"skipped"|"failed"}``
     and never raises: each channel is attempted independently, so a Telegram /
     SMS / SMTP outage neither rolls back the order nor blocks the other
     channels.
+
+    Prefer ``schedule_admin_delivery`` on an HTTP request path: this synchronous
+    form blocks the caller for the full (up to ``SMS_TIMEOUT`` / ``SMTP_TIMEOUT``)
+    network round-trip and is intended for direct/service callers and staff
+    retry, where the per-channel result is the response.
     """
     try:
         payload = build_payload(event, subject)
     except Exception as exc:  # noqa: BLE001 - never let rendering break the caller
         logger.warning("commerce notification build failed event=%s: %s", event, _safe(exc))
         return {"telegram": FAILED, "sms": FAILED, "email": FAILED}
+    return deliver_payload(event, payload)
 
-    return {
-        "telegram": _run_channel(
-            "telegram", event, lambda: send_telegram_message(payload["telegram"])
-        ),
-        "sms": _run_channel("sms", event, lambda: send_sms_alert(payload["sms"])),
-        "email": _run_channel(
-            "email", event, lambda: send_email_alert(payload["email_subject"], payload["email_body"])
-        ),
-    }
+
+def schedule_admin_delivery(background_tasks, event: str, subject) -> None:
+    """Snapshot the payload now and deliver it after the HTTP response.
+
+    The payload is built *while the caller's session is still open* (so any
+    lazy-loaded relationship resolves) and converted to plain strings; the
+    background task therefore never touches a detached ORM object or a closed
+    session. With no task runner (``background_tasks is None``) delivery falls
+    back to inline so direct/service callers keep working. Never raises.
+    """
+    try:
+        payload = build_payload(event, subject)
+    except Exception as exc:  # noqa: BLE001 - rendering must never break the caller
+        logger.warning("commerce notification build failed event=%s: %s", event, _safe(exc))
+        return
+    if background_tasks is not None:
+        background_tasks.add_task(deliver_payload, event, payload)
+    else:
+        deliver_payload(event, payload)

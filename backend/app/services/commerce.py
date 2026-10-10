@@ -55,16 +55,17 @@ class CommerceValidationError(Exception):
     """Domain-level rejection of a public commerce payload (maps to HTTP 400)."""
 
 
-def _emit_admin_notification(event: str, subject) -> None:
-    """Fire an *after-commit* admin notification; never affects the transaction.
+def _emit_admin_notification(event: str, subject, background_tasks=None) -> None:
+    """Snapshot an *after-commit* admin notification; never affects the transaction.
 
-    Called only once a state change is committed, so a notification (or any
-    unexpected error in the notification layer) can never roll back or lose a
-    committed order/invoice — it is logged and swallowed. Each channel is
-    attempted independently inside ``notify_admin``.
+    Called only once a state change is committed. The payload is built while the
+    session is still open and handed to ``BackgroundTasks`` (``background_tasks``)
+    so the HTTP response is not gated by a slow Telegram/SMS/SMTP round-trip; with
+    no task runner it is delivered inline. Any unexpected error is logged and
+    swallowed so it can never roll back or fail a committed order/invoice.
     """
     try:
-        commerce_notifications.notify_admin(event, subject)
+        commerce_notifications.schedule_admin_delivery(background_tasks, event, subject)
     except Exception as exc:  # noqa: BLE001 - notifications are best-effort
         _logger.warning("admin notification failed event=%s: %s", event, exc)
 
@@ -93,6 +94,7 @@ def create_website_request(
     address: str = "",
     note: str = "",
     items: list[dict],
+    background_tasks=None,
 ) -> CommerceRequest:
     """Persist a pending-review website request with server-side item snapshots.
 
@@ -157,8 +159,13 @@ def create_website_request(
     db.commit()
     db.refresh(request)
 
-    # After-commit: alert staff that a website request arrived. Never raises.
-    _emit_admin_notification(commerce_notifications.EVENT_REQUEST_CREATED, request)
+    # After-commit: alert staff that a website request arrived. Delivery is
+    # deferred to a background task (payload snapshotted now) so the public
+    # response is never gated by the transport. Never raises.
+    _emit_admin_notification(
+        commerce_notifications.EVENT_REQUEST_CREATED, request,
+        background_tasks=background_tasks,
+    )
     return request
 
 
@@ -219,6 +226,16 @@ def list_staff_requests(
     if state:
         query = query.filter(CommerceRequest.state == state)
     return query.offset(offset).limit(limit).all()
+
+
+def get_staff_request(db: Session, request_id: int) -> CommerceRequest:
+    """Lookup for a staff action on a website request (404 when absent)."""
+    request = (
+        db.query(CommerceRequest).filter(CommerceRequest.id == request_id).first()
+    )
+    if request is None:
+        raise CommerceNotFoundError("درخواست یافت نشد")
+    return request
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -594,7 +611,9 @@ def update_staff_invoice(
     return invoice
 
 
-def approve_invoice(db: Session, invoice_id: int) -> tuple[CommerceInvoice, str]:
+def approve_invoice(
+    db: Session, invoice_id: int, *, background_tasks=None
+) -> tuple[CommerceInvoice, str]:
     """Freeze the invoice and issue a fresh private link.
 
     Returns ``(invoice, raw_token)`` — the raw token is returned exactly once
@@ -624,8 +643,12 @@ def approve_invoice(db: Session, invoice_id: int) -> tuple[CommerceInvoice, str]
     db.commit()
     db.refresh(invoice)
     # After-commit: the private link/token is NOT broadcast — only the fact of
-    # approval and a minimized summary. Never raises.
-    _emit_admin_notification(commerce_notifications.EVENT_INVOICE_APPROVED, invoice)
+    # approval and a minimized summary. Deferred to a background task so the
+    # staff response is not gated by the transport. Never raises.
+    _emit_admin_notification(
+        commerce_notifications.EVENT_INVOICE_APPROVED, invoice,
+        background_tasks=background_tasks,
+    )
     return invoice, raw_token
 
 
@@ -970,7 +993,8 @@ def _create_legacy_order(db: Session, invoice: CommerceInvoice) -> Order:
 
 
 def settle_verified_payment(
-    db: Session, attempt: CommercePaymentAttempt, *, tracking_code: str
+    db: Session, attempt: CommercePaymentAttempt, *, tracking_code: str,
+    background_tasks=None,
 ) -> CommercePaymentAttempt:
     """Atomically mark the attempt verified, the invoice paid and link ONE order.
 
@@ -1024,8 +1048,12 @@ def settle_verified_payment(
     # After-commit: this is the single claimed `approved -> paid` transition, so
     # the paid alert fires exactly once even if the callback is replayed (later
     # callbacks return via the `state == 'paid'` branch above and never reach
-    # here). Never raises.
-    _emit_admin_notification(commerce_notifications.EVENT_PAYMENT_VERIFIED, invoice)
+    # here). Deferred to a background task so the customer redirect is not gated
+    # by the transport. Never raises.
+    _emit_admin_notification(
+        commerce_notifications.EVENT_PAYMENT_VERIFIED, invoice,
+        background_tasks=background_tasks,
+    )
     return attempt
 
 
@@ -1165,6 +1193,7 @@ def handle_digipay_callback(
     tracking_code: str | None,
     type_value,
     result_value,
+    background_tasks=None,
 ) -> str:
     """Process an untrusted provider callback.
 
@@ -1262,7 +1291,9 @@ def handle_digipay_callback(
     if _verify_confirms(verified, attempt, tracking_code=tracking):
         # Confirmed authoritative success: pin the confirmed identity and settle.
         attempt.payment_method = cb_type
-        settle_verified_payment(db, attempt, tracking_code=tracking)
+        settle_verified_payment(
+            db, attempt, tracking_code=tracking, background_tasks=background_tasks
+        )
         return "success"
     # Any non-confirming outcome — including a provider non-success for a merely
     # callback-supplied tracking code, which may be forged — must never terminally
@@ -1342,6 +1373,7 @@ def reconcile_payment_attempt(
     *,
     abandon: bool = False,
     reason: str | None = None,
+    background_tasks=None,
 ) -> CommercePaymentAttempt:
     """Staff-driven resolution of a stuck attempt; returns the reloaded row.
 
@@ -1412,7 +1444,9 @@ def reconcile_payment_attempt(
         db.refresh(attempt)
         return attempt
     if _verify_confirms(verified, attempt, tracking_code=tracking):
-        settle_verified_payment(db, attempt, tracking_code=tracking)
+        settle_verified_payment(
+            db, attempt, tracking_code=tracking, background_tasks=background_tasks
+        )
         return attempt
 
     if _verify_reports_authoritative_non_success(verified, attempt, tracking_code=tracking):

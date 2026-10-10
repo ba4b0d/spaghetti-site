@@ -45,6 +45,10 @@ NOTIFY_ENV_VARS = (
 def _clean_notify_env(client, monkeypatch):
     for var in NOTIFY_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    # Telegram config is also read from the Settings table of the *real*
+    # database, so neutralise it here: the "absent credentials" tests must not
+    # depend on whether a developer has a real bot configured.
+    monkeypatch.setattr(cn, "get_telegram_config", lambda: ("", [], None))
     from app.main import app
 
     app.state.limiter._limiter.storage.reset()
@@ -520,12 +524,12 @@ def test_notification_failure_does_not_rollback_request(client, auth_headers, mo
     assert len(listing.json()) == 1
 
 
-def test_hard_notification_failure_never_breaks_transition(client, auth_headers, monkeypatch):
-    """Even a notify_admin that raises must not break the DB transition."""
-    def _boom(event, subject):
+def test_hard_notification_scheduling_failure_never_breaks_transition(client, auth_headers, monkeypatch):
+    """Even a scheduling layer that raises must not break the DB transition."""
+    def _boom(*args, **kwargs):
         raise RuntimeError("notify blew up")
 
-    monkeypatch.setattr(cn, "notify_admin", _boom)
+    monkeypatch.setattr(cn, "schedule_admin_delivery", _boom)
 
     product = _create_product(client, auth_headers)
     r = client.post(f"{BASE}/requests", json=_request_payload(product["id"]))
@@ -717,3 +721,269 @@ def test_staff_resend_rejects_non_notifiable_state(client, auth_headers):
 def test_staff_resend_requires_staff(client):
     r = client.post(f"{BASE}/staff/invoices/1/notify")
     assert r.status_code in (401, 403)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Background dispatch — the public/staff response is not gated by transport
+# ══════════════════════════════════════════════════════════════════════
+
+
+class _RecordingTasks:
+    """Minimal stand-in for FastAPI ``BackgroundTasks`` (record, run on demand)."""
+
+    def __init__(self):
+        self.jobs = []
+
+    def add_task(self, func, *args, **kwargs):
+        self.jobs.append((func, args, kwargs))
+
+    def run(self):
+        jobs, self.jobs = self.jobs, []
+        for func, args, kwargs in jobs:
+            func(*args, **kwargs)
+
+
+class _StandaloneSubject:
+    receipt_id = "REQ-BGDISP"
+    customer_name = "رضا"
+    mobile = "09123456789"
+    messenger = "telegram"
+    messenger_handle = ""
+    address = ""
+    state = "pending_review"
+    items = []
+
+
+def test_delivery_is_deferred_and_payload_is_a_snapshot(monkeypatch):
+    """A scheduled event is *not* delivered inline and its payload is plain data.
+
+    Building the payload eagerly (while the session is open) and delivering it
+    later from the ``BackgroundTasks`` job is what keeps the customer response
+    from being gated by a slow transport — and means the delivery task never
+    touches an ORM object after the request (and its session) has closed.
+    """
+    from app.services import commerce as commerce_service
+
+    records = _record_channels(monkeypatch)
+    tasks = _RecordingTasks()
+
+    commerce_service._emit_admin_notification(
+        cn.EVENT_REQUEST_CREATED, _StandaloneSubject(), background_tasks=tasks
+    )
+
+    # Nothing was sent while the request was still being handled.
+    assert records == {"telegram": [], "sms": [], "email": []}
+    assert len(tasks.jobs) == 1
+    func, args, kwargs = tasks.jobs[0]
+    assert func is cn.deliver_payload
+    event, payload = args
+    assert kwargs == {} and event == cn.EVENT_REQUEST_CREATED
+    # The payload is a plain-data snapshot (string, no ORM attribute access).
+    assert isinstance(payload["telegram"], str)
+    assert "REQ-BGDISP" in payload["telegram"]
+
+    # Delivery runs later, after the subject/session is gone.
+    tasks.run()
+    assert len(records["telegram"]) == 1
+    assert len(records["sms"]) == 1
+    assert len(records["email"]) == 1
+
+
+def test_background_delivery_never_raises_to_the_caller(monkeypatch):
+    """A transport blow-up inside the deferred job must be swallowed, not raised."""
+    from app.services import commerce as commerce_service
+
+    def _boom(text):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(cn, "send_telegram_message", _boom)
+    monkeypatch.setattr(cn, "send_sms_alert", lambda parameters: cn.SENT)
+    monkeypatch.setattr(cn, "send_email_alert", lambda subject, body: cn.SENT)
+
+    tasks = _RecordingTasks()
+    commerce_service._emit_admin_notification(
+        cn.EVENT_REQUEST_CREATED, _StandaloneSubject(), background_tasks=tasks
+    )
+    # Running the job must not raise even though Telegram blew up.
+    tasks.run()
+
+
+def test_public_request_hands_notification_to_background_tasks(client, auth_headers, monkeypatch):
+    """The public request handler must schedule (not run) the admin alert."""
+    from app.services import commerce as commerce_service
+
+    seen = {}
+    real = commerce_service._emit_admin_notification
+
+    def _spy(event, subject, background_tasks=None):
+        seen["event"] = event
+        seen["has_bg"] = background_tasks is not None
+        return real(event, subject, background_tasks=background_tasks)
+
+    monkeypatch.setattr(commerce_service, "_emit_admin_notification", _spy)
+    records = _record_channels(monkeypatch)
+    product = _create_product(client, auth_headers)
+
+    r = client.post(f"{BASE}/requests", json=_request_payload(product["id"]))
+    assert r.status_code == 200, r.text
+    assert seen == {"event": cn.EVENT_REQUEST_CREATED, "has_bg": True}
+    # TestClient drains background tasks, so the alert still lands exactly once.
+    assert len(records["telegram"]) == 1
+
+
+def test_approve_hands_notification_to_background_tasks(client, auth_headers, monkeypatch):
+    """Staff approval must likewise schedule the alert rather than block on it."""
+    from app.services import commerce as commerce_service
+
+    seen = {}
+    real = commerce_service._emit_admin_notification
+
+    def _spy(event, subject, background_tasks=None):
+        seen["event"] = event
+        seen["has_bg"] = background_tasks is not None
+        return real(event, subject, background_tasks=background_tasks)
+
+    monkeypatch.setattr(commerce_service, "_emit_admin_notification", _spy)
+    records = _record_channels(monkeypatch)
+    invoice_id = _draft_invoice(client, auth_headers)
+
+    r = client.post(f"{BASE}/staff/invoices/{invoice_id}/approve", headers=auth_headers)
+    assert r.status_code == 200, r.text
+    assert seen == {"event": cn.EVENT_INVOICE_APPROVED, "has_bg": True}
+    assert len(records["telegram"]) == 1
+
+
+def test_payment_settlement_hands_notification_to_background_tasks(
+    client, auth_headers, fake_provider, monkeypatch
+):
+    """The DigiPay callback must settle, then schedule the paid alert."""
+    from app.services import commerce as commerce_service
+
+    seen = {}
+    real = commerce_service._emit_admin_notification
+
+    def _spy(event, subject, background_tasks=None):
+        seen.setdefault(event, 0)
+        seen[event] += 1
+        seen.setdefault("has_bg", background_tasks is not None)
+        return real(event, subject, background_tasks=background_tasks)
+
+    monkeypatch.setattr(commerce_service, "_emit_admin_notification", _spy)
+    _record_channels(monkeypatch)
+
+    created = client.post(
+        f"{BASE}/staff/invoices",
+        json={
+            "customer_name": "رضا", "mobile": "09123456789", "messenger": "telegram",
+            "items": [{"description": "قطعه", "qty": 1, "unit_toman": 100000}],
+        },
+        headers=auth_headers,
+    )
+    invoice_id = created.json()["id"]
+    token = client.post(
+        f"{BASE}/staff/invoices/{invoice_id}/approve", headers=auth_headers
+    ).json()["share_url"].rsplit("/", 1)[-1]
+    client.post(f"{BASE}/invoices/{token}/pay")
+    attempt = _latest_attempt(invoice_id)
+
+    r = client.post(
+        f"{BASE}/digipay/callback",
+        data={
+            "providerId": attempt.provider_id,
+            "amount": str(attempt.amount_rial),
+            "trackingCode": "TRK-1",
+            "type": "11",
+            "result": "SUCCESS",
+        },
+        follow_redirects=False,
+    )
+    assert "payment=success" in r.headers["location"]
+    assert seen.get(cn.EVENT_PAYMENT_VERIFIED) == 1
+    assert seen["has_bg"] is True
+
+
+def test_deferred_delivery_contacts_no_transport_without_credentials(client, auth_headers, monkeypatch):
+    """With no SMS/SMTP credentials the deferred job must make no network call."""
+    calls = {"sms": 0, "smtp": 0}
+    monkeypatch.setattr(cn, "send_telegram_message", lambda text: cn.SKIPPED)
+    monkeypatch.setattr(cn, "post_sms_ir_verify", lambda **kw: calls.__setitem__("sms", calls["sms"] + 1) or True)
+    monkeypatch.setattr(cn, "send_smtp_mail", lambda **kw: calls.__setitem__("smtp", calls["smtp"] + 1) or True)
+
+    product = _create_product(client, auth_headers)
+    r = client.post(f"{BASE}/requests", json=_request_payload(product["id"]))
+    assert r.status_code == 200, r.text
+    assert calls == {"sms": 0, "smtp": 0}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Telegram: distinguish "configured but failed" from "not configured"
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_telegram_not_configured_is_skipped(monkeypatch):
+    monkeypatch.setattr(cn, "send_telegram_notification", lambda text, parse_mode="HTML": False)
+    monkeypatch.setattr(cn, "get_telegram_config", lambda: ("", [], None))
+    assert cn.send_telegram_message("x") == cn.SKIPPED
+
+
+def test_telegram_configured_but_failed_is_failed_not_skipped(monkeypatch):
+    """A configured bot whose send fails must be FAILED, never masked as a skip."""
+    monkeypatch.setattr(cn, "send_telegram_notification", lambda text, parse_mode="HTML": False)
+    monkeypatch.setattr(cn, "get_telegram_config", lambda: ("token", ["12345"], None))
+    assert cn.send_telegram_message("x") == cn.FAILED
+
+
+def test_telegram_configured_success_is_sent(monkeypatch):
+    monkeypatch.setattr(cn, "send_telegram_notification", lambda text, parse_mode="HTML": True)
+    # get_telegram_config must not even be needed once the send succeeds.
+    monkeypatch.setattr(cn, "get_telegram_config", lambda: ("", [], None))
+    assert cn.send_telegram_message("x") == cn.SENT
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Staff retry of request_created + rate limiting
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _first_request_id(client, auth_headers):
+    rows = client.get(f"{BASE}/staff/requests", headers=auth_headers).json()
+    return rows[0]["id"]
+
+
+def test_staff_can_resend_request_created(client, auth_headers, monkeypatch):
+    records = _record_channels(monkeypatch)
+    product = _create_product(client, auth_headers)
+    client.post(f"{BASE}/requests", json=_request_payload(product["id"]))
+    records["telegram"].clear()
+    request_id = _first_request_id(client, auth_headers)
+
+    r = client.post(f"{BASE}/staff/requests/{request_id}/notify", headers=auth_headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["event"] == "request_created"
+    assert body["channels"] == {"telegram": "sent", "sms": "sent", "email": "sent"}
+    assert len(records["telegram"]) == 1
+    assert "REQ-" in records["telegram"][0]
+
+
+def test_staff_resend_request_notify_404_for_unknown(client, auth_headers):
+    r = client.post(f"{BASE}/staff/requests/999999/notify", headers=auth_headers)
+    assert r.status_code == 404
+
+
+def test_staff_resend_request_notify_requires_staff(client):
+    r = client.post(f"{BASE}/staff/requests/1/notify")
+    assert r.status_code in (401, 403)
+
+
+def test_staff_notify_is_rate_limited(client, auth_headers, monkeypatch):
+    """The retry endpoints fan out to live transports, so they are rate-limited."""
+    _record_channels(monkeypatch)
+    invoice_id = _draft_invoice(client, auth_headers)
+    client.post(f"{BASE}/staff/invoices/{invoice_id}/approve", headers=auth_headers)
+
+    statuses = [
+        client.post(f"{BASE}/staff/invoices/{invoice_id}/notify", headers=auth_headers).status_code
+        for _ in range(13)
+    ]
+    assert 429 in statuses
