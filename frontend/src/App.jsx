@@ -28,6 +28,7 @@ const UsersPage = lazy(() => import('./pages/Users'));
 const Categories = lazy(() => import('./pages/Categories'));
 const Collections = lazy(() => import('./pages/Collections'));
 const Orders = lazy(() => import('./pages/Orders'));
+const CommerceAdmin = lazy(() => import('./pages/CommerceAdmin'));
 const CustomOrders = lazy(() => import('./pages/CustomOrders'));
 const Customers = lazy(() => import('./pages/Customers'));
 const AuditLogs = lazy(() => import('./pages/AuditLogs'));
@@ -109,6 +110,7 @@ function AppRoutes() {
         <Route path="/categories" element={<ProtectedRoute><Layout><Categories /></Layout></ProtectedRoute>} />
         <Route path="/collections" element={<ProtectedRoute><Layout><Collections /></Layout></ProtectedRoute>} />
         <Route path="/orders" element={<ProtectedRoute><Layout><Orders /></Layout></ProtectedRoute>} />
+        <Route path="/commerce-admin" element={<ProtectedRoute><Layout><CommerceAdmin /></Layout></ProtectedRoute>} />
         <Route path="/custom-orders" element={<ProtectedRoute><Layout><CustomOrders /></Layout></ProtectedRoute>} />
         <Route path="/customers" element={<ProtectedRoute><Layout><Customers /></Layout></ProtectedRoute>} />
 

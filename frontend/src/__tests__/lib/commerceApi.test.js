@@ -46,13 +46,66 @@ describe('commerceApi public contract', () => {
     expect(commerceClient.post).toHaveBeenCalledWith('/requests', payload, config);
   });
 
-  it('reads the staff queue with credentials', async () => {
+  it('reads the staff queue with pagination params and credentials', async () => {
     const { mod, commerceClient } = await loadCommerceApi();
     const config = { signal: new AbortController().signal };
 
-    mod.getStaffRequests(config);
+    mod.getStaffRequests({ limit: 50, offset: 0 }, config);
 
-    expect(commerceClient.get).toHaveBeenCalledWith('/staff/requests', config);
+    expect(commerceClient.get).toHaveBeenCalledWith('/staff/requests', {
+      params: { limit: 50, offset: 0 },
+      ...config,
+    });
+  });
+
+  it('lists staff invoices with pagination params', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+    const config = { signal: new AbortController().signal };
+
+    mod.getStaffInvoices({ limit: 100, offset: 100 }, config);
+
+    expect(commerceClient.get).toHaveBeenCalledWith('/staff/invoices', {
+      params: { limit: 100, offset: 100 },
+      ...config,
+    });
+  });
+
+  it('creates a staff draft invoice', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+    const payload = {
+      customer_name: 'رضا',
+      mobile: '09123456789',
+      items: [{ description: 'قطعه', qty: 1, unit_toman: 1000 }],
+    };
+
+    mod.createStaffInvoice(payload);
+
+    expect(commerceClient.post).toHaveBeenCalledWith('/staff/invoices', payload);
+  });
+
+  it('revises a staff invoice by id', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+    const payload = { customer_name: 'رضا', mobile: '09123456789', items: [] };
+
+    mod.updateStaffInvoice(7, payload);
+
+    expect(commerceClient.put).toHaveBeenCalledWith('/staff/invoices/7', payload);
+  });
+
+  it('approves a staff invoice by id', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+
+    mod.approveStaffInvoice(7);
+
+    expect(commerceClient.post).toHaveBeenCalledWith('/staff/invoices/7/approve');
+  });
+
+  it('revokes a staff invoice by id', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+
+    mod.revokeStaffInvoice(7);
+
+    expect(commerceClient.post).toHaveBeenCalledWith('/staff/invoices/7/revoke');
   });
 
   it('does not force a login redirect on a public 401', async () => {

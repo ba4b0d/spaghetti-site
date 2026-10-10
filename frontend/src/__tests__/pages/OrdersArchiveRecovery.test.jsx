@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
 import Orders from '../../pages/Orders';
 import { getOrders, getOrderStatuses, getProductsAll, restoreOrder } from '../../lib/api';
 
@@ -71,7 +72,11 @@ describe('Orders archive recovery', () => {
     });
 
     const user = userEvent.setup();
-    render(<Orders />);
+    render(
+      <MemoryRouter>
+        <Orders />
+      </MemoryRouter>
+    );
 
     await screen.findByText('Active Customer');
     expect(screen.queryByText('Archived Customer')).toBeNull();
@@ -90,7 +95,11 @@ describe('Orders archive recovery', () => {
     });
 
     const user = userEvent.setup();
-    render(<Orders />);
+    render(
+      <MemoryRouter>
+        <Orders />
+      </MemoryRouter>
+    );
 
     await screen.findByText('Active Customer');
     await user.click(screen.getByRole('button', { name: /نمایش بایگانی/i }));

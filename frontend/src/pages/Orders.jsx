@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import { ClipboardList, Plus, Archive, Edit2, Download, Trash2, LayoutGrid, List, RotateCcw } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { ClipboardList, Plus, Archive, Edit2, Download, Trash2, LayoutGrid, List, RotateCcw, Receipt } from 'lucide-react';
 import { getOrders, createOrder, updateOrder, deleteOrder, restoreOrder, getOrderStatuses, exportOrdersCsv, getProductsAll } from '../lib/api';
 import { formatPrice } from '../lib/utils';
 import {
@@ -456,6 +457,9 @@ export default function Orders() {
           <button type="button" onClick={handleExportCsv} className="btn-secondary text-xs">
             <Download size={14} /> CSV
           </button>
+          <Link to="/commerce-admin" className="btn-secondary text-xs inline-flex items-center gap-1.5">
+            <Receipt size={14} /> فاکتور و پرداخت
+          </Link>
           <button type="button" onClick={openCreate} className="btn-primary">
             <Plus size={16} /> سفارش جدید
           </button>

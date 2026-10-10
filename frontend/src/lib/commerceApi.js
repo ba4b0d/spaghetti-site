@@ -26,7 +26,34 @@ commerceApi.interceptors.response.use(
 export const submitCommerceRequest = (payload, config) =>
   commerceApi.post('/requests', payload, config);
 
-/** Staff — newest-first request review queue (requires staff session). */
-export const getStaffRequests = (config) => commerceApi.get('/staff/requests', config);
+/** Staff — paginated, newest-first request review queue (requires staff session). */
+export const getStaffRequests = (params = {}, config) =>
+  commerceApi.get('/staff/requests', { params, ...config });
+
+// ── Staff invoices (Task 2) ──────────────────────────────────────────
+//
+// All staff invoice calls require the existing staff session cookie; the
+// private share link is only ever returned by `approveStaffInvoice`, and the
+// frontend must never auto-forward it to a messenger — staff copy it manually.
+
+/** Staff — paginated, newest-first invoice queue. */
+export const getStaffInvoices = (params = {}, config) =>
+  commerceApi.get('/staff/invoices', { params, ...config });
+
+/** Staff — create a draft invoice (manual or linked to a website request). */
+export const createStaffInvoice = (payload) =>
+  commerceApi.post('/staff/invoices', payload);
+
+/** Staff — revise a non-settled invoice (drops to draft, invalidates the link). */
+export const updateStaffInvoice = (id, payload) =>
+  commerceApi.put(`/staff/invoices/${id}`, payload);
+
+/** Staff — freeze the invoice and mint a one-time private share link. */
+export const approveStaffInvoice = (id) =>
+  commerceApi.post(`/staff/invoices/${id}/approve`);
+
+/** Staff — invalidate the private share link. */
+export const revokeStaffInvoice = (id) =>
+  commerceApi.post(`/staff/invoices/${id}/revoke`);
 
 export default commerceApi;
