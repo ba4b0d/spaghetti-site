@@ -22,7 +22,11 @@ const apiMock = vi.hoisted(() => ({ getProductsAll: vi.fn() }));
 vi.mock('../../lib/commerceApi', () => commerceApiMock);
 vi.mock('../../lib/api', () => apiMock);
 
-import CommerceAdmin, { REQUESTS_PAGE_SIZE } from '../../pages/CommerceAdmin';
+import CommerceAdmin, {
+  REQUESTS_PAGE_SIZE,
+  INVOICES_PAGE_SIZE,
+  COPY_RESET_MS,
+} from '../../pages/CommerceAdmin';
 
 function renderPage() {
   return render(
@@ -251,6 +255,10 @@ describe('CommerceAdmin approval and link lifecycle', () => {
 
     await user.click(await screen.findByRole('button', { name: /^ویرایش$/ }));
 
+    // Editing an approved invoice is gated behind a confirmation first.
+    const confirmDialog = await screen.findByRole('dialog');
+    await user.click(within(confirmDialog).getByRole('button', { name: /ادامه و ویرایش/ }));
+
     const priceField = await screen.findByLabelText('قیمت واحد (تومان)');
     await user.clear(priceField);
     await user.type(priceField, '60000');
@@ -302,3 +310,163 @@ describe('CommerceAdmin invoice states', () => {
     expect(alert.textContent).toContain('مبلغ کل فاکتور بیش از حد مجاز است');
   });
 });
+
+// ── catalogue attach price seeding ───────────────────────────────────
+
+describe('CommerceAdmin catalogue attach', () => {
+  it('seeds the unit price from final_price when suggested_price is zero', async () => {
+    apiMock.getProductsAll.mockResolvedValue({
+      data: [
+        { id: 7, name: 'محصول بدون قیمت پیشنهادی', suggested_price: 0, final_price: 45000, is_active: true },
+      ],
+    });
+
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: /فاکتور جدید/ }));
+    await user.type(await screen.findByLabelText('شرح آیتم'), 'محصول');
+
+    const option = await screen.findByRole('button', { name: /محصول بدون قیمت پیشنهادی/ });
+    await user.click(option);
+
+    // A zero suggested_price must NOT price the line at 0 — final_price wins.
+    expect(screen.getByLabelText('قیمت واحد (تومان)')).toHaveValue(45000);
+  });
+
+  it('keeps a typed price when the catalogue product has no usable price', async () => {
+    apiMock.getProductsAll.mockResolvedValue({
+      data: [{ id: 8, name: 'محصول بی‌قیمت', suggested_price: 0, final_price: 0, is_active: true }],
+    });
+
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: /فاکتور جدید/ }));
+    await user.type(await screen.findByLabelText('قیمت واحد (تومان)'), '12345');
+
+    await user.type(await screen.findByLabelText('شرح آیتم'), 'بی');
+    const option = await screen.findByRole('button', { name: /محصول بی‌قیمت/ });
+    await user.click(option);
+
+    expect(screen.getByLabelText('قیمت واحد (تومان)')).toHaveValue(12345);
+  });
+});
+
+// ── invoice queue pagination ─────────────────────────────────────────
+
+describe('CommerceAdmin invoice queue', () => {
+  it('loads more invoices when the first page is full', async () => {
+    const firstPage = Array.from({ length: INVOICES_PAGE_SIZE }, (_, i) =>
+      makeInvoice({ id: i + 1, customer_name: `فاکتور ${i + 1}` })
+    );
+    const secondPage = [makeInvoice({ id: 9000, customer_name: 'فاکتور آخر' })];
+    commerceApiMock.getStaffInvoices.mockImplementation(({ offset } = {}) =>
+      Promise.resolve({ data: offset === 0 ? firstPage : secondPage })
+    );
+
+    const user = userEvent.setup();
+    renderPage();
+
+    await screen.findByText('فاکتور 1');
+    expect(commerceApiMock.getStaffInvoices).toHaveBeenLastCalledWith({
+      limit: INVOICES_PAGE_SIZE,
+      offset: 0,
+    });
+
+    await user.click(screen.getByRole('button', { name: /بارگذاری بیشتر/ }));
+
+    await screen.findByText('فاکتور آخر');
+    expect(commerceApiMock.getStaffInvoices).toHaveBeenLastCalledWith({
+      limit: INVOICES_PAGE_SIZE,
+      offset: INVOICES_PAGE_SIZE,
+    });
+    // A short page means the invoice queue is exhausted.
+    expect(screen.queryByRole('button', { name: /بارگذاری بیشتر/ })).toBeNull();
+  });
+});
+
+// ── confirmation before invalidating a shared link ───────────────────
+
+describe('CommerceAdmin edit confirmation', () => {
+  it('requires confirmation before editing an approved invoice with a live link', async () => {
+    commerceApiMock.getStaffInvoices.mockResolvedValue({
+      data: [makeInvoice({ state: 'approved', has_active_link: true })],
+    });
+
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: /^ویرایش$/ }));
+
+    // The editor must not open before staff confirm the link will be voided.
+    expect(screen.queryByLabelText(/نام مشتری/)).toBeNull();
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog.textContent).toMatch(/لینک/);
+
+    await user.click(within(dialog).getByRole('button', { name: /ادامه و ویرایش/ }));
+
+    expect(await screen.findByLabelText(/نام مشتری/)).toHaveValue('سارا');
+  });
+
+  it('cancelling the confirmation leaves the invoice untouched', async () => {
+    commerceApiMock.getStaffInvoices.mockResolvedValue({
+      data: [makeInvoice({ state: 'approved', has_active_link: true })],
+    });
+
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: /^ویرایش$/ }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'انصراف' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(screen.queryByLabelText(/نام مشتری/)).toBeNull();
+    expect(commerceApiMock.updateStaffInvoice).not.toHaveBeenCalled();
+  });
+
+  it('opens the editor directly for a draft invoice with no confirm step', async () => {
+    commerceApiMock.getStaffInvoices.mockResolvedValue({ data: [makeInvoice({ state: 'draft' })] });
+
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: /^ویرایش$/ }));
+
+    expect(await screen.findByLabelText(/نام مشتری/)).toHaveValue('سارا');
+  });
+});
+
+// ── async status announcements ───────────────────────────────────────
+
+describe('CommerceAdmin status announcements', () => {
+  it('announces copy in a polite live region and resets the copied affordance', async () => {
+    const shareUrl = 'https://spaghettiprints.ir/pay/RAWTOKEN999';
+    commerceApiMock.getStaffInvoices.mockResolvedValue({ data: [makeInvoice()] });
+    commerceApiMock.approveStaffInvoice.mockResolvedValue({
+      data: { id: 9, state: 'approved', revision: 1, share_url: shareUrl, expires_at: '2026-10-17T08:00:00Z' },
+    });
+
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: /تأیید و صدور لینک/ }));
+    await screen.findByText(shareUrl);
+
+    const status = await screen.findByRole('status');
+    await waitFor(() => expect(status.textContent).toContain('لینک'));
+
+    await user.click(screen.getByRole('button', { name: /کپی لینک/ }));
+    await screen.findByRole('button', { name: /کپی شد/ });
+    await waitFor(() => expect(status.textContent).toContain('کپی'));
+
+    // The copied indicator must not stick forever.
+    await waitFor(
+      () => expect(screen.getByRole('button', { name: /کپی لینک/ })).toBeInTheDocument(),
+      { timeout: COPY_RESET_MS + 1500 }
+    );
+  });
+});
+

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   Plus,
@@ -39,6 +39,8 @@ import Modal from '../components/Modal';
 // until a short page comes back so a large queue never loads all at once.
 export const REQUESTS_PAGE_SIZE = 50;
 export const INVOICES_PAGE_SIZE = 100;
+// How long the "کپی شد" affordance stays before it resets.
+export const COPY_RESET_MS = 2000;
 
 const MESSENGER_OPTIONS = [
   { value: 'telegram', label: 'تلگرام' },
@@ -90,6 +92,19 @@ function isCanceled(err) {
 function invoiceDisplayState(invoice) {
   if (invoice.state === 'approved' && invoice.has_active_link === false) return 'expired';
   return invoice.state;
+}
+
+/**
+ * Best catalogue price to seed a line with. Only a POSITIVE price counts: a
+ * `suggested_price` of 0 (or null) must fall through to `final_price` instead
+ * of silently pricing the line at 0. Returns 0 when neither is usable.
+ */
+function catalogPrice(product) {
+  const suggested = Number(product?.suggested_price);
+  if (Number.isFinite(suggested) && suggested > 0) return suggested;
+  const final = Number(product?.final_price);
+  if (Number.isFinite(final) && final > 0) return final;
+  return 0;
 }
 
 const emptyForm = {
@@ -161,29 +176,33 @@ function LineItemRow({ item, index, products, onChange, onRemove, canRemove }) {
               className="absolute z-50 w-full mt-1 rounded-lg border shadow-lg max-h-40 overflow-y-auto"
               style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
             >
-              {filtered.slice(0, 15).map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  className="w-full text-right px-3 py-1.5 text-xs flex items-center justify-between"
-                  style={{ borderBottom: '1px solid var(--border-color)' }}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() =>
-                    onChange({
-                      product_id: p.id,
-                      description: p.name || '',
-                      unit_toman:
-                        p.suggested_price ?? p.final_price ?? item.unit_toman ?? '',
-                      showDropdown: false,
-                    })
-                  }
-                >
-                  <span style={{ color: 'var(--text-primary)' }}>{p.name}</span>
-                  {p.suggested_price > 0 && (
-                    <span style={{ color: 'var(--text-muted)' }}>{formatPrice(p.suggested_price)}</span>
-                  )}
-                </button>
-              ))}
+              {filtered.slice(0, 15).map((p) => {
+                const price = catalogPrice(p);
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className="w-full text-right px-3 py-1.5 text-xs flex items-center justify-between"
+                    style={{ borderBottom: '1px solid var(--border-color)' }}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() =>
+                      onChange({
+                        product_id: p.id,
+                        description: p.name || '',
+                        // A positive catalogue price seeds the line; otherwise
+                        // keep whatever staff already typed.
+                        unit_toman: price > 0 ? price : item.unit_toman ?? '',
+                        showDropdown: false,
+                      })
+                    }
+                  >
+                    <span style={{ color: 'var(--text-primary)' }}>{p.name}</span>
+                    {price > 0 && (
+                      <span style={{ color: 'var(--text-muted)' }}>{formatPrice(price)}</span>
+                    )}
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
@@ -222,6 +241,7 @@ function LineItemRow({ item, index, products, onChange, onRemove, canRemove }) {
 
 export default function CommerceAdmin() {
   const [products, setProducts] = useState([]);
+  const [productsError, setProductsError] = useState(false);
 
   // Website request queue
   const [requests, setRequests] = useState([]);
@@ -233,11 +253,17 @@ export default function CommerceAdmin() {
   const [invoices, setInvoices] = useState([]);
   const [invoicesLoading, setInvoicesLoading] = useState(false);
   const [invoicesError, setInvoicesError] = useState(null);
+  const [invoicesHasMore, setInvoicesHasMore] = useState(false);
 
   // One-time private links (never returned by the list endpoint).
   const [shareLinks, setShareLinks] = useState({});
   const [copiedId, setCopiedId] = useState(null);
+  const [statusMessage, setStatusMessage] = useState('');
+  // Reset the "copied" affordance after a beat so it never sticks forever.
+  const copyResetRef = useRef(null);
   const [actionError, setActionError] = useState(null);
+  // Invoice awaiting confirmation before an edit that would kill its live link.
+  const [confirmEdit, setConfirmEdit] = useState(null);
 
   // Editor
   const [showModal, setShowModal] = useState(false);
@@ -263,11 +289,13 @@ export default function CommerceAdmin() {
     }
   }, []);
 
-  const loadInvoices = useCallback(async () => {
+  const loadInvoices = useCallback(async (offset = 0) => {
     setInvoicesLoading(true);
     try {
-      const res = await getStaffInvoices({ limit: INVOICES_PAGE_SIZE, offset: 0 });
-      setInvoices(Array.isArray(res.data) ? res.data : []);
+      const res = await getStaffInvoices({ limit: INVOICES_PAGE_SIZE, offset });
+      const page = Array.isArray(res.data) ? res.data : [];
+      setInvoices((prev) => (offset === 0 ? page : [...prev, ...page]));
+      setInvoicesHasMore(page.length === INVOICES_PAGE_SIZE);
       setInvoicesError(null);
     } catch (err) {
       if (!isCanceled(err)) setInvoicesError('خطا در بارگذاری فاکتورها');
@@ -281,7 +309,7 @@ export default function CommerceAdmin() {
   }, [fetchRequestsPage]);
 
   useEffect(() => {
-    loadInvoices();
+    loadInvoices(0);
   }, [loadInvoices]);
 
   useEffect(() => {
@@ -289,9 +317,21 @@ export default function CommerceAdmin() {
       .then((res) => {
         const list = Array.isArray(res.data) ? res.data : res.data?.items ?? [];
         setProducts(list.filter((p) => p.is_active !== false));
+        setProductsError(false);
       })
-      .catch(() => {});
+      .catch((err) => {
+        // Surface a hint instead of silently showing an empty catalogue.
+        if (!isCanceled(err)) setProductsError(true);
+      });
   }, []);
+
+  // Never leave a pending copy-reset timer running after unmount.
+  useEffect(
+    () => () => {
+      if (copyResetRef.current) clearTimeout(copyResetRef.current);
+    },
+    []
+  );
 
   // ── Editor open helpers ────────────────────────────────────────────
 
@@ -352,6 +392,25 @@ export default function CommerceAdmin() {
     setItems(invItems.length ? invItems : [emptyItem()]);
     setFormError(null);
     setShowModal(true);
+  };
+
+  /**
+   * Editing an approved invoice bumps the revision and invalidates the live
+   * share link the customer may already hold — confirm before doing that to an
+   * approved invoice, edit drafts/expired/revoked straight away.
+   */
+  const requestEdit = (invoice) => {
+    if (invoiceDisplayState(invoice) === 'approved') {
+      setConfirmEdit(invoice);
+      return;
+    }
+    openEdit(invoice);
+  };
+
+  const confirmEditProceed = () => {
+    const invoice = confirmEdit;
+    setConfirmEdit(null);
+    if (invoice) openEdit(invoice);
   };
 
   const closeModal = () => {
@@ -480,6 +539,7 @@ export default function CommerceAdmin() {
             : inv
         )
       );
+      setStatusMessage('لینک پرداخت ساخته شد. آن را کپی و در گفتگوی مشتری ارسال کنید.');
     } catch (err) {
       setActionError(extractError(err));
     }
@@ -496,6 +556,7 @@ export default function CommerceAdmin() {
         delete next[invoice.id];
         return next;
       });
+      setStatusMessage('لینک پرداخت باطل شد.');
     } catch (err) {
       setActionError(extractError(err));
     }
@@ -515,6 +576,9 @@ export default function CommerceAdmin() {
         document.body.removeChild(el);
       }
       setCopiedId(id);
+      setStatusMessage('لینک کپی شد. آن را دستی در گفتگوی پیام‌رسان بچسبانید.');
+      if (copyResetRef.current) clearTimeout(copyResetRef.current);
+      copyResetRef.current = setTimeout(() => setCopiedId(null), COPY_RESET_MS);
     } catch {
       setActionError('کپی لینک ناموفق بود؛ لینک را دستی انتخاب کنید.');
     }
@@ -552,8 +616,13 @@ export default function CommerceAdmin() {
         </div>
       )}
 
+      {/* Async status announcements for assistive tech. */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {statusMessage}
+      </div>
+
       {/* ── Website requests ── */}
-      <section className="card p-0 overflow-hidden">
+      <section className="card p-0 overflow-hidden" aria-busy={requestsLoading}>
         <div
           className="flex items-center justify-between px-4 py-3 border-b"
           style={{ borderColor: 'var(--border-color)' }}
@@ -626,7 +695,7 @@ export default function CommerceAdmin() {
       </section>
 
       {/* ── Invoices ── */}
-      <section className="card p-0 overflow-hidden">
+      <section className="card p-0 overflow-hidden" aria-busy={invoicesLoading}>
         <div
           className="flex items-center justify-between px-4 py-3 border-b"
           style={{ borderColor: 'var(--border-color)' }}
@@ -634,7 +703,26 @@ export default function CommerceAdmin() {
           <h3 className="text-sm font-bold flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>
             <FileText size={16} /> فاکتورها
           </h3>
-          {invoicesLoading && <Loader2 size={14} className="animate-spin" style={{ color: 'var(--text-muted)' }} />}
+          <div className="flex items-center gap-2">
+            {invoicesLoading && (
+              <Loader2
+                size={14}
+                className="animate-spin"
+                style={{ color: 'var(--text-muted)' }}
+                aria-hidden="true"
+              />
+            )}
+            {invoicesHasMore && (
+              <button
+                type="button"
+                onClick={() => loadInvoices(invoices.length)}
+                className="btn-secondary text-xs"
+                disabled={invoicesLoading}
+              >
+                بارگذاری بیشتر
+              </button>
+            )}
+          </div>
         </div>
 
         {invoicesError ? (
@@ -682,7 +770,7 @@ export default function CommerceAdmin() {
                       {editable && (
                         <button
                           type="button"
-                          onClick={() => openEdit(invoice)}
+                          onClick={() => requestEdit(invoice)}
                           className="btn-secondary text-xs"
                         >
                           ویرایش
@@ -746,6 +834,36 @@ export default function CommerceAdmin() {
           </div>
         )}
       </section>
+
+      {/* ── Confirm edit of an approved invoice ── */}
+      <Modal
+        isOpen={confirmEdit != null}
+        onClose={() => setConfirmEdit(null)}
+        title="تأیید ویرایش فاکتور"
+        size="sm"
+      >
+        <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+          این فاکتور تأییدشده است و لینک پرداخت آن پیش‌تر ساخته شده. با ویرایش، فاکتور به پیش‌نویس
+          بازمی‌گردد، شماره نسخه افزایش می‌یابد و لینک فعلی بلافاصله باطل می‌شود؛ سپس باید لینک
+          تازه‌ای صادر کنید. ادامه می‌دهید؟
+        </p>
+        <div className="flex gap-2 pt-4">
+          <button
+            type="button"
+            className="btn-secondary flex-1 justify-center"
+            onClick={() => setConfirmEdit(null)}
+          >
+            انصراف
+          </button>
+          <button
+            type="button"
+            className="btn-primary flex-1 justify-center"
+            onClick={confirmEditProceed}
+          >
+            ادامه و ویرایش
+          </button>
+        </div>
+      </Modal>
 
       {/* ── Editor ── */}
       <Modal
@@ -844,6 +962,11 @@ export default function CommerceAdmin() {
                 <Plus size={12} /> افزودن آیتم
               </button>
             </div>
+            {productsError && (
+              <p className="text-[11px] mb-2" style={{ color: '#d97706' }}>
+                بارگذاری محصولات کاتالوگ ناموفق بود؛ می‌توانید آیتم را دستی وارد کنید.
+              </p>
+            )}
             <div className="space-y-2">
               {items.map((it, idx) => (
                 <LineItemRow
