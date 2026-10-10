@@ -22,6 +22,10 @@ from app.routers.auth import limiter
 from app.services import commerce as commerce_service
 from app.services import digipay
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v1/commerce/digipay", tags=["commerce-payments"])
 
 RESULT_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
@@ -59,14 +63,27 @@ def digipay_callback(
             # Cannot verify → never claim success.
             return _result_redirect("failed")
 
-    outcome = commerce_service.handle_digipay_callback(
-        db,
-        client,
-        provider_id=provider_id,
-        amount=amount,
-        tracking_code=tracking_code,
-        type_value=type_value,
-        result_value=result_value,
-        background_tasks=background_tasks,
-    )
+    try:
+        outcome = commerce_service.handle_digipay_callback(
+            db,
+            client,
+            provider_id=provider_id,
+            amount=amount,
+            tracking_code=tracking_code,
+            type_value=type_value,
+            result_value=result_value,
+            background_tasks=background_tasks,
+        )
+    except commerce_service.CommerceReconciliationRequiredError:
+        # Provider genuinely confirmed payment but it could not be settled
+        # against the current invoice (stale revision/amount, or revoked).
+        # The attempt kept its verified evidence and is queued for staff; send
+        # the customer to a neutral pending page and never claim paid or 500.
+        outcome = "pending"
+    except commerce_service.CommerceConfigError:
+        # Misconfigured deploy: never claim success.
+        outcome = "failed"
+    except Exception:  # noqa: BLE001 - a gateway callback must ALWAYS redirect
+        logger.exception("digipay callback handling raised; returning neutral result")
+        outcome = "pending"
     return _result_redirect(outcome)

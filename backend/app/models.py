@@ -545,6 +545,14 @@ class CommercePaymentAttempt(Base):
     redirect_url = Column(String(1000), nullable=True)
     last_error = Column(String(300), nullable=True)
     verified_at = Column(DateTime, nullable=True)
+    # Set when a *genuine* server-verified payment could not be settled against
+    # its invoice — the attempt's revision/amount no longer match the current
+    # invoice, or the invoice was revoked/revised after the session went live.
+    # The money is real, so the attempt keeps its verified evidence (state
+    # ``verified`` + tracking/verified_at) and stays surfaced in the staff
+    # reconciliation/refund queue instead of being silently dropped or marking
+    # the current invoice paid.
+    reconciliation_required = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
     updated_at = Column(
         DateTime,

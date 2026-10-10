@@ -210,8 +210,11 @@ as an untrusted hint — the invoice is settled only after a server-side
   on Telegram alerts. This is why alerts are best-effort and
   kept off the request path (see the retry endpoints above).
 - **Reconciling unknown / stuck payments.** `GET
-  /api/v1/commerce/staff/payments` lists in-flight, aging attempts (bounded;
-  `min_age_seconds` only filters, it never changes state). Resolve one via
+  /api/v1/commerce/staff/payments` lists attempts needing attention (bounded;
+  `min_age_seconds` only filters, it never changes state). The default queue
+  includes both in-flight attempts **and** a genuine, provider-verified payment
+  that could not be settled against its invoice (`reconciliation_required`;
+  filter with `needs_reconciliation=true`). Resolve one via
   `POST /api/v1/commerce/staff/payments/{id}/reconcile` with
   `action=verify` (re-queries the provider; only a provider-confirmed
   non-success **tied to the exact transaction** closes the attempt) or
@@ -219,6 +222,25 @@ as an untrusted hint — the invoice is settled only after a server-side
   reason** and releases the invoice lock). An attempt is never failed on age
   alone, so an invoice is never permanently locked without a human able to
   release it.
+- **Settlement is bound to the invoice revision _and_ amount.** A settlement is
+  applied only when the attempt's `invoice_revision` and `amount_rial` still
+  match the current invoice. A genuine but stale success — an abandoned attempt
+  from an earlier revision, or a session against an invoice that was since
+  revoked/re-priced — never marks the invoice paid and never 500s the gateway
+  callback: the attempt keeps its verified evidence (`state=verified` +
+  tracking/`verified_at`) and is flagged `reconciliation_required` for the
+  staff/refund queue above, and the customer is sent to a neutral
+  `payment=pending` result page.
+- **Client IP / rate-limit trust behind the proxy.** slowapi keys login and
+  callback limits on the client address, which only equals the real client when
+  uvicorn trusts the reverse proxy. nginx is pinned to a static IP
+  (`172.28.0.2`) on the compose network and the backend is started with
+  `--forwarded-allow-ips 172.28.0.2` — **never `*`** — and nginx *overwrites*
+  `X-Forwarded-For` with the true peer. A direct request to the published
+  backend port (whose peer is not the proxy) therefore cannot forge its IP, and
+  two clients behind nginx keep separate rate-limit buckets. The `~* ^/pay/`
+  nginx location disables access logging so the bearer token in the path is
+  never written to the log, while keeping the page's security headers.
 
 ---
 

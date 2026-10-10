@@ -1299,3 +1299,220 @@ def test_staff_list_exposes_min_age_seconds(client, auth_headers, fake_provider)
     r2 = client.get(f"{BASE}/staff/payments", headers=auth_headers)
     assert r2.status_code == 200, r2.text
     assert any(a["id"] == stuck.id for a in r2.json())
+
+
+# ══════════════════════════════════════════════════════════════════════
+# I1/I2 — settlement binding + reconciliation queue
+#
+# A genuine, server-verified payment must never settle an invoice it was not
+# issued for. If the attempt's revision/amount no longer match the *current*
+# invoice, or the invoice is no longer payable (revoked/revised), the callback
+# must NOT 500, must NOT mark the invoice paid, and must preserve the verified
+# evidence (state=verified + tracking/verified_at) in the staff reconciliation
+# queue (``reconciliation_required``) — never silently drop it.
+# ══════════════════════════════════════════════════════════════════════
+
+def _mutate_invoice(invoice_id, *, revision_delta=0, total_delta=0, state=None):
+    """Move an invoice out from under an already-issued attempt."""
+    from app.models import CommerceInvoice
+    from tests.conftest import TestSessionLocal
+
+    db = TestSessionLocal()
+    try:
+        inv = db.get(CommerceInvoice, invoice_id)
+        if revision_delta:
+            inv.revision = (inv.revision or 1) + revision_delta
+        if total_delta:
+            inv.total_toman = inv.total_toman + total_delta
+        if state is not None:
+            inv.state = state
+        db.commit()
+    finally:
+        db.close()
+
+
+def _pin_attempt_identity(attempt_id, *, method=11, tracking="TRK-1"):
+    """Give an attempt the provider-verifiable identity a real callback pins."""
+    from app.models import CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    db = TestSessionLocal()
+    try:
+        a = db.get(CommercePaymentAttempt, attempt_id)
+        a.payment_method = method
+        a.tracking_code = tracking
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        {"revision_delta": 1},                      # revision moved on
+        {"total_delta": 50000},                     # same revision, re-priced
+        {"revision_delta": 1, "total_delta": 50000},
+    ],
+)
+def test_stale_genuine_callback_never_settles_current_invoice(
+    client, auth_headers, fake_provider, mutate
+):
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    _mutate_invoice(invoice_id, **mutate)
+
+    r = client.post(CALLBACK, data=callback_payload(attempt), follow_redirects=False)
+    assert r.status_code in (302, 303), r.text
+    location = r.headers["location"]
+    assert "payment=pending" in location
+    assert "payment=success" not in location
+    assert token not in location
+
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"  # never paid
+        refreshed = (
+            db.query(CommercePaymentAttempt)
+            .filter_by(provider_id=attempt.provider_id)
+            .one()
+        )
+        # Verified evidence preserved and explicitly queued for staff.
+        assert refreshed.state == "verified"
+        assert refreshed.reconciliation_required is True
+        assert refreshed.tracking_code == "TRK-1"
+        assert refreshed.verified_at is not None
+    finally:
+        db.close()
+
+    listing = client.get(
+        f"{BASE}/staff/payments",
+        params={"needs_reconciliation": "true"},
+        headers=auth_headers,
+    )
+    assert listing.status_code == 200, listing.text
+    rows = {row["id"]: row for row in listing.json()}
+    assert attempt.id in rows
+    assert rows[attempt.id]["reconciliation_required"] is True
+    assert rows[attempt.id]["state"] == "verified"
+
+
+def test_revoked_invoice_verified_payment_preserved_and_queued(
+    client, auth_headers, fake_provider
+):
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    # Simulate a revoke that landed after the gateway session went live but
+    # before its callback (attempt still pending/locked).
+    _mutate_invoice(invoice_id, state="revoked")
+
+    r = client.post(CALLBACK, data=callback_payload(attempt), follow_redirects=False)
+    assert r.status_code in (302, 303), r.text
+    assert "payment=pending" in r.headers["location"]
+    assert "payment=success" not in r.headers["location"]
+
+    db = TestSessionLocal()
+    try:
+        inv = db.get(CommerceInvoice, invoice_id)
+        assert inv.state == "revoked"        # never flipped to paid
+        assert inv.order_id is None          # no order fabricated
+        refreshed = (
+            db.query(CommercePaymentAttempt)
+            .filter_by(provider_id=attempt.provider_id)
+            .one()
+        )
+        assert refreshed.state == "verified"
+        assert refreshed.reconciliation_required is True
+        assert refreshed.tracking_code == "TRK-1"
+        assert refreshed.last_error and "not payable" in refreshed.last_error
+    finally:
+        db.close()
+
+    # Must remain visible in the DEFAULT staff queue (not disappear).
+    default_list = client.get(f"{BASE}/staff/payments", headers=auth_headers)
+    assert default_list.status_code == 200, default_list.text
+    assert attempt.id in {row["id"] for row in default_list.json()}
+
+
+def test_staff_reconcile_of_stale_verified_payment_flags_not_settles(
+    client, auth_headers, fake_provider
+):
+    from app.models import CommerceInvoice
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    _pin_attempt_identity(attempt.id)           # callback pinned IPG identity
+    _mutate_invoice(invoice_id, revision_delta=1, total_delta=50000)
+
+    r = client.post(
+        f"{BASE}/staff/payments/{attempt.id}/reconcile",
+        json={"action": "verify", "reason": ""},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["reconciliation_required"] is True
+    assert body["state"] == "verified"
+    assert body["tracking_code"] == "TRK-1"
+
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"  # not paid
+    finally:
+        db.close()
+
+
+def test_callback_never_500s_when_handler_raises(client, fake_provider, monkeypatch):
+    from app.services import commerce as commerce_service
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected settlement error")
+
+    monkeypatch.setattr(commerce_service, "handle_digipay_callback", _boom)
+    r = client.post(
+        CALLBACK,
+        data={
+            "providerId": "p",
+            "amount": "1",
+            "type": "11",
+            "result": "SUCCESS",
+            "trackingCode": "t",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 303), r.text
+    assert "payment=pending" in r.headers["location"]
+
+
+def test_settled_attempt_is_not_flagged_for_reconciliation(
+    client, auth_headers, fake_provider
+):
+    from app.models import CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    r = client.post(CALLBACK, data=callback_payload(attempt), follow_redirects=False)
+    assert "payment=success" in r.headers["location"]
+
+    db = TestSessionLocal()
+    try:
+        refreshed = (
+            db.query(CommercePaymentAttempt)
+            .filter_by(provider_id=attempt.provider_id)
+            .one()
+        )
+        assert refreshed.state == "verified"
+        assert not refreshed.reconciliation_required
+    finally:
+        db.close()
+
+    only = client.get(
+        f"{BASE}/staff/payments",
+        params={"needs_reconciliation": "true"},
+        headers=auth_headers,
+    )
+    assert only.status_code == 200, only.text
+    assert attempt.id not in {row["id"] for row in only.json()}

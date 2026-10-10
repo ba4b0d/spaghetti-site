@@ -18,6 +18,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -827,6 +828,19 @@ class CommerceGatewayUnavailableError(Exception):
     """Payment provider is not configured on this deployment (HTTP 503)."""
 
 
+class CommerceReconciliationRequiredError(CommerceStateError):
+    """A genuine server-verified payment could not be settled (needs staff).
+
+    Raised by ``settle_verified_payment`` when the provider really confirmed a
+    payment but it cannot be applied to the current invoice — the attempt's
+    ``invoice_revision``/``amount_rial`` no longer match, or the invoice was
+    revoked/revised while the gateway session was live. The attempt keeps its
+    verified evidence and is queued for staff reconciliation/refund; callers
+    must never treat this as a settlement failure that unlocks the attempt,
+    marks the invoice paid, or 500s the gateway callback.
+    """
+
+
 def _short(value, limit: int = 300) -> str:
     return str(value)[:limit]
 
@@ -992,6 +1006,53 @@ def _create_legacy_order(db: Session, invoice: CommerceInvoice) -> Order:
     return order
 
 
+def _expected_amount_rial(invoice: CommerceInvoice) -> int | None:
+    """The invoice's current payable amount in Rial, or None if unpayable."""
+    try:
+        return toman_to_rial(invoice.total_toman)
+    except CommerceStateError:
+        return None
+
+
+def _attempt_binds_invoice(attempt: CommercePaymentAttempt, invoice: CommerceInvoice) -> bool:
+    """True only when the attempt was issued for the invoice's *current* state.
+
+    An attempt is bound to the invoice only if it was created against the same
+    ``revision`` AND for the invoice's current total. This is the guard that
+    stops a late callback for an abandoned old attempt from settling a
+    re-approved, re-priced invoice.
+    """
+    expected = _expected_amount_rial(invoice)
+    if expected is None:
+        return False
+    return (
+        attempt.invoice_revision == invoice.revision
+        and attempt.amount_rial == expected
+    )
+
+
+def _mark_verified_needs_reconciliation(
+    db: Session,
+    attempt: CommercePaymentAttempt,
+    tracking_code: str | None,
+    reason: str,
+) -> None:
+    """Preserve a genuine verified payment for staff, without settling it.
+
+    The attempt keeps terminal ``verified`` state (so the partial-unique index
+    releases and re-payment is not blocked) plus its tracking/verified evidence,
+    and is flagged ``reconciliation_required`` so it stays visible in the staff
+    payment queue even though it is no longer active.
+    """
+    attempt.state = "verified"
+    attempt.tracking_code = attempt.tracking_code or (tracking_code or None)
+    attempt.verified_at = attempt.verified_at or _now()
+    attempt.reconciliation_required = True
+    attempt.last_error = _short(reason)
+    db.commit()
+    db.refresh(attempt)
+
+
 def settle_verified_payment(
     db: Session, attempt: CommercePaymentAttempt, *, tracking_code: str,
     background_tasks=None,
@@ -1001,10 +1062,30 @@ def settle_verified_payment(
     Safe under replay/concurrency: the ``approved → paid`` transition is claimed
     with a single conditional UPDATE, so only the first writer creates the
     legacy order. Later callers see ``state == 'paid'`` and no-op.
+
+    Before settling, the attempt is bound to the invoice's *current* revision
+    and amount. A genuine but stale/foreign success (an abandoned attempt from
+    an earlier revision, or a session against an invoice that was since
+    revoked/revised) never settles: it is flagged for staff reconciliation and
+    ``CommerceReconciliationRequiredError`` is raised.
     """
     invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
     if invoice is None:
         raise CommerceNotFoundError("فاکتور یافت نشد")
+
+    # Bind BEFORE any settlement: never apply a payment to a differently-priced
+    # or differently-revised invoice. Preserve the verified evidence and hand it
+    # to staff reconciliation instead of marking the invoice paid.
+    if not _attempt_binds_invoice(attempt, invoice):
+        _mark_verified_needs_reconciliation(
+            db, attempt, tracking_code,
+            "settle blocked: attempt does not match the current invoice "
+            f"(attempt revision={attempt.invoice_revision} amount_rial={attempt.amount_rial}, "
+            f"invoice revision={invoice.revision} total_rial={_expected_amount_rial(invoice)})",
+        )
+        raise CommerceReconciliationRequiredError(
+            "پرداخت تأییدشده با نسخه فعلی فاکتور مطابقت ندارد؛ نیازمند بررسی دستی"
+        )
 
     if invoice.state == "paid":
         # Already settled (replay, or a second attempt racing the first).
@@ -1025,13 +1106,25 @@ def settle_verified_payment(
     if claimed == 0:
         db.rollback()
         invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
-        if invoice is None or invoice.state != "paid":
-            raise CommerceStateError("وضعیت فاکتور برای تسویه نامعتبر است")
-        attempt.state = "verified"
-        attempt.tracking_code = attempt.tracking_code or tracking_code
-        attempt.verified_at = attempt.verified_at or _now()
-        db.commit()
-        return attempt
+        if invoice is None:
+            raise CommerceNotFoundError("فاکتور یافت نشد")
+        if invoice.state == "paid":
+            attempt.state = "verified"
+            attempt.tracking_code = attempt.tracking_code or tracking_code
+            attempt.verified_at = attempt.verified_at or _now()
+            db.commit()
+            return attempt
+        # Provider-confirmed success, but the invoice is no longer payable
+        # (revoked, or revised back to draft). Never mark it paid and never let
+        # the callback 500: keep the verified evidence, surface it to staff.
+        _mark_verified_needs_reconciliation(
+            db, attempt, tracking_code,
+            f"provider verified but invoice not payable (state={invoice.state}); "
+            "manual refund/reconciliation required",
+        )
+        raise CommerceReconciliationRequiredError(
+            "پرداخت تأییدشده روی فاکتور غیرقابل‌پرداخت؛ نیازمند بررسی دستی"
+        )
 
     db.expire_all()
     invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
@@ -1291,9 +1384,16 @@ def handle_digipay_callback(
     if _verify_confirms(verified, attempt, tracking_code=tracking):
         # Confirmed authoritative success: pin the confirmed identity and settle.
         attempt.payment_method = cb_type
-        settle_verified_payment(
-            db, attempt, tracking_code=tracking, background_tasks=background_tasks
-        )
+        try:
+            settle_verified_payment(
+                db, attempt, tracking_code=tracking, background_tasks=background_tasks
+            )
+        except CommerceReconciliationRequiredError:
+            # The provider genuinely confirmed payment, but it can no longer be
+            # settled against the current invoice (its revision/amount changed,
+            # or the invoice was revoked/revised). The attempt kept its verified
+            # evidence and is queued for staff; never 500 and never claim paid.
+            return "pending"
         return "success"
     # Any non-confirming outcome — including a provider non-success for a merely
     # callback-supplied tracking code, which may be forged — must never terminally
@@ -1328,6 +1428,10 @@ def serialize_staff_payment_attempt(attempt: CommercePaymentAttempt) -> dict:
         "tracking_code": attempt.tracking_code,
         "has_redirect": bool(attempt.redirect_url),
         "last_error": attempt.last_error,
+        # A genuine provider-verified payment that could not be settled against
+        # its invoice is preserved with this flag set and shown in the queue.
+        "reconciliation_required": bool(attempt.reconciliation_required),
+        "verified_at": attempt.verified_at.isoformat() if attempt.verified_at else None,
         "created_at": attempt.created_at.isoformat() if attempt.created_at else None,
         "updated_at": attempt.updated_at.isoformat() if attempt.updated_at else None,
     }
@@ -1338,23 +1442,35 @@ def list_stuck_payment_attempts(
     *,
     state: str | None = None,
     min_age_seconds: int | None = None,
+    needs_reconciliation: bool | None = None,
     limit: int = DEFAULT_LIST_LIMIT,
     offset: int = 0,
 ) -> list[CommercePaymentAttempt]:
-    """Bounded list of in-flight attempts needing staff attention.
+    """Bounded list of attempts needing staff attention.
 
-    There is deliberately **no** time-based auto-fail: aging an attempt only
-    moves it up this queue, it never changes its state.
+    The default queue contains everything still requiring a human decision:
+    in-flight attempts (``ACTIVE_ATTEMPT_STATES``) **and** provider-verified
+    payments that could not be settled (``reconciliation_required``). The
+    latter would otherwise disappear once their state became terminal. There is
+    deliberately **no** time-based auto-fail: aging an attempt only moves it up
+    this queue, it never changes its state.
     """
     limit = max(1, min(int(limit), MAX_LIST_LIMIT))
     offset = max(0, int(offset))
-    query = db.query(CommercePaymentAttempt).filter(
-        CommercePaymentAttempt.state.in_(ACTIVE_ATTEMPT_STATES)
-    )
+    query = db.query(CommercePaymentAttempt)
     if state:
         if state not in ACTIVE_ATTEMPT_STATES:
             raise CommerceValidationError("وضعیت تراکنش نامعتبر است")
         query = query.filter(CommercePaymentAttempt.state == state)
+    elif needs_reconciliation:
+        query = query.filter(CommercePaymentAttempt.reconciliation_required.is_(True))
+    else:
+        query = query.filter(
+            or_(
+                CommercePaymentAttempt.state.in_(ACTIVE_ATTEMPT_STATES),
+                CommercePaymentAttempt.reconciliation_required.is_(True),
+            )
+        )
     if min_age_seconds is not None:
         cutoff = _now() - timedelta(seconds=max(0, int(min_age_seconds)))
         query = query.filter(CommercePaymentAttempt.updated_at < cutoff)
@@ -1444,9 +1560,14 @@ def reconcile_payment_attempt(
         db.refresh(attempt)
         return attempt
     if _verify_confirms(verified, attempt, tracking_code=tracking):
-        settle_verified_payment(
-            db, attempt, tracking_code=tracking, background_tasks=background_tasks
-        )
+        try:
+            settle_verified_payment(
+                db, attempt, tracking_code=tracking, background_tasks=background_tasks
+            )
+        except CommerceReconciliationRequiredError:
+            # Already flagged for staff (verified evidence preserved); the queue
+            # surfaces it, so just return the refreshed attempt.
+            db.refresh(attempt)
         return attempt
 
     if _verify_reports_authoritative_non_success(verified, attempt, tracking_code=tracking):

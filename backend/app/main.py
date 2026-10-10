@@ -231,6 +231,19 @@ async def lifespan(app: FastAPI):
                         text("ALTER TABLE commerce_payment_attempts ADD COLUMN payment_method INTEGER")
                     )
                 print("Added commerce_payment_attempts.payment_method column.")
+            # Task 3 fix wave: a provider-verified payment that could not settle
+            # against the current invoice keeps its evidence and is surfaced to
+            # staff via this flag (see settle_verified_payment).
+            if "reconciliation_required" not in attempt_cols:
+                print("Adding commerce_payment_attempts.reconciliation_required column...")
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE commerce_payment_attempts "
+                            "ADD COLUMN reconciliation_required BOOLEAN NOT NULL DEFAULT 0"
+                        )
+                    )
+                print("Added commerce_payment_attempts.reconciliation_required column.")
 
         # Migration: products.created_at
         product_cols = {c["name"] for c in inspector.get_columns("products")}

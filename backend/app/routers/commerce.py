@@ -603,6 +603,7 @@ class PaymentReconcileRequest(BaseModel):
 def list_staff_payments(
     state: str | None = Query(default=None, max_length=20),
     min_age_seconds: int | None = Query(default=None, ge=0),
+    needs_reconciliation: bool | None = Query(default=None),
     limit: int = Query(
         default=commerce_service.DEFAULT_LIST_LIMIT,
         ge=1,
@@ -612,17 +613,20 @@ def list_staff_payments(
     user=Depends(require_staff_role),
     db: Session = Depends(get_db),
 ):
-    """Staff — in-flight/stuck payment attempts needing attention (bounded).
+    """Staff — attempts needing attention (bounded).
 
-    Read-only: listing never resolves an attempt, it only surfaces the ones
-    that are no longer progressing so a human can reconcile them. Aging
-    (``min_age_seconds``) only filters/re-orders; it never changes state.
+    Read-only: listing never resolves an attempt. By default the queue surfaces
+    both in-flight attempts and provider-verified payments that could not be
+    settled (``reconciliation_required``); pass ``needs_reconciliation=true`` to
+    show only the latter. Aging (``min_age_seconds``) only filters/re-orders; it
+    never changes state.
     """
     try:
         rows = commerce_service.list_stuck_payment_attempts(
             db,
             state=state,
             min_age_seconds=min_age_seconds,
+            needs_reconciliation=needs_reconciliation,
             limit=limit,
             offset=offset,
         )
