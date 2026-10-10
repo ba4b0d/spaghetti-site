@@ -741,7 +741,27 @@ def serialize_public_invoice(invoice: CommerceInvoice) -> dict:
 
 TOMAN_TO_RIAL = 10
 PAYMENT_PROVIDER_DIGIPAY = "digipay"
+# UPG ticket type requested at initiation (docs: 11 = all UPG features).
 DIGIPAY_TICKET_TYPE = 11
+# Payment methods reported by the DigiPay callback ``type`` and echoed to
+# ``/purchases/verify?type=`` (docs table): IPG=0, Wallet=11, Credit=5,
+# BNPL=13, CreditCard=24. v1 enables only IPG/Wallet — credit/BNPL additionally
+# need a ``basketDetailsDto`` (+ ``/purchases/deliver`` after fulfillment), so
+# they are *rejected safely* and never verified here.
+PAYMENT_METHOD_IPG = 0
+PAYMENT_METHOD_WALLET = 11
+PAYMENT_METHOD_CREDIT = 5
+PAYMENT_METHOD_BNPL = 13
+PAYMENT_METHOD_CREDIT_CARD = 24
+ALLOWED_PAYMENT_METHODS = (PAYMENT_METHOD_IPG, PAYMENT_METHOD_WALLET)
+REJECTED_PAYMENT_METHODS = (
+    PAYMENT_METHOD_CREDIT,
+    PAYMENT_METHOD_BNPL,
+    PAYMENT_METHOD_CREDIT_CARD,
+)
+# Documented verify ``result.status`` values.
+DIGIPAY_STATUS_SUCCESS = 0
+DIGIPAY_STATUS_PENDING = 9011  # accepted but not settled yet — keep unknown
 ACTIVE_ATTEMPT_STATES = ("initiating", "pending", "unknown")
 PROVIDER_ID_PREFIX = "INV"
 # Public, non-secret confirmation page. The raw bearer token is never persisted,
@@ -1012,18 +1032,29 @@ def _callback_result_is_failure(result_value) -> bool:
 
 
 def _verify_confirms(verified: dict, attempt: CommercePaymentAttempt) -> bool:
-    """Strict server-side confirmation: status 0 and identity/amount match."""
+    """Strict server-side confirmation against the documented verify payload.
+
+    Documented shape (docs "UPG" → verify)::
+
+        {"result": {"status": 0, ...}, "trackingCode": ..., "providerId": ...,
+         "amount": ..., "paymentGateway": ...}
+
+    The success flag is ``result.status``; the identity/amount fields are
+    **top-level**. Reading ``status``/``amount`` off the top level (or the
+    identity fields out of ``result``) is the earlier bug that made every real
+    verification fail.
+    """
     if not isinstance(verified, dict):
         return False
-    if _int_or_none(verified.get("status")) != 0:
+    result = verified.get("result")
+    if not isinstance(result, dict):
+        return False
+    if _int_or_none(result.get("status")) != DIGIPAY_STATUS_SUCCESS:
         return False
     if _int_or_none(verified.get("amount")) != attempt.amount_rial:
         return False
     provider_id = verified.get("providerId") or verified.get("provider_id")
     if provider_id != attempt.provider_id:
-        return False
-    vtype = _int_or_none(verified.get("type"))
-    if vtype is not None and vtype != attempt.type:
         return False
     return True
 
@@ -1042,7 +1073,10 @@ def handle_digipay_callback(
 
     Returns ``success`` | ``failed`` | ``pending``. The callback is treated as a
     hint only: the invoice is settled solely when a server-to-server verify
-    confirms ``status == 0`` with a matching providerId, amount and type.
+    confirms ``result.status == 0`` with a matching top-level providerId/amount.
+    The callback ``type`` is the method actually used (IPG=0 / Wallet=11) and is
+    the value echoed to ``/purchases/verify``; a credit/BNPL callback is refused
+    before any verify call.
     """
     attempt = find_payment_attempt_by_provider_id(db, provider_id)
     if attempt is None:
@@ -1056,35 +1090,201 @@ def handle_digipay_callback(
             attempt.last_error = _short(reason)
             db.commit()
 
+    def _hold(reason) -> None:
+        # Never claim a definite failure without a provider-confirmed outcome;
+        # keep the attempt open for staff reconciliation instead.
+        if attempt.state in ACTIVE_ATTEMPT_STATES:
+            attempt.state = "unknown"
+            attempt.last_error = _short(reason)
+            db.commit()
+
     if _int_or_none(amount) != attempt.amount_rial:
         _fail("callback amount mismatch")
         return "failed"
-    if _int_or_none(type_value) != attempt.type:
-        _fail("callback type mismatch")
+
+    # ``type`` is the method actually used, NOT the UPG ticket type (11).
+    cb_type = _int_or_none(type_value)
+    if cb_type is None:
+        _hold("callback missing/invalid type")
         return "failed"
-    if not (tracking_code or "").strip():
-        _fail("callback missing trackingCode")
+    if cb_type not in ALLOWED_PAYMENT_METHODS:
+        # Credit/BNPL/Card are disabled in v1: refuse without verifying. DigiPay
+        # auto-reverses an unverified purchase, so no money is captured.
+        _fail(f"unsupported payment method (type={cb_type})")
         return "failed"
+
+    tracking = (tracking_code or "").strip()
+    if not tracking:
+        _hold("callback missing trackingCode")
+        return "failed"
+
+    # Persist the callback-confirmed method + tracking code BEFORE the network
+    # call, so a crash/timeout still leaves a reconcile-able attempt.
+    attempt.payment_method = cb_type
+    attempt.tracking_code = tracking
+    db.commit()
+
     if _callback_result_is_failure(result_value):
-        _fail("callback reported failure")
+        # Unverified hint of failure — keep the attempt open for reconciliation.
+        _hold("callback reported failure (unverified)")
         return "failed"
 
     try:
         verified = client.verify(
-            tracking_code=tracking_code.strip(),
+            tracking_code=tracking,
             provider_id=attempt.provider_id,
-            type=attempt.type,
+            type=cb_type,
         )
     except Exception as exc:  # noqa: BLE001 - transient → recoverable unknown
-        if attempt.state in ACTIVE_ATTEMPT_STATES:
-            attempt.state = "unknown"
-            attempt.last_error = _short(exc)
-            db.commit()
+        _hold(exc)
         return "pending"
 
+    result = verified.get("result") if isinstance(verified, dict) else None
+    status = _int_or_none(result.get("status")) if isinstance(result, dict) else None
+    if status == DIGIPAY_STATUS_PENDING:
+        _hold("provider verify still pending (9011)")
+        return "pending"
     if not _verify_confirms(verified, attempt):
         _fail("provider verify did not confirm")
         return "failed"
 
-    settle_verified_payment(db, attempt, tracking_code=tracking_code.strip())
+    settle_verified_payment(db, attempt, tracking_code=tracking)
     return "success"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Reconciliation — staff resolution of stuck/in-flight attempts
+# ══════════════════════════════════════════════════════════════════════
+#
+# A payment that is left in ``initiating``/``pending``/``unknown`` can outlive
+# its natural lifetime (customer never finished, callback lost, verify timeout).
+# The rules below intentionally never *auto-fail* such an attempt on age alone:
+# a definite failure requires either a provider-confirmed non-success or an
+# explicit staff ``abandon``. Until then the attempt stays open and visible in
+# the staff queue, so an invoice is never permanently locked without a human
+# able to release it.
+
+def serialize_staff_payment_attempt(attempt: CommercePaymentAttempt) -> dict:
+    """Staff view of one attempt. Exposes no credential, token or redirect URL."""
+    return {
+        "id": attempt.id,
+        "invoice_id": attempt.invoice_id,
+        "provider": attempt.provider,
+        "state": attempt.state,
+        "provider_id": attempt.provider_id,
+        "amount_rial": attempt.amount_rial,
+        "type": attempt.type,
+        "payment_method": attempt.payment_method,
+        "tracking_code": attempt.tracking_code,
+        "has_redirect": bool(attempt.redirect_url),
+        "last_error": attempt.last_error,
+        "created_at": attempt.created_at.isoformat() if attempt.created_at else None,
+        "updated_at": attempt.updated_at.isoformat() if attempt.updated_at else None,
+    }
+
+
+def list_stuck_payment_attempts(
+    db: Session,
+    *,
+    state: str | None = None,
+    min_age_seconds: int | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+) -> list[CommercePaymentAttempt]:
+    """Bounded list of in-flight attempts needing staff attention.
+
+    There is deliberately **no** time-based auto-fail: aging an attempt only
+    moves it up this queue, it never changes its state.
+    """
+    limit = max(1, min(int(limit), MAX_LIST_LIMIT))
+    offset = max(0, int(offset))
+    query = db.query(CommercePaymentAttempt).filter(
+        CommercePaymentAttempt.state.in_(ACTIVE_ATTEMPT_STATES)
+    )
+    if state:
+        if state not in ACTIVE_ATTEMPT_STATES:
+            raise CommerceValidationError("وضعیت تراکنش نامعتبر است")
+        query = query.filter(CommercePaymentAttempt.state == state)
+    if min_age_seconds is not None:
+        cutoff = _now() - timedelta(seconds=max(0, int(min_age_seconds)))
+        query = query.filter(CommercePaymentAttempt.updated_at < cutoff)
+    return (
+        query.order_by(CommercePaymentAttempt.updated_at.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+
+def reconcile_payment_attempt(
+    db: Session,
+    attempt: CommercePaymentAttempt | None,
+    client,
+    *,
+    abandon: bool = False,
+    reason: str | None = None,
+) -> CommercePaymentAttempt:
+    """Staff-driven resolution of a stuck attempt; returns the reloaded row.
+
+    Safety rules:
+
+    * A terminal attempt is never touched (idempotent).
+    * ``abandon`` is the only way to close an attempt without a provider query —
+      an explicit, audited staff decision (manual reconciliation).
+    * Otherwise the provider is queried **only when the method is known** (a
+      callback confirmed IPG/Wallet) and a tracking code exists. The method is
+      never guessed from the ticket type: verifying an IPG payment with
+      ``type=11`` would wrongly report failure.
+    * A pending/unknown provider status keeps the attempt open; only a
+      provider-confirmed non-success closes it as ``failed``.
+    """
+    if attempt is None:
+        raise CommerceNotFoundError("تراکنش یافت نشد")
+    if attempt.state not in ACTIVE_ATTEMPT_STATES:
+        return attempt
+
+    if abandon:
+        attempt.state = "failed"
+        attempt.last_error = _short(reason or "بسته‌شده توسط کارمند (تسویه دستی)")
+        db.commit()
+        db.refresh(attempt)
+        return attempt
+
+    method = attempt.payment_method
+    tracking = (attempt.tracking_code or "").strip()
+    if method not in ALLOWED_PAYMENT_METHODS or not tracking:
+        # No provider-verifiable identity yet (e.g. the customer never reached
+        # the gateway). Keep it open for an explicit staff decision.
+        return attempt
+
+    if client is None:
+        raise CommerceGatewayUnavailableError("درگاه پرداخت پیکربندی نشده است")
+
+    try:
+        verified = client.verify(
+            tracking_code=tracking,
+            provider_id=attempt.provider_id,
+            type=method,
+        )
+    except Exception as exc:  # noqa: BLE001 - transient; keep unknown
+        attempt.last_error = _short(exc)
+        db.commit()
+        db.refresh(attempt)
+        return attempt
+
+    result = verified.get("result") if isinstance(verified, dict) else None
+    status = _int_or_none(result.get("status")) if isinstance(result, dict) else None
+    if status == DIGIPAY_STATUS_PENDING:
+        attempt.last_error = _short("provider verify still pending (9011)")
+        db.commit()
+        db.refresh(attempt)
+        return attempt
+    if _verify_confirms(verified, attempt):
+        settle_verified_payment(db, attempt, tracking_code=tracking)
+        return attempt
+
+    attempt.state = "failed"
+    attempt.last_error = _short(f"reconcile: provider status={status}")
+    db.commit()
+    db.refresh(attempt)
+    return attempt

@@ -67,6 +67,29 @@ def make_client(responses, **overrides):
 
 TOKEN_OK = FakeResponse(200, {"access_token": "tok1", "token_type": "bearer", "expires_in": 3600})
 
+# Documented (docs "UPG") response envelopes. Ticket/verify payloads carry their
+# identity fields at the TOP level; only the outcome flag is nested in `result`.
+UAT_REDIRECT = "https://uatweb.mydigipay.info/web-pay/tgs/v2:ab17ec383d654be3b009f9fc45202f80"
+LIVE_REDIRECT = "https://web.mydigipay.com/web-pay/tgs/v2:ab17ec383d654be3b009f9fc45202f80"
+
+
+def doc_ticket_response(*, redirect=UAT_REDIRECT, status=0, ticket="v2:ab17ec383d654be3b009f9fc45202f80"):
+    return FakeResponse(200, {
+        "result": {"title": "SUCCESS" if status == 0 else "ERROR", "status": status, "message": "m", "level": "INFO"},
+        "ticket": ticket,
+        "redirectUrl": redirect,
+    })
+
+
+def doc_verify_response(*, status=0, amount=3120000, provider_id="INV1-R1-abc", tracking_code="T1", payment_gateway=3):
+    return FakeResponse(200, {
+        "result": {"status": status, "message": "m", "level": "INFO"},
+        "trackingCode": tracking_code,
+        "providerId": provider_id,
+        "amount": amount,
+        "paymentGateway": payment_gateway,
+    })
+
 
 # ══════════════════════════════════════════════════════════════════════
 # DigiPay client unit tests
@@ -85,17 +108,19 @@ def test_login_uses_basic_auth_and_password_grant():
     assert call["timeout"] is not None
 
 
-def test_create_ticket_uses_type_11_and_documented_headers():
+def test_create_ticket_reads_top_level_redirect_and_uses_type_11():
     from app.services.digipay import DIGIPAY_TICKET_TYPE
 
-    client = make_client([TOKEN_OK, FakeResponse(200, {"result": {"redirectUrl": "https://pn.mydigipay.com/pay/x"}})])
+    client = make_client([TOKEN_OK, doc_ticket_response()])
     ticket = client.create_ticket(
         amount_rial=3120000,
         mobile="09123456789",
         provider_id="INV1-R1-abc",
         callback_url="https://spaghettiprints.ir/api/v1/commerce/digipay/callback",
     )
-    assert ticket["redirect_url"] == "https://pn.mydigipay.com/pay/x"
+    # C1: the documented redirect lives at the TOP level of the response.
+    assert ticket["redirect_url"] == UAT_REDIRECT
+    assert ticket["ticket"] == "v2:ab17ec383d654be3b009f9fc45202f80"
     call = client._session.calls[1]
     assert "/tickets/business" in call["url"]
     assert call["params"]["type"] == DIGIPAY_TICKET_TYPE == 11
@@ -108,16 +133,38 @@ def test_create_ticket_uses_type_11_and_documented_headers():
     assert call["headers"]["Authorization"] == "Bearer tok1"
 
 
-def test_verify_posts_tracking_and_provider_id():
-    client = make_client([
-        TOKEN_OK,
-        FakeResponse(200, {"result": {"status": 0, "amount": 3120000, "providerId": "INV1-R1-abc", "trackingCode": "T1", "type": 11}}),
-    ])
-    result = client.verify(tracking_code="T1", provider_id="INV1-R1-abc", type=11)
-    assert result["status"] == 0 and result["amount"] == 3120000
+def test_create_ticket_rejects_nested_only_redirect():
+    """The old bug read redirectUrl out of `result`; a real response must not."""
+    from app.services.digipay import DigiPayResponseError
+
+    nested_only = FakeResponse(200, {
+        "result": {"status": 0, "redirectUrl": UAT_REDIRECT},
+        "ticket": "v2:x",
+    })
+    client = make_client([TOKEN_OK, nested_only])
+    with pytest.raises(DigiPayResponseError):
+        client.create_ticket(amount_rial=1000, mobile="09123456789", provider_id="P", callback_url="https://spaghettiprints.ir/cb")
+
+
+def test_create_ticket_rejects_nonzero_result_status():
+    from app.services.digipay import DigiPayResponseError
+
+    client = make_client([TOKEN_OK, doc_ticket_response(status=5, redirect=UAT_REDIRECT)])
+    with pytest.raises(DigiPayResponseError):
+        client.create_ticket(amount_rial=1000, mobile="09123456789", provider_id="P", callback_url="https://spaghettiprints.ir/cb")
+
+
+def test_verify_returns_full_documented_payload():
+    client = make_client([TOKEN_OK, doc_verify_response()])
+    result = client.verify(tracking_code="T1", provider_id="INV1-R1-abc", type=0)
+    # C2: success flag is nested; identity/amount are top-level.
+    assert result["result"]["status"] == 0
+    assert result["amount"] == 3120000
+    assert result["providerId"] == "INV1-R1-abc"
+    assert result["paymentGateway"] == 3
     call = client._session.calls[1]
     assert "/purchases/verify" in call["url"]
-    assert call["params"]["type"] == 11
+    assert call["params"]["type"] == 0          # the method echoed from the callback
     assert call["json"] == {"trackingCode": "T1", "providerId": "INV1-R1-abc"}
 
 
@@ -126,12 +173,12 @@ def test_client_retries_once_after_401_with_fresh_token():
         TOKEN_OK,
         FakeResponse(401, {"error": "expired"}),
         FakeResponse(200, {"access_token": "tok2", "token_type": "bearer", "expires_in": 3600}),
-        FakeResponse(200, {"result": {"redirectUrl": "https://pn.mydigipay.com/pay/y"}}),
+        doc_ticket_response(redirect=UAT_REDIRECT),
     ])
     ticket = client.create_ticket(
         amount_rial=10000, mobile="09123456789", provider_id="P", callback_url="https://spaghettiprints.ir/cb"
     )
-    assert ticket["redirect_url"] == "https://pn.mydigipay.com/pay/y"
+    assert ticket["redirect_url"] == UAT_REDIRECT
     urls = [c["url"] for c in client._session.calls]
     assert sum("oauth/token" in u for u in urls) == 2
     assert client._session.calls[3]["headers"]["Authorization"] == "Bearer tok2"
@@ -140,7 +187,7 @@ def test_client_retries_once_after_401_with_fresh_token():
 def test_client_refuses_non_digipay_redirect_host():
     from app.services.digipay import DigiPayResponseError
 
-    client = make_client([TOKEN_OK, FakeResponse(200, {"result": {"redirectUrl": "https://evil.example/pay/x"}})])
+    client = make_client([TOKEN_OK, doc_ticket_response(redirect="https://evil.example/pay/x")])
     with pytest.raises(DigiPayResponseError):
         client.create_ticket(amount_rial=1000, mobile="09123456789", provider_id="P", callback_url="https://spaghettiprints.ir/cb")
 
@@ -148,9 +195,36 @@ def test_client_refuses_non_digipay_redirect_host():
 def test_client_refuses_http_redirect():
     from app.services.digipay import DigiPayResponseError
 
-    client = make_client([TOKEN_OK, FakeResponse(200, {"result": {"redirectUrl": "http://pn.mydigipay.com/pay/x"}})])
+    client = make_client([TOKEN_OK, doc_ticket_response(redirect="http://uatweb.mydigipay.info/pay/x")])
     with pytest.raises(DigiPayResponseError):
         client.create_ticket(amount_rial=1000, mobile="09123456789", provider_id="P", callback_url="https://spaghettiprints.ir/cb")
+
+
+def test_client_refuses_unlisted_mydigipay_host():
+    """I3: only the documented web-pay host is allowed, not any *.mydigipay.* sibling."""
+    from app.services.digipay import DigiPayResponseError
+
+    client = make_client([TOKEN_OK, doc_ticket_response(redirect="https://pn.mydigipay.com/pay/x")])
+    with pytest.raises(DigiPayResponseError):
+        client.create_ticket(amount_rial=1000, mobile="09123456789", provider_id="P", callback_url="https://spaghettiprints.ir/cb")
+
+
+def test_redirect_allowlist_is_environment_scoped():
+    """A live client accepts only the live web-pay host; UAT only the UAT host."""
+    from app.services.digipay import DigiPayResponseError, DIGIPAY_LIVE_BASE_URL
+
+    live = make_client([TOKEN_OK, doc_ticket_response(redirect=LIVE_REDIRECT)], base_url=DIGIPAY_LIVE_BASE_URL)
+    assert live.create_ticket(amount_rial=1000, mobile="09123456789", provider_id="P", callback_url="https://spaghettiprints.ir/cb")["redirect_url"] == LIVE_REDIRECT
+
+    # A live client must refuse a UAT redirect...
+    live2 = make_client([TOKEN_OK, doc_ticket_response(redirect=UAT_REDIRECT)], base_url=DIGIPAY_LIVE_BASE_URL)
+    with pytest.raises(DigiPayResponseError):
+        live2.create_ticket(amount_rial=1000, mobile="09123456789", provider_id="P2", callback_url="https://spaghettiprints.ir/cb")
+
+    # ...and a UAT client must refuse a live redirect.
+    uat = make_client([TOKEN_OK, doc_ticket_response(redirect=LIVE_REDIRECT)])
+    with pytest.raises(DigiPayResponseError):
+        uat.create_ticket(amount_rial=1000, mobile="09123456789", provider_id="P3", callback_url="https://spaghettiprints.ir/cb")
 
 
 def test_base_url_selection_is_allowlisted(monkeypatch):
@@ -189,12 +263,17 @@ def test_toman_to_rial_is_exact_times_ten():
 # ══════════════════════════════════════════════════════════════════════
 
 class FakeDigiPay:
-    """Records calls; scripts success/failure for ticket + verify."""
+    """Records calls; scripts success/failure for ticket + verify.
 
-    def __init__(self, *, redirect_url="https://pn.mydigipay.com/pay/live", verify_error=None, create_error=None):
+    Returns the documented (docs "UPG") response envelopes so the service layer
+    is exercised against real payload shapes, not a simplified fake.
+    """
+
+    def __init__(self, *, redirect_url=UAT_REDIRECT, verify_error=None, create_error=None, verify_status=0):
         self.redirect_url = redirect_url
         self.verify_error = verify_error
         self.create_error = create_error
+        self.verify_status = verify_status
         self.tickets = {}
         self.verify_calls = []
 
@@ -206,7 +285,11 @@ class FakeDigiPay:
             "mobile": mobile,
             "callback_url": callback_url,
         }
-        return {"redirect_url": self.redirect_url, "provider_id": provider_id}
+        return {
+            "redirect_url": self.redirect_url,
+            "ticket": "v2:fake-ticket",
+            "provider_id": provider_id,
+        }
 
     def verify(self, *, tracking_code, provider_id, type):
         if self.verify_error:
@@ -214,11 +297,11 @@ class FakeDigiPay:
         self.verify_calls.append({"tracking_code": tracking_code, "provider_id": provider_id, "type": type})
         ticket = self.tickets.get(provider_id, {})
         return {
-            "status": 0,
-            "amount": ticket.get("amount_rial"),
-            "providerId": provider_id,
+            "result": {"status": self.verify_status, "message": "m", "level": "INFO"},
             "trackingCode": tracking_code,
-            "type": type,
+            "providerId": provider_id,
+            "amount": ticket.get("amount_rial"),
+            "paymentGateway": 3,
         }
 
 
@@ -452,7 +535,7 @@ def test_callback_duplicate_replay_does_not_double_account(client, auth_headers,
     "override",
     [
         {"amount": "999"},                       # amount mismatch
-        {"type": "5"},                           # type mismatch
+        {"type": "5"},                           # credit (type=5) → unsupported in v1
         {"providerId": "unknown-provider-id"},   # unknown attempt
         {"result": "FAILURE"},                   # provider reports failure
         {"trackingCode": ""},                    # missing tracking code
@@ -480,7 +563,11 @@ def test_callback_verify_status_nonzero_refuses(client, auth_headers, fake_provi
 
     invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
     # Server-side verify says not settled even though the callback claimed success.
-    fake_provider.verify = lambda **kw: {"status": 5, "amount": attempt.amount_rial, "providerId": attempt.provider_id, "type": attempt.type}
+    fake_provider.verify = lambda **kw: {
+        "result": {"status": 5},
+        "amount": attempt.amount_rial,
+        "providerId": attempt.provider_id,
+    }
     r = client.post(CALLBACK, data=callback_payload(attempt), follow_redirects=False)
     assert "payment=success" not in r.headers["location"]
     db = TestSessionLocal()
@@ -495,7 +582,11 @@ def test_callback_verify_amount_mismatch_refuses(client, auth_headers, fake_prov
     from tests.conftest import TestSessionLocal
 
     invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
-    fake_provider.verify = lambda **kw: {"status": 0, "amount": attempt.amount_rial + 1, "providerId": attempt.provider_id, "type": attempt.type}
+    fake_provider.verify = lambda **kw: {
+        "result": {"status": 0},
+        "amount": attempt.amount_rial + 1,
+        "providerId": attempt.provider_id,
+    }
     r = client.post(CALLBACK, data=callback_payload(attempt), follow_redirects=False)
     assert "payment=success" not in r.headers["location"]
     db = TestSessionLocal()
@@ -552,3 +643,136 @@ def test_two_attempts_settle_invoice_exactly_once(client, auth_headers, fake_pro
         assert db.get(CommerceInvoice, invoice_id).order_id == orders[0].id
     finally:
         db.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# I1 — the callback `type` is the method actually used (IPG=0 / Wallet=11)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_callback_ipg_type_is_verified_with_callback_type(client, auth_headers, fake_provider):
+    """An IPG (type=0) callback must verify with type=0, never the ticket's 11."""
+    from app.models import CommercePaymentAttempt, CommerceInvoice
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    r = client.post(CALLBACK, data=callback_payload(attempt, type="0"), follow_redirects=False)
+    assert "payment=success" in r.headers["location"]
+    assert fake_provider.verify_calls[-1]["type"] == 0
+
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "paid"
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "verified"
+        assert row.payment_method == 0   # the method recorded, not the ticket type
+        assert row.type == 11            # UPG ticket type preserved
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("ctype", ["5", "13", "24"])
+def test_callback_rejects_credit_methods_without_verifying(client, auth_headers, fake_provider, ctype):
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    r = client.post(CALLBACK, data=callback_payload(attempt, type=ctype), follow_redirects=False)
+    assert "payment=success" not in r.headers["location"]
+    assert fake_provider.verify_calls == []      # credit/BNPL never verified
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "failed"             # refused safely, lock released
+    finally:
+        db.close()
+
+
+def test_callback_wallet_type_11_verifies_with_11(client, auth_headers, fake_provider):
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    # callback_payload defaults to the attempt's ticket type 11 == Wallet
+    r = client.post(CALLBACK, data=callback_payload(attempt, type="11"), follow_redirects=False)
+    assert "payment=success" in r.headers["location"]
+    assert fake_provider.verify_calls[-1]["type"] == 11
+
+
+# ══════════════════════════════════════════════════════════════════════
+# I2 — bounded staff reconciliation of stuck attempts
+# ══════════════════════════════════════════════════════════════════════
+
+def test_staff_reconcile_after_transient_verify_settles(client, auth_headers, fake_provider):
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from app.services.digipay import DigiPayError
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    fake_provider.verify_error = DigiPayError("timeout")
+    client.post(CALLBACK, data=callback_payload(attempt, type="0"), follow_redirects=False)
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "unknown"        # preserved, NOT failed by timeout
+        assert row.payment_method == 0
+        assert row.tracking_code == "TRK-1"
+    finally:
+        db.close()
+
+    fake_provider.verify_error = None
+    r = client.post(f"{BASE}/staff/payments/{attempt.id}/reconcile", json={"action": "verify"}, headers=auth_headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "verified"
+    assert fake_provider.verify_calls[-1]["type"] == 0   # method, not the ticket type
+
+    db = TestSessionLocal()
+    try:
+        assert db.get(CommerceInvoice, invoice_id).state == "paid"
+    finally:
+        db.close()
+
+
+def test_reconcile_without_callback_never_guesses_method(client, auth_headers, fake_provider):
+    """A pending attempt with no callback must not be verified with type=11."""
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    r = client.post(f"{BASE}/staff/payments/{attempt.id}/reconcile", json={"action": "verify"}, headers=auth_headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "pending"        # held open, never auto-failed
+    assert fake_provider.verify_calls == []      # method unknown → no provider call
+
+
+def test_reconcile_abandon_releases_invoice_lock(client, auth_headers, fake_provider):
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    r = client.post(
+        f"{BASE}/staff/payments/{attempt.id}/reconcile",
+        json={"action": "abandon", "reason": "customer cancelled"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "failed"
+    # The invoice is no longer locked: a fresh attempt can start.
+    assert pay(client, token).status_code == 200
+
+
+def test_staff_list_stuck_attempts_is_bounded_and_auth_gated(client, auth_headers, fake_provider):
+    from app.services.digipay import DigiPayError
+
+    fake_provider.create_error = DigiPayError("network down")
+    invoice_id, token = make_approved(client, auth_headers)
+    assert pay(client, token).status_code in (502, 503)
+    stuck = latest_attempt(invoice_id)
+
+    assert client.get(f"{BASE}/staff/payments").status_code in (401, 403)  # no auth
+    r = client.get(f"{BASE}/staff/payments", headers=auth_headers)
+    assert r.status_code == 200, r.text
+    assert any(a["id"] == stuck.id for a in r.json())
+
+
+def test_reconcile_rejects_unknown_action(client, auth_headers, fake_provider):
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+    r = client.post(f"{BASE}/staff/payments/{attempt.id}/reconcile", json={"action": "nuke"}, headers=auth_headers)
+    assert r.status_code == 422
+
+
+def test_reconcile_missing_attempt_404(client, auth_headers, fake_provider):
+    r = client.post(f"{BASE}/staff/payments/999999/reconcile", json={"action": "abandon"}, headers=auth_headers)
+    assert r.status_code == 404

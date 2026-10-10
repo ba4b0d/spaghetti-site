@@ -534,7 +534,13 @@ class CommercePaymentAttempt(Base):
     provider_id = Column(String(80), nullable=False, unique=True, index=True)
     amount_rial = Column(Integer, nullable=False, default=0)
     invoice_revision = Column(Integer, nullable=False, default=1)
+    # ``type`` is the DigiPay *ticket* type requested at initiation (UPG = 11).
     type = Column(Integer, nullable=False, default=DIGIPAY_TICKET_TYPE)
+    # The payment method the customer actually chose, confirmed by the DigiPay
+    # callback ``type`` (docs: IPG=0, Wallet=11, Credit=5, BNPL=13, Card=24).
+    # NULL until a callback arrives; v1 verifies IPG/Wallet only, so a verify
+    # request must never reuse the ticket type in place of this value.
+    payment_method = Column(Integer, nullable=True)
     tracking_code = Column(String(80), nullable=True)
     redirect_url = Column(String(1000), nullable=True)
     last_error = Column(String(300), nullable=True)

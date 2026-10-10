@@ -217,6 +217,21 @@ async def lifespan(app: FastAPI):
                 print("Added orders.ready_by column.")
             db.commit()
 
+        # Migration: commerce_payment_attempts.payment_method (Task 3 — the
+        # callback `type` records the method actually used; distinct from the
+        # UPG ticket `type`). Existing installs predate the column.
+        if "commerce_payment_attempts" in inspect(engine).get_table_names():
+            attempt_cols = {
+                c["name"] for c in inspect(engine).get_columns("commerce_payment_attempts")
+            }
+            if "payment_method" not in attempt_cols:
+                print("Adding commerce_payment_attempts.payment_method column...")
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("ALTER TABLE commerce_payment_attempts ADD COLUMN payment_method INTEGER")
+                    )
+                print("Added commerce_payment_attempts.payment_method column.")
+
         # Migration: products.created_at
         product_cols = {c["name"] for c in inspector.get_columns("products")}
         if "created_at" not in product_cols:

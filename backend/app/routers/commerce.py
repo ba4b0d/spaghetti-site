@@ -490,3 +490,86 @@ def pay_invoice(
         "amount_rial": attempt.amount_rial,
         "redirect_url": attempt.redirect_url,
     }
+
+
+# ── Task 3: staff payment reconciliation ─────────────────────────────
+
+class PaymentReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # "verify" re-queries the provider (only when the callback pinned a method);
+    # "abandon" is an explicit staff decision to release a stuck attempt.
+    action: str = Field(default="verify", pattern="^(verify|abandon)$")
+    reason: str = Field(default="", max_length=200)
+
+
+@router.get("/staff/payments")
+def list_staff_payments(
+    state: str | None = Query(default=None, max_length=20),
+    limit: int = Query(
+        default=commerce_service.DEFAULT_LIST_LIMIT,
+        ge=1,
+        le=commerce_service.MAX_LIST_LIMIT,
+    ),
+    offset: int = Query(default=0, ge=0),
+    user=Depends(require_staff_role),
+    db: Session = Depends(get_db),
+):
+    """Staff — in-flight/stuck payment attempts needing attention (bounded).
+
+    Read-only: listing never resolves an attempt, it only surfaces the ones
+    that are no longer progressing so a human can reconcile them.
+    """
+    try:
+        rows = commerce_service.list_stuck_payment_attempts(
+            db, state=state, limit=limit, offset=offset
+        )
+    except CommerceValidationError as exc:
+        raise _validation_error(exc)
+    return [commerce_service.serialize_staff_payment_attempt(r) for r in rows]
+
+
+@router.post("/staff/payments/{attempt_id}/reconcile")
+def reconcile_staff_payment(
+    attempt_id: int,
+    body: PaymentReconcileRequest,
+    user=Depends(require_staff_role),
+    db: Session = Depends(get_db),
+    client=Depends(digipay.client_dependency),
+):
+    """Staff — resolve a stuck attempt (re-query the provider, or abandon it).
+
+    A payment is never failed on age alone: ``verify`` fails only on a
+    provider-confirmed non-success, and ``abandon`` is an explicit, audited
+    staff decision that releases the invoice lock.
+    """
+    from app.models import CommercePaymentAttempt
+
+    attempt = (
+        db.query(CommercePaymentAttempt)
+        .filter(CommercePaymentAttempt.id == attempt_id)
+        .first()
+    )
+    if attempt is None:
+        raise HTTPException(status_code=404, detail="تراکنش یافت نشد")
+
+    if client is None and body.action == "verify":
+        try:
+            client = digipay.get_client()
+        except digipay.DigiPayConfigError:
+            # Unconfigured gateway: reconcile() keeps the attempt open rather
+            # than guessing an outcome.
+            client = None
+
+    try:
+        resolved = commerce_service.reconcile_payment_attempt(
+            db, attempt, client, abandon=(body.action == "abandon"), reason=body.reason
+        )
+    except commerce_service.CommerceGatewayUnavailableError as exc:
+        raise _validation_error(exc)
+
+    log_user(
+        user, db, "reconcile", "commerce_payment_attempt", resolved.id,
+        f"تسویه دستی تراکنش #{resolved.id} → {resolved.state}",
+    )
+    return commerce_service.serialize_staff_payment_attempt(resolved)

@@ -4,7 +4,12 @@ Only the documented **IPG / Wallet direct-payment** flow is implemented in v1:
 
     login   ``POST {base}/oauth/token``             password grant + HTTP Basic
     ticket  ``POST {base}/tickets/business?type=11`` amount/cellNumber/providerId/callbackUrl
-    verify  ``POST {base}/purchases/verify?type=11`` trackingCode/providerId
+    verify  ``POST {base}/purchases/verify?type=0|11`` trackingCode/providerId
+
+``ticket``/``redirectUrl`` come back **top-level** (only ``result.status`` signals
+success) and the verify response carries top-level ``amount``/``providerId``.
+The verify ``type`` is the method the customer actually used — IPG (0) or
+Wallet (11) — as reported by the callback, never the UPG ticket type.
 
 Credit / BNPL are deliberately **not** enabled here: they additionally require a
 ``basketDetailsDto`` on the ticket request and a post-fulfillment
@@ -26,16 +31,26 @@ from urllib.parse import urlsplit
 
 import requests
 
-# Documented UPG hosts. Both the API base URL and any browser redirect must live
-# under one of these suffixes.
+# ── Documented hosts ─────────────────────────────────────────────────
+# API base URLs (docs "UPG" → Authentication). An env override may only
+# point at one of these exact hosts.
 DIGIPAY_LIVE_BASE_URL = "https://api.mydigipay.com/digipay/api"
 DIGIPAY_UAT_BASE_URL = "https://uat.mydigipay.info/digipay/api"
-ALLOWED_HOST_SUFFIXES = (".mydigipay.com", ".mydigipay.info")
-ALLOWED_HOSTS = ("mydigipay.com", "mydigipay.info")
+LIVE_API_HOSTS = ("api.mydigipay.com",)
+UAT_API_HOSTS = ("uat.mydigipay.info",)
+ALLOWED_API_HOSTS = LIVE_API_HOSTS + UAT_API_HOSTS
+
+# Browser redirect (web-pay) hosts. The docs UAT example redirects to
+# ``https://uatweb.mydigipay.info/web-pay/tgs/<ticket>``; the live web-pay app
+# is ``web.mydigipay.com``. Kept as an exact allowlist (never a wildcard
+# ``*.mydigipay.com`` suffix), so a typo-squatted sibling domain cannot be
+# injected into the customer's browser.
+LIVE_REDIRECT_HOSTS = ("web.mydigipay.com",)
+UAT_REDIRECT_HOSTS = ("uatweb.mydigipay.info",)
 
 AGENT_HEADER = "WEB"
 DIGIPAY_VERSION = "2022-02-02"
-DIGIPAY_TICKET_TYPE = 11  # IPG / Wallet direct payment
+DIGIPAY_TICKET_TYPE = 11  # UPG ticket type (IPG / Wallet direct payment)
 TOKEN_PATH = "/oauth/token"
 TICKET_PATH = "/tickets/business"
 VERIFY_PATH = "/purchases/verify"
@@ -59,17 +74,49 @@ class DigiPayResponseError(DigiPayError):
     """Provider answered, but the payload was malformed or unsafe."""
 
 
-def _host_allowed(url: str) -> bool:
+def _int_or_none(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _result_status(payload) -> int | None:
+    """Read ``result.status`` from a documented DigiPay envelope (or None)."""
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if isinstance(result, dict):
+        return _int_or_none(result.get("status"))
+    return None
+
+
+def _host_in(url: str, hosts) -> bool:
     parsed = urlsplit(url or "")
     if parsed.scheme != "https" or not parsed.hostname:
         return False
-    host = parsed.hostname.lower()
-    return host in ALLOWED_HOSTS or host.endswith(ALLOWED_HOST_SUFFIXES)
+    if parsed.username or parsed.password:
+        return False
+    return parsed.hostname.lower() in hosts
 
 
-def assert_safe_redirect(url: str) -> str:
-    """Only a DigiPay-controlled HTTPS URL may reach the customer's browser."""
-    if not _host_allowed(url):
+def _api_host_allowed(url: str) -> bool:
+    return _host_in(url, ALLOWED_API_HOSTS)
+
+
+def is_uat_base_url(base_url: str) -> bool:
+    return _host_in(base_url, UAT_API_HOSTS)
+
+
+def assert_safe_redirect(url: str, *, hosts) -> str:
+    """Only a documented DigiPay web-pay HTTPS URL may reach the customer.
+
+    ``hosts`` is the environment-specific redirect allowlist so a live client
+    never hands the browser a UAT host (or vice versa).
+    """
+    if not _host_in(url, hosts):
         raise DigiPayResponseError("redirectUrl is not an allowed DigiPay HTTPS URL")
     return url
 
@@ -78,7 +125,7 @@ def resolve_base_url() -> str:
     """Explicit env selection; an arbitrary override host is refused."""
     override = (os.getenv("DIGIPAY_BASE_URL") or "").strip().rstrip("/")
     if override:
-        if not _host_allowed(override):
+        if not _api_host_allowed(override):
             raise DigiPayConfigError(
                 "DIGIPAY_BASE_URL must be an allowed DigiPay HTTPS base URL"
             )
@@ -142,9 +189,14 @@ class DigiPayClient:
         self._username = username
         self._password = password
         resolved = (base_url or resolve_base_url()).rstrip("/")
-        if not _host_allowed(resolved):
+        if not _api_host_allowed(resolved):
             raise DigiPayConfigError("DigiPay base URL is not an allowed host")
         self._base_url = resolved
+        # Environment-scoped redirect allowlist: a UAT client only accepts the
+        # documented UAT web-pay host and a live client only the live one.
+        self._redirect_hosts = (
+            UAT_REDIRECT_HOSTS if is_uat_base_url(resolved) else LIVE_REDIRECT_HOSTS
+        )
         self._timeout = timeout
         self._session = session if session is not None else requests.Session()
         self._token: str | None = None
@@ -224,7 +276,17 @@ class DigiPayClient:
     def create_ticket(
         self, *, amount_rial: int, mobile: str, provider_id: str, callback_url: str
     ) -> dict:
-        """Request a business ticket and return the validated ``redirect_url``."""
+        """Request a business ticket and return the validated ``redirect_url``.
+
+        Documented response (docs "UPG" → ticket):
+
+            {"result": {"status": 0, ...}, "ticket": "v2:...",
+             "redirectUrl": "https://<web-pay>/web-pay/tgs/v2:..."}
+
+        ``ticket`` and ``redirectUrl`` are **top-level**; only the outcome flag
+        lives inside ``result``. (Reading the redirect out of ``result`` — the
+        earlier bug — always failed for a real gateway response.)
+        """
         if isinstance(amount_rial, bool) or not isinstance(amount_rial, int) or amount_rial <= 0:
             raise DigiPayError("amount_rial must be a positive integer")
         payload = self._authed_post(
@@ -237,25 +299,44 @@ class DigiPayClient:
                 "callbackUrl": callback_url,
             },
         )
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            result = payload
-        redirect = result.get("redirectUrl") or result.get("redirect_url")
+        status = _result_status(payload)
+        if status != 0:
+            raise DigiPayResponseError(
+                f"DigiPay ticket was not accepted (result.status={status})"
+            )
+        redirect = payload.get("redirectUrl") or payload.get("redirect_url")
         if not redirect:
             raise DigiPayResponseError("DigiPay ticket response missing redirectUrl")
-        return {"redirect_url": assert_safe_redirect(str(redirect)), "provider_id": provider_id}
+        return {
+            "redirect_url": assert_safe_redirect(
+                str(redirect), hosts=self._redirect_hosts
+            ),
+            "ticket": payload.get("ticket"),
+            "provider_id": provider_id,
+        }
 
     def verify(self, *, tracking_code: str, provider_id: str, type: int) -> dict:
-        """Server-to-server verification; returns the provider ``result`` object."""
+        """Server-to-server verification; returns the full documented payload.
+
+        Documented response (docs "UPG" → verify)::
+
+            {"result": {"status": 0, "message": ..., "level": "INFO"},
+             "trackingCode": "...", "providerId": "...", "amount": 200000,
+             "paymentGateway": 3}
+
+        The identity/amount fields are **top-level** and must be preserved for
+        the caller to match against its stored attempt; the success flag is
+        ``result.status``. ``type`` is the method the customer actually used
+        (IPG=0 / Wallet=11), echoed from the callback.
+        """
         payload = self._authed_post(
             VERIFY_PATH,
             params={"type": type},
             json_body={"trackingCode": tracking_code, "providerId": provider_id},
         )
-        result = payload.get("result")
-        if not isinstance(result, dict):
+        if not isinstance(payload.get("result"), dict):
             raise DigiPayResponseError("DigiPay verify response missing result")
-        return result
+        return payload
 
 
 def get_client() -> DigiPayClient:
