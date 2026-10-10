@@ -296,13 +296,20 @@ class FakeDigiPay:
             raise self.verify_error
         self.verify_calls.append({"tracking_code": tracking_code, "provider_id": provider_id, "type": type})
         ticket = self.tickets.get(provider_id, {})
-        return {
+        payload = {
             "result": {"status": self.verify_status, "message": "m", "level": "INFO"},
-            "trackingCode": tracking_code,
             "providerId": provider_id,
             "amount": ticket.get("amount_rial"),
             "paymentGateway": 3,
         }
+        # A real gateway echoes the ``trackingCode`` only for the transaction it
+        # actually holds. For a ticket it recognises it still echoes
+        # providerId/amount (which is exactly why those two are *not* on their
+        # own evidence of a failure), but a terminal non-success / "not found"
+        # reply carries no tracking echo.
+        if self.verify_status == 0:
+            payload["trackingCode"] = tracking_code
+        return payload
 
 
 @pytest.fixture()
@@ -1156,6 +1163,87 @@ def test_reconcile_non_authoritative_non_success_keeps_lock(client, auth_headers
         assert db.get(CommerceInvoice, invoice_id).state == "approved"   # lock held
         row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
         assert row.state == "unknown"
+    finally:
+        db.close()
+
+
+def test_forged_first_staff_reconcile_echoing_provider_keeps_lock(client, auth_headers, fake_provider):
+    """Staff reconcile must not unlock a forged-first attempt on a providerId/amount echo.
+
+    ``providerId`` and ``amount`` are visible in the gateway redirect, so a
+    forged, self-consistent callback can pin a bogus tracking code *first*. A
+    later staff reconciliation then asks the provider about that bogus tracking;
+    the gateway (default fake reply) answers with a terminal **non-success**
+    while still echoing our ``providerId`` and ``amount`` — but with no matching
+    tracking echo. That is not a proven failure of OUR ticket, so the attempt
+    must stay open (invoice lock held). Only once the genuine callback — the one
+    carrying the tracking code the gateway actually recognises — arrives does the
+    attempt settle, exactly once.
+    """
+    from app.models import CommerceInvoice, CommercePaymentAttempt, Order
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token, attempt = _pay_and_get_attempt(client, auth_headers, fake_provider)
+
+    # The gateway reports a terminal non-success for a tracking code it does not
+    # hold, yet still echoes the providerId/amount of the ticket it recognises.
+    fake_provider.verify_status = 4
+
+    # Forged callback FIRST: self-consistent (matching amount, supported type)
+    # but an attacker-chosen bogus tracking code.
+    r_forged = client.post(
+        CALLBACK,
+        data=callback_payload(attempt, type="0", trackingCode="FORGED"),
+        follow_redirects=False,
+    )
+    assert "payment=success" not in r_forged.headers["location"]
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "unknown"                                   # held, never failed
+        assert row.tracking_code == "FORGED"                            # provisional hint only
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"  # lock held
+    finally:
+        db.close()
+
+    # Staff reconcile of the still-bogus hint must NOT release the lock merely
+    # because the provider echoed our providerId/amount.
+    r_rec = client.post(
+        f"{BASE}/staff/payments/{attempt.id}/reconcile",
+        json={"action": "verify"},
+        headers=auth_headers,
+    )
+    assert r_rec.status_code == 200, r_rec.text
+    assert r_rec.json()["state"] == "unknown"                           # NOT failed
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "unknown"
+        assert db.get(CommerceInvoice, invoice_id).state == "approved"  # lock held
+    finally:
+        db.close()
+
+    # The lock is intact: a second pay click resumes the same payment session.
+    assert pay(client, token).json()["redirect_url"] == attempt.redirect_url
+
+    # The GENUINE callback now arrives with the tracking the gateway recognises.
+    fake_provider.verify_status = 0
+    r_real = client.post(
+        CALLBACK,
+        data=callback_payload(attempt, type="0", trackingCode="TRK-REAL"),
+        follow_redirects=False,
+    )
+    assert "payment=success" in r_real.headers["location"]
+
+    db = TestSessionLocal()
+    try:
+        row = db.query(CommercePaymentAttempt).filter_by(provider_id=attempt.provider_id).one()
+        assert row.state == "verified"
+        assert row.tracking_code == "TRK-REAL"          # confirmed identity recorded
+        assert db.get(CommerceInvoice, invoice_id).state == "paid"
+        assert db.query(Order).count() == 1             # settled exactly once
     finally:
         db.close()
 

@@ -1075,17 +1075,29 @@ def _verify_confirms(
 
 
 def _verify_reports_authoritative_non_success(
-    verified, attempt: CommercePaymentAttempt
+    verified,
+    attempt: CommercePaymentAttempt,
+    *,
+    tracking_code: str,
 ) -> bool:
     """True only for a terminal non-success tied to the ticket WE issued.
 
     A provider non-success whose only link to our attempt is a
-    **callback-supplied** ``trackingCode`` is *not* authoritative: that code may
-    be a forgery, so a "transaction not found"/error reply says nothing about the
-    invoice we actually issued. Only a reply that explicitly reports a
-    non-success **and** echoes our unique ``providerId`` together with the issued
-    ``amount_rial`` proves the provider looked up our ticket. Only then may an
-    attempt be closed as ``failed`` (releasing the invoice lock).
+    **callback-supplied** ``trackingCode`` is *not* authoritative. ``providerId``
+    and ``amount`` are both visible in the gateway redirect, so a reply that
+    merely echoes those two proves nothing about the invoice we issued: the
+    gateway may recognise our ``providerId`` (and so echo the amount it holds)
+    yet be answering about a tracking code we *supplied* — which may be a
+    forgery. Such a "not found"/error therefore says nothing about whether OUR
+    payment failed, and must not release the invoice lock.
+
+    The reply is authoritative only when it explicitly reports a terminal
+    non-success **and** is tied to the exact transaction we asked about: it must
+    echo our unique ``providerId``, the issued ``amount_rial`` **and** the
+    ``tracking_code`` we verified with. A missing or mismatched tracking echo is
+    an ambiguous/absent tie and keeps the attempt open, so only a proven
+    transaction-terminal response — or an explicit, audited staff ``abandon`` —
+    may release the lock.
     """
     if not isinstance(verified, dict):
         return False
@@ -1101,6 +1113,14 @@ def _verify_reports_authoritative_non_success(
     if provider_id != attempt.provider_id:
         return False
     if _int_or_none(verified.get("amount")) != attempt.amount_rial:
+        return False
+    # The decisive tie: the gateway must echo the very tracking code we verified
+    # with. A callback-supplied code it does not echo (missing) or echoes
+    # differently (ambiguous) cannot conclude a failure for our ticket.
+    echoed = verified.get("trackingCode")
+    if echoed is None:
+        echoed = verified.get("tracking_code")
+    if str(echoed or "").strip() != str(tracking_code).strip():
         return False
     return True
 
@@ -1305,10 +1325,14 @@ def reconcile_payment_attempt(
       never guessed from the ticket type: verifying an IPG payment with
       ``type=11`` would wrongly report failure.
     * A pending/unknown provider status keeps the attempt open; only a
-      provider-confirmed non-success **tied to the issued ticket** (the reply
-      echoes our unique ``providerId`` and the issued amount) closes it as
-      ``failed``. A non-success that rests only on a callback-supplied tracking
-      code cannot — such a code may be forged.
+      provider-confirmed non-success **tied to the exact transaction we asked
+      about** (the reply echoes our unique ``providerId``, the issued amount
+      **and** the tracking code we verified with) closes it as ``failed``. A
+      non-success that rests only on a callback-supplied tracking code — echoed
+      ``providerId``/``amount`` alone, with the tracking missing or mismatched —
+      cannot: that code may be forged, so the reply says nothing about our
+      ticket. The lock is released only on such a proven terminal response or an
+      explicit, audited staff ``abandon``.
     """
     if attempt is None:
         raise CommerceNotFoundError("تراکنش یافت نشد")
@@ -1360,10 +1384,13 @@ def reconcile_payment_attempt(
         settle_verified_payment(db, attempt, tracking_code=tracking)
         return attempt
 
-    if _verify_reports_authoritative_non_success(verified, attempt):
-        # The provider explicitly reported a terminal non-success for the ticket
-        # WE issued (it echoed our unique ``providerId`` and amount): only now
-        # may staff reconciliation close the attempt and release the lock.
+    if _verify_reports_authoritative_non_success(verified, attempt, tracking_code=tracking):
+        # The provider explicitly reported a terminal non-success tied to the
+        # exact transaction we asked about (it echoed our unique ``providerId``,
+        # the issued amount AND the tracking code we verified with): only now may
+        # staff reconciliation close the attempt and release the lock. An echo
+        # of providerId/amount alone is NOT enough — both are visible in the
+        # redirect, and the tracking may be a forged callback hint.
         attempt.state = "failed"
         attempt.last_error = _short(f"reconcile: provider status={status}")
         db.commit()
