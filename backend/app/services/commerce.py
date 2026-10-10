@@ -261,17 +261,24 @@ def generate_invoice_token() -> tuple[str, str]:
     return raw, hash_invoice_token(raw)
 
 
-def _is_production() -> bool:
-    env = (os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "").strip().lower()
-    return env in ("production", "prod")
+# Plain HTTP is tolerated only for an explicit local development host. Real
+# deployments must serve the private bearer link over HTTPS — enforced here
+# unconditionally rather than behind an optional APP_ENV flag that a production
+# deploy is likely to leave unset (which would silently accept a plaintext link).
+LOCAL_DEV_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_local_dev_origin(parsed) -> bool:
+    return (parsed.hostname or "").lower() in LOCAL_DEV_HOSTS
 
 
 def public_site_origin() -> str:
     """Validated public origin used to build customer-facing share links.
 
-    Defaults to the production site. HTTPS is mandatory whenever ``APP_ENV``
-    is production/prod so a private bearer link is never emitted over plain
-    HTTP; a non-HTTPS origin is only tolerated in local development.
+    Defaults to the production site. HTTPS is required for every origin except
+    an explicit local development host (``localhost`` / ``127.0.0.1`` /
+    ``::1``), so a private bearer link is never emitted over plain HTTP on a
+    real deployment regardless of whether ``APP_ENV`` happens to be set.
     """
     raw = (os.getenv("PUBLIC_SITE_ORIGIN") or DEFAULT_PUBLIC_SITE_ORIGIN).strip().rstrip("/")
     parsed = urlsplit(raw)
@@ -285,8 +292,10 @@ def public_site_origin() -> str:
         raise CommerceConfigError(
             "PUBLIC_SITE_ORIGIN must be a bare origin (no path, query, fragment or userinfo)"
         )
-    if parsed.scheme != "https" and _is_production():
-        raise CommerceConfigError("PUBLIC_SITE_ORIGIN must use HTTPS in production")
+    if parsed.scheme != "https" and not _is_local_dev_origin(parsed):
+        raise CommerceConfigError(
+            "PUBLIC_SITE_ORIGIN must use HTTPS unless it is an explicit localhost dev host"
+        )
     return raw
 
 

@@ -15,10 +15,11 @@ Staff:
 Payment initiation/callback arrive in Task 3. Handlers stay thin; validation
 and persistence live in ``app.services.commerce``.
 """
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from sqlalchemy.orm import Session
 
+from app.audit import log_user
 from app.database import get_db
 from app.routers.auth import limiter, require_staff_role
 from app.services import commerce as commerce_service
@@ -35,6 +36,10 @@ from app.services.commerce import (
 router = APIRouter(prefix="/api/v1/commerce", tags=["commerce"])
 
 VALID_MESSENGERS = ("telegram", "bale")
+
+# The public invoice read carries a private bearer token in its URL and body:
+# never let a browser, intermediary proxy or Referer header cache or leak it.
+NO_STORE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
 
 
 def _normalize_mobile(value: str) -> str:
@@ -266,7 +271,12 @@ def create_staff_invoice(
         commerce_service.CommerceConfigError,
     ) as exc:
         raise _validation_error(exc)
-    return commerce_service.serialize_staff_invoice(invoice)
+    payload = commerce_service.serialize_staff_invoice(invoice)
+    log_user(
+        user, db, "create", "commerce_invoice", invoice.id,
+        f"ایجاد پیش‌نویس فاکتور #{invoice.id}",
+    )
+    return payload
 
 
 @router.get("/staff/invoices")
@@ -324,7 +334,12 @@ def update_staff_invoice(
         commerce_service.CommerceConfigError,
     ) as exc:
         raise _validation_error(exc)
-    return commerce_service.serialize_staff_invoice(invoice)
+    payload = commerce_service.serialize_staff_invoice(invoice)
+    log_user(
+        user, db, "update", "commerce_invoice", invoice.id,
+        f"ویرایش فاکتور #{invoice.id}",
+    )
+    return payload
 
 
 @router.post("/staff/invoices/{invoice_id}/approve")
@@ -344,6 +359,12 @@ def approve_invoice(
         commerce_service.CommerceConfigError,
     ) as exc:
         raise _validation_error(exc)
+    # Audit the approval without ever writing the raw token or share URL: only
+    # the invoice identity and state transition belong in the log.
+    log_user(
+        user, db, "approve", "commerce_invoice", invoice.id,
+        f"تأیید و صدور لینک فاکتور #{invoice.id}",
+    )
     return {
         "id": invoice.id,
         "state": invoice.state,
@@ -371,26 +392,38 @@ def revoke_invoice(
         commerce_service.CommerceConfigError,
     ) as exc:
         raise _validation_error(exc)
-    return commerce_service.serialize_staff_invoice(invoice)
+    payload = commerce_service.serialize_staff_invoice(invoice)
+    log_user(
+        user, db, "revoke", "commerce_invoice", invoice.id,
+        f"لغو فاکتور #{invoice.id}",
+    )
+    return payload
 
 
 @router.get("/invoices/{token}")
 @limiter.limit("30/minute")
 def read_public_invoice(
     request: Request,
+    response: Response,
     token: str = Path(..., min_length=1, max_length=200),
     db: Session = Depends(get_db),
 ):
     """Public — minimal read of an approved invoice behind its private token.
 
     Returns no customer contact details and no staff-only notes. Expired
-    links answer 410; unknown or revoked tokens answer 404.
+    links answer 410; unknown or revoked tokens answer 404. Every response —
+    success or error — carries ``Cache-Control: no-store`` and
+    ``Referrer-Policy: no-referrer`` so the private bearer URL is never cached
+    or leaked through a referrer.
     """
+    response.headers.update(NO_STORE_HEADERS)
     try:
         invoice = commerce_service.resolve_public_invoice(db, token)
     except (
         commerce_service.CommerceNotFoundError,
         commerce_service.CommerceGoneError,
     ) as exc:
-        raise _validation_error(exc)
+        http_exc = _validation_error(exc)
+        http_exc.headers = {**(http_exc.headers or {}), **NO_STORE_HEADERS}
+        raise http_exc
     return commerce_service.serialize_public_invoice(invoice)

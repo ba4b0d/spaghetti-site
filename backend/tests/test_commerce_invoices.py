@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 import pytest
-from app.models import CommerceInvoice
+from app.models import AuditLog, CommerceInvoice
 from tests.conftest import TestSessionLocal
 
 BASE = "/api/v1/commerce"
@@ -164,3 +164,76 @@ def test_revoke_and_approve_blocked_while_payment_in_flight(
     # The original approval is untouched (still approved with a live link).
     listing = client.get(f"{BASE}/staff/invoices", headers=auth_headers).json()
     assert listing[0]["state"] == "approved"
+
+
+def test_public_invoice_sends_no_store_and_no_referrer_headers(client, auth_headers):
+    """The private pay response must never be cached or leak via a referrer."""
+    inv = create(client, auth_headers)
+    token = client.post(
+        f"{BASE}/staff/invoices/{inv['id']}/approve", headers=auth_headers
+    ).json()["share_url"].rsplit("/", 1)[-1]
+
+    ok = client.get(f"{BASE}/invoices/{token}")
+    assert ok.status_code == 200, ok.text
+    assert ok.headers["Cache-Control"] == "no-store"
+    assert ok.headers["Referrer-Policy"] == "no-referrer"
+
+    # Error responses for the same private endpoint must not be cacheable either.
+    missing = client.get(f"{BASE}/invoices/not-a-real-token")
+    assert missing.status_code == 404
+    assert missing.headers["Cache-Control"] == "no-store"
+    assert missing.headers["Referrer-Policy"] == "no-referrer"
+
+
+def test_plain_http_origin_allowed_only_for_localhost_dev(
+    client, auth_headers, monkeypatch
+):
+    """HTTP is refused for any real host even with APP_ENV unset (the deploy
+    case); only an explicit localhost dev origin may use plain HTTP."""
+    inv = create(client, auth_headers)
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    monkeypatch.setenv("PUBLIC_SITE_ORIGIN", "http://spaghettiprints.ir")
+    refused = client.post(
+        f"{BASE}/staff/invoices/{inv['id']}/approve", headers=auth_headers
+    )
+    assert refused.status_code >= 400, refused.text
+    listing = client.get(f"{BASE}/staff/invoices", headers=auth_headers).json()
+    assert listing[0]["state"] == "draft"
+
+    # An explicit local dev host is the sole accepted plain-HTTP origin.
+    monkeypatch.setenv("PUBLIC_SITE_ORIGIN", "http://localhost:5173")
+    approved = client.post(
+        f"{BASE}/staff/invoices/{inv['id']}/approve", headers=auth_headers
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["share_url"].startswith("http://localhost:5173/pay/")
+
+
+def test_staff_invoice_mutations_are_audited_without_token(client, auth_headers):
+    """create/edit/approve/revoke each append an audit row; never the token."""
+    inv = create(client, auth_headers)
+    approved = client.post(
+        f"{BASE}/staff/invoices/{inv['id']}/approve", headers=auth_headers
+    ).json()
+    raw_token = approved["share_url"].rsplit("/", 1)[-1]
+    client.put(
+        f"{BASE}/staff/invoices/{inv['id']}",
+        headers=auth_headers,
+        json=draft(specification="رنگ سبز"),
+    )
+    client.post(f"{BASE}/staff/invoices/{inv['id']}/revoke", headers=auth_headers)
+
+    db = TestSessionLocal()
+    try:
+        rows = db.query(AuditLog).filter(AuditLog.entity == "commerce_invoice").all()
+        actions = {r.action for r in rows}
+        assert {"create", "approve", "update", "revoke"} <= actions
+        assert all(r.entity_id == inv["id"] for r in rows)
+        assert all(r.user == "admin" for r in rows)
+        summaries = " ".join(r.summary or "" for r in rows)
+        assert raw_token not in summaries
+        assert raw_token not in repr([r.summary for r in rows])
+    finally:
+        db.close()
