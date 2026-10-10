@@ -93,6 +93,15 @@ SMS_TIMEOUT = 10.0
 SMS_PARAM_EVENT = "EVENT"
 SMS_PARAM_CODE = "CODE"
 
+# ── Customer checkout OTP (storefront cart) ──────────────────────────
+# The one-time code sent to a *customer's own* mobile at checkout is a
+# FUNCTIONAL delivery, independent of the admin-alert channel above: it needs
+# only the API key and its own approved template, never the admin recipient or
+# the COMMERCE_NOTIFY_SMS flag. Placeholder is the UPPERCASE "CODE", matching
+# this provider's case-sensitive substitution convention.
+OTP_TEMPLATE_ID = 337011
+OTP_CODE_PARAM = "CODE"
+
 SMTP_TIMEOUT = 15.0
 TLS_STARTTLS = "starttls"
 TLS_SSL = "ssl"
@@ -141,6 +150,25 @@ def sms_config() -> dict | None:
     if template_id <= 0:
         return None
     return {"api_key": api_key, "template_id": template_id, "mobile": mobile}
+
+
+def customer_otp_config() -> dict | None:
+    """SMS.ir config for the CUSTOMER OTP template only: api_key + template id.
+
+    No admin recipient, no admin-notify flag — this is functional delivery of a
+    one-time code to a customer's own mobile, not an alert. ``sms_config`` above
+    must NOT be reused for it: that one is gated on the ``COMMERCE_NOTIFY_SMS``
+    toggle and requires ``SMS_IR_ADMIN_MOBILE``, neither of which applies here.
+    """
+    api_key = _clean("SMS_IR_API_KEY")
+    template_raw = _clean("SMS_IR_OTP_TEMPLATE_ID", str(OTP_TEMPLATE_ID))
+    if not (api_key and template_raw):
+        return None
+    try:
+        template_id = int(template_raw)
+    except ValueError:
+        return None
+    return {"api_key": api_key, "template_id": template_id} if template_id > 0 else None
 
 
 def smtp_config() -> dict | None:
@@ -332,6 +360,31 @@ def post_sms_ir_verify(
         return int(payload.get("status")) == 1
     except (TypeError, ValueError):
         return False
+
+
+def send_customer_otp(mobile: str, code: str) -> bool:
+    """Send the storefront one-time code to the customer's own mobile.
+
+    Functional delivery (not an admin alert): needs only the API key and the
+    OTP template id. Returns ``False`` — never raises — when unconfigured or the
+    provider does not acknowledge, so the caller can drop the unusable
+    challenge. The ``code`` is never logged.
+    """
+    config = customer_otp_config()
+    if config is None:
+        return False
+    param_name = _clean("SMS_IR_OTP_PARAM_CODE", OTP_CODE_PARAM) or OTP_CODE_PARAM
+    try:
+        acked = post_sms_ir_verify(
+            api_key=config["api_key"],
+            template_id=config["template_id"],
+            mobile=mobile,
+            parameters=[{"name": param_name, "value": code}],
+        )
+    except Exception as exc:  # noqa: BLE001 - provider/network error is a failed send
+        logger.warning("SMS.ir customer OTP send error: %s", _safe(exc))
+        return False
+    return bool(acked)
 
 
 def send_smtp_mail(

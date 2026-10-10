@@ -367,6 +367,31 @@ class CommerceRequestItem(Base):
     product = relationship("Product", lazy="joined")
 
 
+# ── Commerce: storefront cart OTP challenges ─────────────────────────
+# A short-lived, single-use proof-of-ownership for the mobile number a
+# customer enters at checkout. Only a *salted hash* of the code is persisted:
+# the plaintext code is never stored and never logged. A challenge is
+# invalidated the moment it is consumed, superseded by a newer challenge for
+# the same mobile, or exhausted by too many wrong attempts.
+class CommerceOtpChallenge(Base):
+    """One pending SMS one-time-code challenge for a storefront cart request."""
+
+    __tablename__ = "commerce_otp_challenges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    mobile = Column(String(11), nullable=False, index=True)
+    # 16 random bytes rendered as 32 hex chars; each code keeps its own salt so
+    # two identical codes never share a hash.
+    code_salt = Column(String(32), nullable=False)
+    code_hash = Column(String(64), nullable=False)       # SHA-256 hex of salt+code
+    expires_at = Column(DateTime, nullable=False, index=True)
+    consumed_at = Column(DateTime, nullable=True)        # set on success/invalidation
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    # SHA-256 hash of the issuing client IP — never the raw address.
+    client_ip_hash = Column(String(64), nullable=True)
+
+
 # ── Commerce: staff-reviewed invoices + private payment links (Task 2) ──
 # An invoice is the ONLY payable commerce artifact. A website request can
 # never be paid directly; staff must convert it into a reviewed invoice.

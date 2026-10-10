@@ -26,6 +26,14 @@ commerceApi.interceptors.response.use(
 export const submitCommerceRequest = (payload, config) =>
   commerceApi.post('/requests', payload, config);
 
+/**
+ * Public — begin the cart OTP gate: send a one-time SMS code to the customer's
+ * mobile. Returns `{ challenge_id, expires_in, resend_after, delivery,
+ * masked_mobile }`. The code itself is never returned.
+ */
+export const requestOtp = (payload, config) =>
+  commerceApi.post('/requests/otp', payload, config);
+
 /** Staff — paginated, newest-first request review queue (requires staff session). */
 export const getStaffRequests = (params = {}, config) =>
   commerceApi.get('/staff/requests', { params, ...config });

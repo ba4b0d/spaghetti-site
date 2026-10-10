@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 import pytest
 from app.models import AuditLog, CommerceInvoice
 from tests.conftest import TestSessionLocal
+from tests.otp_helpers import issue_test_otp
 
 BASE = "/api/v1/commerce"
 
@@ -91,7 +92,7 @@ def test_website_conversion_and_role_guard(client, auth_headers):
     assert client.post(f"{BASE}/staff/invoices", json=draft()).status_code == 401
     product = client.post("/api/v1/products", json={"name": "فیگور", "weight_g": 40, "print_time_hours": 1, "final_price": 150000}, headers=auth_headers)
     assert product.status_code == 201, product.text
-    req = client.post(f"{BASE}/requests", json={"customer_name":"رضا", "mobile":"09123456789", "messenger":"telegram", "items":[{"product_id":product.json()["id"],"qty":1}]})
+    req = client.post(f"{BASE}/requests", json={"customer_name":"رضا", "mobile":"09123456789", "messenger":"telegram", "items":[{"product_id":product.json()["id"],"qty":1}], **issue_test_otp()})
     assert req.status_code == 200, req.text
     requests = client.get(f"{BASE}/staff/requests", headers=auth_headers).json()
     inv = create(client, auth_headers, request_id=requests[0]["id"])

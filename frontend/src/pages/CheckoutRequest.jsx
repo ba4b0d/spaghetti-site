@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ShoppingBag, Trash2, Plus, Minus, Loader2, CheckCircle2, ArrowRight, Send } from 'lucide-react';
+import { ShoppingBag, Trash2, Plus, Minus, Loader2, CheckCircle2, ArrowRight, Send, ShieldCheck } from 'lucide-react';
 import { getCatalog } from '../lib/api';
-import { submitCommerceRequest } from '../lib/commerceApi';
+import { submitCommerceRequest, requestOtp } from '../lib/commerceApi';
 import { readCart, updateQuantity, removeItem, subscribe, clearCart } from '../lib/cart';
 import { formatPrice } from '../lib/utils';
 
@@ -66,6 +66,15 @@ export default function CheckoutRequest() {
   const [submitting, setSubmitting] = useState(false);
   const [receipt, setReceipt] = useState(null);
 
+  // ── Cart OTP gate ───────────────────────────────────────────────────
+  // `otp` is null until the one-time code has been requested; once set the
+  // guest must enter the SMS code before the request is accepted.
+  const [otp, setOtp] = useState(null);
+  const [otpCode, setOtpCode] = useState('');
+  const [otpError, setOtpError] = useState(null);
+  const [otpSubmitting, setOtpSubmitting] = useState(false);
+  const [resendIn, setResendIn] = useState(0);
+
   // Keep the local list in sync with the shared cart store.
   useEffect(() => subscribe(() => setCartItems(readCart())), []);
 
@@ -125,49 +134,135 @@ export default function CheckoutRequest() {
     setCartItems(removeItem(id));
   }, []);
 
-  const handleSubmit = async (event) => {
-    event.preventDefault();
-    if (submitting) return;
-    setError(null);
-
+  /** The exact public request payload — no prices, no surplus keys. */
+  const buildPayload = useCallback(() => {
     const customerName = form.customer_name.trim();
     const mobile = normalizeDigits(form.mobile).replace(/\s+/g, '');
     const items = cartItems.map((item) => ({ product_id: item.id, qty: item.qty }));
-
-    if (!customerName) {
-      setError('نام و نام خانوادگی را وارد کنید.');
-      return;
-    }
-    if (!MOBILE_RE.test(mobile)) {
-      setError('شماره موبایل باید با ۰۹ شروع شود و ۱۱ رقم باشد.');
-      return;
-    }
-    if (items.length === 0) {
-      setError('سبد خرید شما خالی است.');
-      return;
-    }
-
-    // Only the fields the server accepts — no prices, no surplus keys.
-    const payload = {
-      customer_name: customerName,
-      mobile,
-      messenger: form.messenger,
-      items,
-    };
+    const payload = { customer_name: customerName, mobile, messenger: form.messenger, items };
     const handle = form.messenger_handle.trim();
     const address = form.address.trim();
     const note = form.note.trim();
     if (handle) payload.messenger_handle = handle;
     if (address) payload.address = address;
     if (note) payload.note = note;
+    return payload;
+  }, [form, cartItems]);
 
-    setSubmitting(true);
+  // Reset the OTP step whenever the mobile changes: a code is bound to the
+  // number it was sent to, so a new number starts a fresh challenge.
+  useEffect(() => {
+    setOtp(null);
+    setOtpCode('');
+    setOtpError(null);
+  }, [form.mobile]);
+
+  // Resend countdown; only ticks while an OTP step is active and is cleaned up
+  // on unmount (or when the challenge is replaced).
+  useEffect(() => {
+    if (!otp) return undefined;
+    setResendIn(otp.resendAfter > 0 ? otp.resendAfter : 0);
+    if (!otp.resendAfter) return undefined;
+    const timer = setInterval(() => {
+      setResendIn((seconds) => (seconds > 0 ? seconds - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [otp]);
+
+  const startOtp = async (mobile) => {
+    const res = await requestOtp({ mobile });
+    const data = res?.data || {};
+    const resendAfter = Number(data.resend_after) || 0;
+    // Seed the countdown in the same commit that reveals the OTP step, so the
+    // resend button is never briefly enabled before the interval kicks in.
+    setResendIn(resendAfter);
+    setOtp({
+      challengeId: data.challenge_id,
+      maskedMobile: data.masked_mobile || mobile,
+      resendAfter,
+    });
+    setOtpCode('');
+    setOtpError(null);
+  };
+
+  const confirmOtp = async () => {
+    if (otpSubmitting || !otp) return;
+    const code = otpCode.trim();
+    if (!/^\d{5}$/.test(code)) {
+      setOtpError('کد تأیید ۵ رقمی را وارد کنید.');
+      return;
+    }
+    setOtpError(null);
+    setOtpSubmitting(true);
     try {
+      // Re-POST the same request payload PLUS the OTP proof. Still no prices.
+      const payload = {
+        ...buildPayload(),
+        otp_challenge_id: otp.challengeId,
+        otp_code: code,
+      };
       const res = await submitCommerceRequest(payload);
       const data = res?.data || {};
       setReceipt({ receipt_id: data.receipt_id, state: data.state });
-      // Clear only after the request succeeded.
       clearCart();
+    } catch (err) {
+      if (err?.name !== 'CanceledError' && err?.code !== 'ERR_CANCELED') {
+        setOtpError(extractError(err));
+      }
+    } finally {
+      setOtpSubmitting(false);
+    }
+  };
+
+  const resendOtp = async () => {
+    if (!otp || resendIn > 0 || submitting) return;
+    setOtpError(null);
+    setSubmitting(true);
+    try {
+      await startOtp(normalizeDigits(form.mobile).replace(/\s+/g, ''));
+    } catch (err) {
+      setOtpError(extractError(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const editMobile = () => {
+    setOtp(null);
+    setOtpCode('');
+    setOtpError(null);
+  };
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    // Once the OTP step is open, a form submit (Enter / the primary button)
+    // means "confirm the code", never a fresh request.
+    if (otp) {
+      await confirmOtp();
+      return;
+    }
+    if (submitting) return;
+    setError(null);
+
+    const payload = buildPayload();
+    if (!payload.customer_name) {
+      setError('نام و نام خانوادگی را وارد کنید.');
+      return;
+    }
+    if (!MOBILE_RE.test(payload.mobile)) {
+      setError('شماره موبایل باید با ۰۹ شروع شود و ۱۱ رقم باشد.');
+      return;
+    }
+    if (payload.items.length === 0) {
+      setError('سبد خرید شما خالی است.');
+      return;
+    }
+
+    // Validated: request the SMS one-time code instead of submitting. A 503 /
+    // delivery error keeps the guest on the form with the Persian message.
+    setSubmitting(true);
+    try {
+      await startOtp(payload.mobile);
     } catch (err) {
       if (err?.name !== 'CanceledError' && err?.code !== 'ERR_CANCELED') {
         setError(extractError(err));
@@ -507,15 +602,94 @@ export default function CheckoutRequest() {
             </div>
           ) : null}
 
-          <button
-            type="submit"
-            className="btn-primary w-full inline-flex items-center justify-center gap-2"
-            disabled={submitting}
-            style={submitting ? { opacity: 0.7, pointerEvents: 'none' } : undefined}
-          >
-            {submitting ? <Loader2 size={17} className="animate-spin" /> : <Send size={17} />}
-            {submitting ? 'در حال ثبت...' : 'ثبت درخواست'}
-          </button>
+          {otp ? (
+            <div
+              className="rounded-2xl border p-4 space-y-3"
+              data-testid="checkout-otp-step"
+              style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}
+            >
+              <h3 className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>
+                کد تأیید را وارد کنید
+              </h3>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                کد ۵ رقمی ارسال‌شده به شماره{' '}
+                <span style={{ direction: 'ltr', fontFamily: 'monospace' }}>{otp.maskedMobile}</span>{' '}
+                را وارد کنید.
+              </p>
+              <input
+                id="checkout-otp-code"
+                name="otp_code"
+                data-testid="checkout-otp-input"
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                className="input-field w-full text-sm"
+                style={{ direction: 'ltr', textAlign: 'center', letterSpacing: '0.4em' }}
+                value={otpCode}
+                onChange={(event) =>
+                  setOtpCode(normalizeDigits(event.target.value).replace(/\D/g, '').slice(0, 5))
+                }
+                maxLength={5}
+                autoFocus
+                aria-label="کد تأیید"
+                required
+              />
+              {otpError ? (
+                <div
+                  role="alert"
+                  className="p-3 rounded-xl text-xs leading-relaxed border"
+                  style={{
+                    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                    borderColor: 'rgba(239, 68, 68, 0.35)',
+                    color: '#ef4444',
+                  }}
+                >
+                  {otpError}
+                </div>
+              ) : null}
+              <button
+                type="button"
+                data-testid="checkout-otp-confirm"
+                className="btn-primary w-full inline-flex items-center justify-center gap-2"
+                onClick={confirmOtp}
+                disabled={otpSubmitting || otpCode.trim().length < 5}
+                style={otpSubmitting || otpCode.trim().length < 5 ? { opacity: 0.7 } : undefined}
+              >
+                {otpSubmitting ? <Loader2 size={17} className="animate-spin" /> : <ShieldCheck size={17} />}
+                {otpSubmitting ? 'در حال ثبت...' : 'تأیید و ثبت درخواست'}
+              </button>
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  data-testid="checkout-otp-resend"
+                  onClick={resendOtp}
+                  disabled={resendIn > 0 || submitting}
+                  className="text-xs font-medium disabled:cursor-not-allowed"
+                  style={{ color: resendIn > 0 ? 'var(--text-muted)' : 'var(--accent)' }}
+                >
+                  {resendIn > 0 ? `ارسال مجدد کد تا ${resendIn} ثانیه` : 'ارسال مجدد کد'}
+                </button>
+                <button
+                  type="button"
+                  onClick={editMobile}
+                  className="text-xs font-medium"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  ویرایش شماره موبایل
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="submit"
+              className="btn-primary w-full inline-flex items-center justify-center gap-2"
+              disabled={submitting}
+              style={submitting ? { opacity: 0.7, pointerEvents: 'none' } : undefined}
+            >
+              {submitting ? <Loader2 size={17} className="animate-spin" /> : <Send size={17} />}
+              {submitting ? 'در حال ثبت...' : 'ثبت درخواست'}
+            </button>
+          )}
 
           <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
             با ثبت درخواست، هیچ مبلغی بهصورت خودکار پرداخت نمیشود. کارشناسان ما پس از بررسی موجودی،

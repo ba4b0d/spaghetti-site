@@ -6,7 +6,10 @@ import { MemoryRouter } from 'react-router-dom';
 // Mock the public HTTP layers: the checkout page talks to commerceApi for the
 // request and to the catalog API only to resolve display names (never prices
 // as authoritative values).
-const commerceApiMock = vi.hoisted(() => ({ submitCommerceRequest: vi.fn() }));
+const commerceApiMock = vi.hoisted(() => ({
+  submitCommerceRequest: vi.fn(),
+  requestOtp: vi.fn(),
+}));
 const catalogApiMock = vi.hoisted(() => ({ getCatalog: vi.fn() }));
 
 vi.mock('../lib/commerceApi', () => commerceApiMock);
@@ -35,7 +38,26 @@ beforeEach(() => {
   catalogApiMock.getCatalog.mockResolvedValue({
     data: [{ id: 12, name: 'جاکلیدی تستی', final_price: 30000, slug: 'test-keychain' }],
   });
+  commerceApiMock.requestOtp.mockResolvedValue({
+    data: {
+      challenge_id: 7,
+      expires_in: 120,
+      resend_after: 2,
+      delivery: 'sms',
+      masked_mobile: '0912***6789',
+    },
+  });
 });
+
+// ── Item 3: the cart is gated behind an SMS one-time code ────────────
+// Every test that submits the cart must first open the OTP step and confirm a
+// code; the request is only minted on confirm.
+async function submitCartThroughOtp() {
+  fireEvent.click(screen.getByRole('button', { name: 'ثبت درخواست' }));
+  await screen.findByTestId('checkout-otp-step');
+  fireEvent.change(screen.getByLabelText('کد تأیید'), { target: { value: '12345' } });
+  fireEvent.click(screen.getByRole('button', { name: 'تأیید و ثبت درخواست' }));
+}
 
 // ── cart.js ──────────────────────────────────────────────────────────
 
@@ -126,7 +148,8 @@ describe('CheckoutRequest', () => {
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
     fireEvent.change(screen.getByLabelText('پیامرسان'), { target: { value: 'telegram' } });
 
-    fireEvent.click(screen.getByRole('button', { name: 'ثبت درخواست' }));
+    // Item 3: the request is only minted after the SMS code is confirmed.
+    await submitCartThroughOtp();
 
     await waitFor(() => expect(commerceApiMock.submitCommerceRequest).toHaveBeenCalledTimes(1));
     const payload = commerceApiMock.submitCommerceRequest.mock.calls[0][0];
@@ -136,7 +159,7 @@ describe('CheckoutRequest', () => {
     expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
     // The cart is not an authoritative price source.
     expect(Object.keys(payload).sort()).toEqual(
-      ['customer_name', 'items', 'messenger', 'mobile'].sort()
+      ['customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
     );
 
     expect(await screen.findByText(/REQ-ABC123/)).toBeDefined();
@@ -155,7 +178,8 @@ describe('CheckoutRequest', () => {
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
-    fireEvent.click(screen.getByRole('button', { name: 'ثبت درخواست' }));
+    // Item 3: reach the server only through a confirmed OTP step.
+    await submitCartThroughOtp();
 
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('برخی محصولات موجود یا فعال نیستند');
@@ -201,12 +225,13 @@ describe('CheckoutRequest estimated total', () => {
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
-    fireEvent.click(screen.getByRole('button', { name: 'ثبت درخواست' }));
+    // Item 3: reach the server only through a confirmed OTP step.
+    await submitCartThroughOtp();
 
     await waitFor(() => expect(commerceApiMock.submitCommerceRequest).toHaveBeenCalledTimes(1));
     const payload = commerceApiMock.submitCommerceRequest.mock.calls[0][0];
     expect(Object.keys(payload).sort()).toEqual(
-      ['customer_name', 'items', 'messenger', 'mobile'].sort()
+      ['customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
     );
     expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
     expect(JSON.stringify(payload)).not.toContain('60000');

@@ -6,6 +6,8 @@ commerce plan (docs/superpowers/plans/2026-10-10-order-invoice-payments.md).
 """
 import pytest
 
+from tests.otp_helpers import issue_test_otp
+
 
 @pytest.fixture(autouse=True)
 def _clear_rate_limiter(client):
@@ -42,6 +44,11 @@ def _valid_payload(product_id, qty=2, **overrides):
         "mobile": "09123456789",
         "messenger": "telegram",
         "items": [{"product_id": product_id, "qty": qty}],
+        # The public gate now requires a verified one-time code. Mint a live
+        # challenge for the default mobile so these intake tests still exercise
+        # the request contract; the OTP path itself is covered in
+        # test_commerce_otp.py. No SMS is ever sent (see tests/otp_helpers.py).
+        **issue_test_otp(),
     }
     payload.update(overrides)
     return payload
@@ -242,8 +249,14 @@ def test_boundary_payload_is_accepted(client, auth_headers):
 
 def test_public_post_is_rate_limited(client, auth_headers):
     product = _create_product(client, auth_headers)
-    payload = _valid_payload(product["id"])
-    statuses = [client.post("/api/v1/commerce/requests", json=payload).status_code for _ in range(6)]
+    # A fresh challenge per POST: the OTP is single-use, so reusing one payload
+    # would fail the gate (400) before the limiter is reached.
+    statuses = [
+        client.post(
+            "/api/v1/commerce/requests", json=_valid_payload(product["id"])
+        ).status_code
+        for _ in range(6)
+    ]
     assert statuses[:5] == [200] * 5
     assert statuses[5] == 429
 

@@ -35,6 +35,7 @@ from app.database import get_db
 from app.routers.auth import limiter, require_staff_role
 from app.services import commerce as commerce_service
 from app.services import commerce_notifications
+from app.services import commerce_otp
 from app.services import digipay
 from app.services.commerce import (
     MAX_DISTINCT_PRODUCTS,
@@ -109,6 +110,11 @@ class CommerceRequestCreate(BaseModel):
     messenger_handle: str = Field(default="", max_length=100)
     address: str = Field(default="", max_length=500)
     note: str = Field(default="", max_length=2000)
+    # Ownership proof for ``mobile`` (see app.services.commerce_otp): the request
+    # is accepted only after the SMS one-time code is verified. Both fields are
+    # required, so a client cannot bypass the gate by omitting them.
+    otp_challenge_id: int = Field(..., ge=1)
+    otp_code: str = Field(..., min_length=1, max_length=16)
     items: list[CommerceRequestItemIn] = Field(..., min_length=1, max_length=MAX_DISTINCT_PRODUCTS)
 
     @field_validator("customer_name")
@@ -138,6 +144,50 @@ class CommerceRequestCreate(BaseModel):
         return self
 
 
+class OtpRequest(BaseModel):
+    """Public payload for the cart one-time-code endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mobile: str
+
+
+@router.post("/requests/otp")
+@limiter.limit("3/minute")
+def request_cart_otp(
+    request: Request,
+    body: OtpRequest,
+    db: Session = Depends(get_db),
+):
+    """Public — send a one-time SMS code to the customer's own mobile.
+
+    ``request`` MUST be the first parameter: slowapi resolves the client key
+    from it, and without it the app crashes at import. A resend cooldown or an
+    hourly cap answers 429; a transport/config failure answers 503. The code is
+    never echoed back — only an opaque challenge id and timing hints are.
+    """
+    try:
+        mobile = _normalize_mobile(body.mobile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    client_ip = request.client.host if request.client else None
+    try:
+        challenge = commerce_otp.issue_challenge(db, mobile, client_ip=client_ip)
+    except commerce_otp.OtpThrottled as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except commerce_otp.OtpDeliveryError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    return {
+        "challenge_id": challenge.id,
+        "expires_in": commerce_otp.OTP_TTL_SECONDS,
+        "resend_after": commerce_otp.OTP_RESEND_COOLDOWN_SECONDS,
+        "delivery": "sms",
+        "masked_mobile": commerce_notifications.mask_mobile(mobile),
+    }
+
+
 @router.post("/requests")
 @limiter.limit("5/minute")
 def create_request(
@@ -148,11 +198,22 @@ def create_request(
 ):
     """Public — record a pending-review website cart request.
 
-    Returns an opaque receipt identifier only; no invoice or payment link is
-    produced before staff review. The admin alert is dispatched as a *background*
-    task after the response, so a slow Telegram/SMS/SMTP transport cannot delay
-    the customer's acknowledgement.
+    Ownership of ``mobile`` is proven FIRST: the submitted OTP must match the
+    issued challenge, otherwise the request is rejected and — crucially — no
+    request row is written. Returns an opaque receipt identifier only; no
+    invoice or payment link is produced before staff review. The admin alert is
+    dispatched as a *background* task after the response, so a slow
+    Telegram/SMS/SMTP transport cannot delay the customer's acknowledgement.
     """
+    try:
+        commerce_otp.verify_challenge(
+            db, body.otp_challenge_id, body.otp_code, body.mobile
+        )
+    except commerce_otp.OtpError as exc:
+        # Invalid / expired / unknown / exhausted all answer 400 with a generic
+        # Persian message — the failure never reveals whether the mobile exists.
+        raise HTTPException(status_code=400, detail=str(exc))
+
     try:
         created = commerce_service.create_website_request(
             db,

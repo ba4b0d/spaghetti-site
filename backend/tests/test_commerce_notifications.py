@@ -19,6 +19,7 @@ SMTP client, Telegram sender) is replaced by a fake.
 import pytest
 
 from app.services import commerce_notifications as cn
+from tests.otp_helpers import issue_test_otp
 
 BASE = "/api/v1/commerce"
 
@@ -497,6 +498,9 @@ def _request_payload(product_id, qty=1):
         "mobile": "09123456789",
         "messenger": "telegram",
         "items": [{"product_id": product_id, "qty": qty}],
+        # Public intake now requires a verified OTP; mint a live challenge so
+        # the notification wiring keeps being exercised (no SMS is sent).
+        **issue_test_otp(),
     }
 
 

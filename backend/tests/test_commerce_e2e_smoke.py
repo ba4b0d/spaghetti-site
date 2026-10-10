@@ -25,6 +25,8 @@ Nothing here reads credentials, mutates production data, or sends anything.
 """
 import pytest
 
+from tests.otp_helpers import issue_test_otp
+
 BASE = "/api/v1/commerce"
 CALLBACK = f"{BASE}/digipay/callback"
 
@@ -149,6 +151,8 @@ def _website_request(client, auth_headers, product_id):
             "mobile": "09123456789",
             "messenger": "telegram",
             "items": [{"product_id": product_id, "qty": 2}],
+            # Public intake now requires a verified OTP (no SMS is sent).
+            **issue_test_otp(),
         },
     )
     assert r.status_code == 200, r.text
