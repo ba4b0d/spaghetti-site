@@ -7,8 +7,13 @@ effect replaced by an in-process double:
 * ``FakeDigiPay`` is injected through the ``digipay.client_dependency`` override,
   so ``start_payment`` / the callback ``verify`` never touch the gateway.
 * The three notification channel entrypoints are monkeypatched, so Telegram,
-  SMS.ir and SMTP are never contacted. Live DigiPay credentials are also
-  removed from the environment so a leaked env var cannot open a real client.
+  SMS.ir and SMTP are never contacted; every channel is nonetheless switched on
+  with throwaway credentials so each event fans out to all three and the alert
+  is asserted per channel. Live DigiPay credentials are also removed from the
+  environment so a leaked env var cannot open a real client.
+* The app lifespan's Telegram receive-poll thread is neutralised suite-wide
+  (see ``conftest.client``), so entering ``TestClient`` never opens a live
+  ``getUpdates`` socket even though the Settings table holds a real token.
 
 Two invoices are exercised end to end:
 
@@ -64,7 +69,12 @@ class FakeDigiPay:
 
 @pytest.fixture(autouse=True)
 def no_live_io(monkeypatch):
-    """Replace all three notification transports and scrub DigiPay credentials."""
+    """Replace all three notification transports, scrub DigiPay credentials.
+
+    Every channel toggle is switched on and given throwaway credentials so the
+    real notification fan-out runs for all three; the transport entrypoints
+    themselves are replaced by in-process doubles, so nothing is ever sent.
+    """
     from app.services import commerce_notifications as cn
 
     records = {"telegram": [], "sms": [], "email": []}
@@ -80,6 +90,26 @@ def no_live_io(monkeypatch):
         cn, "send_email_alert",
         lambda subject, body: records["email"].append((subject, body)) or cn.SENT,
     )
+
+    # Configure all three channels (throwaway values) so each event is expected
+    # to fan out to Telegram *and* SMS *and* email; the doubles above mean no
+    # live send happens regardless.
+    for var, value in (
+        ("COMMERCE_NOTIFY_TELEGRAM", "1"),
+        ("COMMERCE_NOTIFY_SMS", "1"),
+        ("SMS_IR_API_KEY", "test-key"),
+        ("SMS_IR_TEMPLATE_ID", "100"),
+        ("SMS_IR_ADMIN_MOBILE", "09120000000"),
+        ("COMMERCE_NOTIFY_SMTP", "1"),
+        ("SMTP_HOST", "smtp.test.invalid"),
+        ("SMTP_PORT", "587"),
+        ("SMTP_USERNAME", "mailer"),
+        ("SMTP_PASSWORD", "test-secret"),
+        ("SMTP_FROM", "no-reply@test.invalid"),
+        ("SMTP_ADMIN_TO", "owner@test.invalid"),
+    ):
+        monkeypatch.setenv(var, value)
+
     for var in (
         "DIGIPAY_CLIENT_ID", "DIGIPAY_CLIENT_SECRET",
         "DIGIPAY_USERNAME", "DIGIPAY_PASSWORD",
@@ -249,6 +279,19 @@ def _assert_invoice_and_single_order(invoice_id, *, expected_toman, expected_ord
         db.close()
 
 
+def _sms_event_values(records):
+    """The ``event`` label of each SMS fan-out (one parameter list per event)."""
+    return [
+        next(p["value"] for p in params if p["name"] == "event")
+        for params in records["sms"]
+    ]
+
+
+def _email_subjects(records):
+    """The subject line of each email fan-out."""
+    return [subject for subject, _body in records["email"]]
+
+
 # ── the two end-to-end scenarios ─────────────────────────────────────
 
 def test_website_request_full_path_pays_once(client, auth_headers, fake_provider, no_live_io):
@@ -270,26 +313,56 @@ def test_website_request_full_path_pays_once(client, auth_headers, fake_provider
     assert "payment=success" in dup.headers["location"]
     _assert_invoice_and_single_order(invoice_id, expected_toman=312000, expected_orders=1)
 
-    # Notifications: request_created + invoice_approved + payment_verified, each once.
-    tg = no_live_io["telegram"]
-    assert len([t for t in tg if "REQ-" in t]) == 1
-    assert len([t for t in tg if "تأیید" in t]) == 1
-    assert len([t for t in tg if "پرداخت" in t]) == 1
-    assert all(token not in t for t in tg)  # bearer token never broadcast
+    # Notifications: request_created + invoice_approved + payment_verified, once
+    # each, on every configured channel.
+    records = no_live_io
+    tg, sms, email = records["telegram"], records["sms"], records["email"]
+
+    assert len(tg) == 3 and len(sms) == 3 and len(email) == 3
+
+    assert sum("درخواست جدید وبسایت" in t for t in tg) == 1
+    assert sum("تأیید فاکتور" in t for t in tg) == 1
+    assert sum("پرداخت موفق فاکتور" in t for t in tg) == 1
+    assert sum("REQ-" in t for t in tg) == 1  # the request receipt code
+
+    # SMS + email fan out the identical three events (one apiece).
+    assert sorted(_sms_event_values(records)) == sorted(["درخواست", "فاکتور", "پرداخت"])
+    subjects = _email_subjects(records)
+    assert sum("درخواست جدید وبسایت" in s for s in subjects) == 1
+    assert sum("تأیید فاکتور" in s for s in subjects) == 1
+    assert sum("پرداخت موفق فاکتور" in s for s in subjects) == 1
+
+    # The private bearer token is never broadcast on any channel.
+    assert all(token not in t for t in tg)
+    assert all(token not in str(params) for params in sms)
+    assert all(token not in subject and token not in body for subject, body in email)
 
 
 def test_manual_invoice_full_path_pays_once(client, auth_headers, fake_provider, no_live_io):
     invoice_id = _draft_manual(client, auth_headers)
 
     token, attempt = _drive_payment_to_paid(client, auth_headers, invoice_id, expected_toman=200000)
-    order_id = _assert_invoice_and_single_order(invoice_id, expected_toman=200000, expected_orders=1)
+    _assert_invoice_and_single_order(invoice_id, expected_toman=200000, expected_orders=1)
 
     dup = client.post(CALLBACK, data=_callback_payload(attempt), follow_redirects=False)
     assert "payment=success" in dup.headers["location"]
     _assert_invoice_and_single_order(invoice_id, expected_toman=200000, expected_orders=1)
 
-    # Manual invoice emits approval + paid alerts but never a request_created one.
-    tg = no_live_io["telegram"]
-    assert len([t for t in tg if "تأیید" in t]) == 1
-    assert len([t for t in tg if "پرداخت" in t]) == 1
-    assert order_id is not None
+    # A manual invoice starts from no website request, so it emits only the
+    # approval + paid alerts — never a request_created one — on every channel.
+    records = no_live_io
+    tg, sms, email = records["telegram"], records["sms"], records["email"]
+
+    assert len(tg) == 2 and len(sms) == 2 and len(email) == 2
+    assert sum("تأیید فاکتور" in t for t in tg) == 1
+    assert sum("پرداخت موفق فاکتور" in t for t in tg) == 1
+
+    # No request_created alert anywhere: no request label, no REQ- receipt code.
+    assert not [t for t in tg if "درخواست جدید وبسایت" in t or "REQ-" in t]
+    assert sorted(_sms_event_values(records)) == sorted(["فاکتور", "پرداخت"])
+    assert not [s for s in _email_subjects(records) if "درخواست جدید وبسایت" in s]
+
+    # The private bearer token stays out of every channel.
+    assert all(token not in t for t in tg)
+    assert all(token not in str(params) for params in sms)
+    assert all(token not in subject and token not in body for subject, body in email)
