@@ -89,9 +89,20 @@ class FakeBitPay:
 
 
 @pytest.fixture()
-def fake_bitpay(client):
+def fake_bitpay(client, monkeypatch):
     from app.main import app
     from app.services import bitpay
+
+    # The initiation route enforces the *same* Task-4 sandbox gate as the public
+    # readiness snapshot (see the gate tests below), so the offline fake is only
+    # usable from a fully-formed, non-production test deployment — the exact
+    # shape the gate requires. This is test-environment *configuration*, not a
+    # bypass: the production condition is still evaluated on every request, and
+    # the injected client never short-circuits it.
+    monkeypatch.setenv("BITPAY_API_KEY", "sk_test_offline-fake-not-a-real-key")
+    monkeypatch.setenv("BITPAY_ENV", "test")
+    monkeypatch.setenv("BITPAY_ENABLE_TEST_CHECKOUT", "1")
+    monkeypatch.setenv("PUBLIC_SITE_ORIGIN", "https://staging.spaghettiprints.ir")
 
     fake = FakeBitPay()
     app.dependency_overrides[bitpay.client_dependency] = lambda: fake
@@ -279,15 +290,83 @@ def test_bitpay_pay_sets_no_store_headers(client, auth_headers, fake_bitpay):
 
 
 def test_bitpay_pay_composes_https_callback_url(client, auth_headers, fake_bitpay, monkeypatch):
+    # The gate now requires a non-production PUBLIC_SITE_ORIGIN, so the callback
+    # is (and must be) composed from that validated origin rather than the
+    # production default; the composition + HTTPS guarantee is what this pins.
     monkeypatch.delenv("BITPAY_CALLBACK_URL", raising=False)
-    monkeypatch.delenv("PUBLIC_SITE_ORIGIN", raising=False)
+    monkeypatch.setenv("PUBLIC_SITE_ORIGIN", "https://staging.spaghettiprints.ir")
     _, token = make_approved(client, auth_headers)
     assert bitpay_pay(client, token).status_code == 200
-    from app.services import bitpay, commerce
+    from app.services import bitpay
 
     recorded = next(iter(fake_bitpay.sessions.values()))
-    assert recorded["callback_url"] == commerce.DEFAULT_PUBLIC_SITE_ORIGIN + bitpay.CALLBACK_PATH
+    assert recorded["callback_url"] == "https://staging.spaghettiprints.ir" + bitpay.CALLBACK_PATH
     assert recorded["callback_url"].startswith("https://")
+
+
+# ── Task 4 (fix) — the sandbox gate is enforced at *initiation* ──────
+#
+# Readiness hiding the CTA is not enough: the provider-explicit initiation
+# endpoint is public and unauthenticated, so a direct POST must be refused just
+# like the UI surface. These tests inject the offline fake (no socket) yet still
+# expect the gate to win, proving an injected provider cannot bypass it.
+
+def _production_style_env(monkeypatch, *, origin="https://spaghettiprints.ir", flag="1"):
+    """A production host carrying an accidentally-copied sandbox key + test env.
+
+    Exactly the accident the gate defends against: the key and ``BITPAY_ENV=test``
+    are present; only the deployment flags differ per case.
+    """
+    monkeypatch.setenv("BITPAY_API_KEY", "sk_test_accidentally-copied-to-prod")
+    monkeypatch.setenv("BITPAY_ENV", "test")
+    if flag is None:
+        monkeypatch.delenv("BITPAY_ENABLE_TEST_CHECKOUT", raising=False)
+    else:
+        monkeypatch.setenv("BITPAY_ENABLE_TEST_CHECKOUT", flag)
+    monkeypatch.setenv("PUBLIC_SITE_ORIGIN", origin)
+
+
+def test_bitpay_pay_refused_on_production_even_with_key_and_test_env(
+    client, auth_headers, fake_bitpay, monkeypatch
+):
+    """A direct POST cannot execute a sandbox payment on the production host."""
+    _production_style_env(monkeypatch, origin="https://spaghettiprints.ir", flag="1")
+    invoice_id, token = make_approved(client, auth_headers)
+    r = bitpay_pay(client, token)
+    assert r.status_code == 503, r.text
+    assert _attempt_count(invoice_id) == 0        # no attempt is ever recorded
+    assert fake_bitpay.sessions == {}             # the provider was never asked
+    assert r.headers["Cache-Control"] == "no-store"
+
+
+def test_bitpay_pay_refused_for_trailing_dot_production_origin(
+    client, auth_headers, fake_bitpay, monkeypatch
+):
+    """``spaghettiprints.ir.`` resolves to the same production host; it must lose."""
+    _production_style_env(monkeypatch, origin="https://spaghettiprints.ir.", flag="1")
+    invoice_id, token = make_approved(client, auth_headers)
+    assert bitpay_pay(client, token).status_code == 503
+    assert _attempt_count(invoice_id) == 0
+
+
+def test_bitpay_pay_refused_without_opt_in_flag_on_non_production(
+    client, auth_headers, fake_bitpay, monkeypatch
+):
+    # non-production origin + test env + key, but the dedicated flag is missing
+    monkeypatch.delenv("BITPAY_ENABLE_TEST_CHECKOUT", raising=False)
+    invoice_id, token = make_approved(client, auth_headers)
+    assert bitpay_pay(client, token).status_code == 503
+    assert _attempt_count(invoice_id) == 0
+
+
+def test_bitpay_pay_allowed_for_valid_non_production_opt_in(
+    client, auth_headers, fake_bitpay
+):
+    """The fixture configures a genuine non-production opt-in test deployment."""
+    invoice_id, token = make_approved(client, auth_headers)
+    r = bitpay_pay(client, token)
+    assert r.status_code == 200, r.text
+    assert _attempt_count(invoice_id) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════

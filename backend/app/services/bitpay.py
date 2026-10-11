@@ -305,8 +305,14 @@ def test_checkout_opt_in() -> bool:
 
 
 def origin_is_production(origin: str) -> bool:
-    """True when ``origin``'s host is a real production site host."""
-    host = (urlsplit(origin or "").hostname or "").lower()
+    """True when ``origin``'s host is a real production site host.
+
+    A trailing-dot FQDN (``spaghettiprints.ir.``) names the same host to every
+    resolver, and ``urlsplit`` keeps the dot, so the host is normalised before
+    the comparison. Without it a trailing-dot production origin would silently
+    evade this check and re-enable a sandbox checkout.
+    """
+    host = (urlsplit(origin or "").hostname or "").lower().rstrip(".")
     return host in PRODUCTION_SITE_HOSTS
 
 
@@ -324,6 +330,37 @@ def origin_is_non_production() -> bool:
     except Exception:  # noqa: BLE001 - any config/validation failure fails closed
         return False
     return not origin_is_production(origin)
+
+
+def test_checkout_allowed() -> bool:
+    """The single sandbox-safety predicate — readiness **and** initiation.
+
+    True only when ALL of these hold:
+
+    * a merchant key (``BITPAY_API_KEY``) is present;
+    * ``BITPAY_ENV`` resolves to the sandbox (``test``);
+    * the dedicated ``BITPAY_ENABLE_TEST_CHECKOUT`` opt-in is truthy; and
+    * ``PUBLIC_SITE_ORIGIN`` is validated and provably non-production.
+
+    Anything else — a live env, a missing opt-in, a production (or
+    trailing-dot production) origin, or a misconfigured ``BITPAY_ENV`` — is
+    ``False`` (fails closed).
+
+    Both the public readiness snapshot and the payment-initiation route call
+    this one function, so the surfacing gate and the execution gate can never
+    drift apart.
+    """
+    if not (os.getenv("BITPAY_API_KEY") or "").strip():
+        return False
+    try:
+        env = resolve_env()
+    except BitPayConfigError:
+        return False
+    return (
+        env == ENV_TEST
+        and test_checkout_opt_in()
+        and origin_is_non_production()
+    )
 
 
 # ── Client ───────────────────────────────────────────────────────────
@@ -566,12 +603,10 @@ def public_readiness() -> dict:
     except BitPayConfigError:
         return {"enabled": False, "configured": False, "environment": None}
     return {
-        "enabled": (
-            key_present
-            and env == ENV_TEST
-            and test_checkout_opt_in()
-            and origin_is_non_production()
-        ),
+        # ``enabled`` IS the shared predicate, so this snapshot and the
+        # initiation route can never disagree about whether a test checkout is
+        # permitted.
+        "enabled": test_checkout_allowed(),
         "configured": key_present,
         "environment": "test" if env == ENV_TEST else "live",
     }

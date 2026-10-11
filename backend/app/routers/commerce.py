@@ -707,8 +707,22 @@ def pay_invoice_bitpay(
     matched on — and returns the gateway's HTTPS portal URL. Same validity and
     idempotency rules as DigiPay; the private bearer token is never forwarded to
     the gateway.
+
+    A sandbox checkout is only *executed* on an explicitly opted-in, provably
+    non-production test deployment (the same Task-4 predicate that gates the
+    public readiness snapshot). The check runs before the provider is resolved
+    and independently of any injected client, so a direct POST cannot run a
+    sandbox payment on the production host; the specific refusal is ``503``.
     """
     response.headers.update(NO_STORE_HEADERS)
+
+    if not bitpay.test_checkout_allowed():
+        http_exc = HTTPException(
+            status_code=503,
+            detail="درگاه پرداخت بیت‌پی در این محیط غیرفعال است",
+        )
+        http_exc.headers = {**NO_STORE_HEADERS}
+        raise http_exc
 
     if client is None:
         try:

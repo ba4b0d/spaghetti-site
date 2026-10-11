@@ -110,6 +110,20 @@ def test_production_origin_with_test_key_and_flag_stays_disabled(
     assert body["bitpay"]["environment"] == "test"
 
 
+@pytest.mark.parametrize(
+    "origin",
+    ["https://spaghettiprints.ir.", "https://www.spaghettiprints.ir."],
+)
+def test_trailing_dot_production_origin_stays_disabled(client, monkeypatch, origin):
+    # A trailing-dot FQDN is the same host to every resolver (and to urlsplit,
+    # which keeps the dot); it must not evade the production check.
+    body = _readiness(client, monkeypatch, origin=origin).json()
+
+    assert body["bitpay"]["enabled"] is False
+    assert body["bitpay"]["configured"] is True
+    assert body["bitpay"]["environment"] == "test"
+
+
 def test_default_origin_is_production_so_bitpay_stays_disabled(client, monkeypatch):
     # No PUBLIC_SITE_ORIGIN → the shared helper defaults to the production site,
     # so even a key + flag + test env cannot surface a sandbox checkout.
