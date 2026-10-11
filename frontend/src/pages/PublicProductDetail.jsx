@@ -712,31 +712,34 @@ export default function PublicProductDetail() {
           })()}
 
           {/* CTAs */}
-          <div className="pt-4 mt-auto border-t flex flex-col sm:flex-row gap-3 flex-wrap" style={{ borderColor: 'var(--border-color)' }}>
+          <div className="pt-4 mt-auto border-t flex flex-col gap-2.5" style={{ borderColor: 'var(--border-color)' }}>
             <button
               type="button"
-              className="btn-primary flex-1 inline-flex items-center justify-center gap-2"
+              className="btn-primary w-full inline-flex items-center justify-center gap-2 whitespace-nowrap text-sm font-bold py-3 shadow-sm"
               onClick={handleAddToCart}
+              style={added ? { backgroundColor: 'var(--success, #16a34a)' } : undefined}
             >
-              <ShoppingCart size={18} />
-              {added ? 'به سبد خرید اضافه شد ✓' : 'افزودن به سبد خرید'}
+              <ShoppingCart size={19} />
+              <span>{added ? 'به سبد خرید اضافه شد ✓' : 'افزودن به سبد خرید'}</span>
             </button>
-            <Link
-              to="/contact"
-              className="btn-secondary flex-1 inline-flex items-center justify-center gap-2"
-            >
-              <MessageCircle size={18} />
-              تماس برای سفارش
-            </Link>
-            <button
-              type="button"
-              onClick={handleShare}
-              className="btn-secondary inline-flex items-center justify-center shrink-0 self-start sm:self-center w-11 h-11 p-0"
-              aria-label={shareCopied ? 'کپی شد ✓' : 'اشتراک‌گذاری محصول'}
-              title={shareCopied ? 'کپی شد ✓' : 'اشتراک‌گذاری محصول'}
-            >
-              {shareCopied ? <Check size={18} /> : <Share2 size={18} />}
-            </button>
+            <div className="flex items-center gap-2.5">
+              <Link
+                to="/contact"
+                className="btn-secondary flex-1 inline-flex items-center justify-center gap-2 whitespace-nowrap text-sm py-2.5"
+              >
+                <MessageCircle size={18} />
+                <span>تماس برای سفارش</span>
+              </Link>
+              <button
+                type="button"
+                onClick={handleShare}
+                className="btn-secondary inline-flex items-center justify-center shrink-0 w-11 h-11 p-0 rounded-xl"
+                aria-label={shareCopied ? 'کپی شد ✓' : 'اشتراک‌گذاری محصول'}
+                title={shareCopied ? 'کپی شد ✓' : 'اشتراک‌گذاری محصول'}
+              >
+                {shareCopied ? <Check size={18} /> : <Share2 size={18} />}
+              </button>
+            </div>
           </div>
           <p className="sr-only" aria-live="polite">
             {added ? 'محصول به سبد خرید اضافه شد' : ''}
