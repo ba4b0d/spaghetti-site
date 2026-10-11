@@ -14,6 +14,11 @@ written to the log:
 
       GET|POST /api/v1/commerce/snappay/callback?<anything>
 
+* the BitPay gateway *callback query string* — ``trans_id`` / ``id_get`` arrive
+  as query params and, by the same never-log-a-callback-query rule, are dropped::
+
+      GET /api/v1/commerce/bitpay/callback?trans_id=<n>&id_get=<n>
+
 nginx is configured to disable its own access log for both prefixes (see
 ``frontend/nginx.conf``), but the backend keeps uvicorn's access log
 (``docker-compose.yml``). The filters here rewrite the credential in uvicorn's
@@ -104,8 +109,41 @@ class RedactSnappayCallbackFilter(logging.Filter):
         return True
 
 
+# ── BitPay gateway GET callback (URL *query* string) ─────────────────────
+# ``trans_id`` and ``id_get`` arrive as query params on a fixed path. They are
+# gateway transaction identifiers, not credentials, but the same never-log-a-
+# callback-query rule applies, so only the fixed path is retained. Matched as a
+# path prefix (with an optional trailing segment) so a query on a look-alike
+# sub-path is still scrubbed, case-insensitively to mirror the nginx `~*`
+# companion.
+_BITPAY_CALLBACK_RE = re.compile(
+    r"(/api/v1/commerce/bitpay/callback(?:/[^\s?]*)?)(\?[^\s]*)?",
+    re.IGNORECASE,
+)
+
+
+def redact_bitpay_query(value: str) -> str:
+    """Return ``value`` with any query string on the BitPay callback redacted."""
+    return _BITPAY_CALLBACK_RE.sub(
+        lambda m: m.group(1) + ("?" + REDACTED if m.group(2) else ""),
+        value,
+    )
+
+
+class RedactBitpayCallbackFilter(logging.Filter):
+    """Scrub the BitPay callback query from the request line of access records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - stdlib name
+        _redact_string_args(record, _BITPAY_CALLBACK_RE, redact_bitpay_query)
+        return True
+
+
 # Every credential filter, installed together (each at most once) on uvicorn.access.
-_ACCESS_FILTERS = (RedactInvoiceTokenFilter, RedactSnappayCallbackFilter)
+_ACCESS_FILTERS = (
+    RedactInvoiceTokenFilter,
+    RedactSnappayCallbackFilter,
+    RedactBitpayCallbackFilter,
+)
 
 
 def install_access_log_redaction() -> None:

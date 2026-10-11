@@ -524,6 +524,10 @@ COMMERCE_PAYMENT_ATTEMPT_STATES = (
 ACTIVE_PAYMENT_ATTEMPT_STATES = ("initiating", "pending", "unknown")
 
 PAYMENT_PROVIDER_DIGIPAY = "digipay"
+# Task 2: the BitPay gateway is a second provider recorded on the same attempt
+# table. ``provider`` therefore identifies which adapter issued the attempt and
+# must never be assumed to be DigiPay by shared settlement code.
+PAYMENT_PROVIDER_BITPAY = "bitpay"
 
 # DigiPay UPG ticket type used in v1. Only the IPG/Wallet direct-payment flow
 # is enabled: credit/BNPL additionally require a `basketDetailsDto` payload and
@@ -572,6 +576,13 @@ class CommercePaymentAttempt(Base):
     # request must never reuse the ticket type in place of this value.
     payment_method = Column(Integer, nullable=True)
     tracking_code = Column(String(80), nullable=True)
+    # BitPay's ``gateway-result-second`` verify needs BOTH the ``trans_id`` (the
+    # transaction id the payer portal appends to our GET callback) and the
+    # ``id_get`` returned by ``gateway-send`` at initiation. ``tracking_code``
+    # holds the durable ``id_get`` (it is the key that links an untrusted GET
+    # callback back to the attempt); this column holds the ``trans_id`` so a
+    # timed-out verify can still be reconciled by staff. NULL for DigiPay.
+    provider_trans_id = Column(Integer, nullable=True)
     redirect_url = Column(String(1000), nullable=True)
     last_error = Column(String(300), nullable=True)
     verified_at = Column(DateTime, nullable=True)

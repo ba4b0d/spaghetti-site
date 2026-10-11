@@ -62,6 +62,7 @@ from app.routers.audit_logs import router as audit_router
 from app.routers.commerce import router as commerce_router
 from app.routers.digipay_callback import router as digipay_callback_router
 from app.routers.snappay_callback import router as snappay_callback_router
+from app.routers.bitpay_callback import router as bitpay_callback_router
 from app.telegram_bot import start_telegram_bot_thread, send_telegram_notification
 
 from sqlalchemy import inspect, text
@@ -396,6 +397,7 @@ app.include_router(catalog_router)  # No auth — public catalog
 app.include_router(commerce_router)  # Public request intake + staff request listing (auth per route)
 app.include_router(digipay_callback_router)  # DigiPay UPG callback (untrusted form POST, verify server-side)
 app.include_router(snappay_callback_router)  # SnappPay onboarding reachability stub (no payment processing)
+app.include_router(bitpay_callback_router)  # BitPay GET callback (untrusted query, verify server-side)
 
 # ── Static files for uploads with immutable caching ─────────────────
 class CachedStaticFiles(StaticFiles):

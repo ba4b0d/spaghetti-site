@@ -36,6 +36,7 @@ from app.routers.auth import limiter, require_staff_role
 from app.services import commerce as commerce_service
 from app.services import commerce_notifications
 from app.services import commerce_otp
+from app.services import bitpay
 from app.services import digipay
 from app.services.commerce import (
     MAX_DISTINCT_PRODUCTS,
@@ -666,6 +667,66 @@ def pay_invoice(
     }
 
 
+@router.post("/invoices/{token}/pay/bitpay")
+@limiter.limit("10/minute")
+def pay_invoice_bitpay(
+    request: Request,
+    response: Response,
+    token: str = Path(..., min_length=1, max_length=200),
+    db: Session = Depends(get_db),
+    client=Depends(bitpay.client_dependency),
+):
+    """Public — start (or resume) a BitPay payment for an approved invoice.
+
+    Provider-explicit sibling of ``/pay`` (DigiPay): records a durable attempt
+    tagged ``provider=bitpay`` — persisting the ``id_get`` the callback will be
+    matched on — and returns the gateway's HTTPS portal URL. Same validity and
+    idempotency rules as DigiPay; the private bearer token is never forwarded to
+    the gateway.
+    """
+    response.headers.update(NO_STORE_HEADERS)
+
+    if client is None:
+        try:
+            client = bitpay.get_client()
+        except bitpay.BitPayConfigError:
+            http_exc = HTTPException(status_code=503, detail="درگاه پرداخت پیکربندی نشده است")
+            http_exc.headers = {**NO_STORE_HEADERS}
+            raise http_exc
+
+    try:
+        callback_url = bitpay.build_callback_url()
+    except (bitpay.BitPayConfigError, commerce_service.CommerceConfigError) as exc:
+        http_exc = HTTPException(status_code=500, detail="پیکربندی درگاه پرداخت نامعتبر است")
+        http_exc.headers = {**NO_STORE_HEADERS}
+        raise http_exc from exc
+
+    try:
+        invoice = commerce_service.resolve_public_invoice(db, token)
+        attempt = commerce_service.start_bitpay_payment(
+            db, invoice, client, callback_url=callback_url
+        )
+    except (
+        CommerceValidationError,
+        commerce_service.CommerceNotFoundError,
+        commerce_service.CommerceGoneError,
+        commerce_service.CommerceStateError,
+        commerce_service.CommerceConfigError,
+        commerce_service.CommercePaymentError,
+        commerce_service.CommerceGatewayUnavailableError,
+    ) as exc:
+        http_exc = _validation_error(exc)
+        http_exc.headers = {**(http_exc.headers or {}), **NO_STORE_HEADERS}
+        raise http_exc
+
+    return {
+        "provider": "bitpay",
+        "state": attempt.state,
+        "amount_rial": attempt.amount_rial,
+        "redirect_url": attempt.redirect_url,
+    }
+
+
 # ── Task 3: staff payment reconciliation ─────────────────────────────
 
 class PaymentReconcileRequest(BaseModel):
@@ -721,6 +782,7 @@ def reconcile_staff_payment(
     user=Depends(require_staff_role),
     db: Session = Depends(get_db),
     client=Depends(digipay.client_dependency),
+    bitpay_client=Depends(bitpay.client_dependency),
 ):
     """Staff — resolve a stuck attempt (re-query the provider, or abandon it).
 
@@ -746,17 +808,27 @@ def reconcile_staff_payment(
             detail="برای رهاسازی تراکنش، ثبت دلیل الزامی است",
         )
 
-    if client is None and body.action == "verify":
+    # Resolve a provider-appropriate client for "verify": a BitPay attempt must
+    # be re-queried through the BitPay adapter, never the DigiPay one.
+    provider_client = client
+    if attempt.provider == commerce_service.PAYMENT_PROVIDER_BITPAY:
+        provider_client = bitpay_client
+        if provider_client is None and body.action == "verify":
+            try:
+                provider_client = bitpay.get_client()
+            except bitpay.BitPayConfigError:
+                provider_client = None
+    elif provider_client is None and body.action == "verify":
         try:
-            client = digipay.get_client()
+            provider_client = digipay.get_client()
         except digipay.DigiPayConfigError:
             # Unconfigured gateway: reconcile() keeps the attempt open rather
             # than guessing an outcome.
-            client = None
+            provider_client = None
 
     try:
         resolved = commerce_service.reconcile_payment_attempt(
-            db, attempt, client, abandon=(body.action == "abandon"), reason=body.reason,
+            db, attempt, provider_client, abandon=(body.action == "abandon"), reason=body.reason,
             background_tasks=background_tasks,
         )
     except commerce_service.CommerceValidationError as exc:

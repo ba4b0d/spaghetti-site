@@ -506,3 +506,26 @@ def client_dependency() -> BitPayClient | None:
     startup 500. Tests override it with a fake provider.
     """
     return None
+
+
+# ── callback URL (Task 2 wiring) ─────────────────────────────────────
+
+# The fixed, exact path the gateway GET-callbacks. Composed with the public
+# deployment origin it yields e.g.
+# ``https://spaghettiprints.ir/api/v1/commerce/bitpay/callback``.
+CALLBACK_PATH = "/api/v1/commerce/bitpay/callback"
+
+
+def build_callback_url() -> str:
+    """The redirect the gateway sends the payer's browser back to.
+
+    Server config only: an explicit ``BITPAY_CALLBACK_URL`` wins (validated as a
+    bare absolute HTTPS URL), otherwise the validated public site origin is
+    used, exactly like the DigiPay adapter.
+    """
+    raw = (os.getenv("BITPAY_CALLBACK_URL") or "").strip()
+    if raw:
+        return _valid_callback_url(raw)
+    from app.services.commerce import public_site_origin
+
+    return f"{public_site_origin()}{CALLBACK_PATH}"

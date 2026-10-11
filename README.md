@@ -122,6 +122,10 @@ Copy `backend/.env.example` to `backend/.env` and configure:
 | `DIGIPAY_ENV` | DigiPay UPG base URL selector: `production` → `api.mydigipay.com`, `staging` (or `uat`/`test`) → `uat.mydigipay.info`. **Caution:** `staging` points every payment (and its redirect allowlist) at the UAT host — never combine it with live merchant credentials; leave as `production` | `production` |
 | `DIGIPAY_BASE_URL` | Optional HTTPS host override (DigiPay hosts only; any other host is refused) | *optional* |
 | `DIGIPAY_CALLBACK_URL` | Optional absolute HTTPS callback; defaults to `PUBLIC_SITE_ORIGIN` + `/api/v1/commerce/digipay/callback` | *optional* |
+| `BITPAY_API_KEY` | BitPay gateway API key. Leave blank to disable BitPay — its pay endpoint then returns `503` instead of pretending to work | *optional* |
+| `BITPAY_ENV` | BitPay environment selector: `production` → `/payment/*`, `test` (or `sandbox`/`staging`/`uat`) → `/payment-test/*` — both on `bitpay.ir`. A typo never silently means production | `production` |
+| `BITPAY_BASE_URL` | Optional HTTPS override; must be `https://bitpay.ir` (any other host is refused) | *optional* |
+| `BITPAY_CALLBACK_URL` | Optional absolute HTTPS callback; defaults to `PUBLIC_SITE_ORIGIN` + `/api/v1/commerce/bitpay/callback` | *optional* |
 | `COMMERCE_NOTIFY_TELEGRAM` | Enable Telegram admin alerts (`0`/`false` to silence) | `1` |
 | `COMMERCE_NOTIFY_SMS` | Enable SMS.ir admin alerts | `1` |
 | `SMS_IR_API_KEY` / `SMS_IR_TEMPLATE_ID` / `SMS_IR_ADMIN_MOBILE` | SMS.ir API key + approved admin-alert template id + recipient. All three required together or the channel is skipped. The approved template's parameter placeholders must match the names the app sends **exactly, case-sensitively** (the admin-alert template `309349` is approved with `#EVENT#` / `#CODE#`, sent uppercase as `EVENT` / `CODE`); a differently-cased name is not substituted and the send is rejected | *optional* |
