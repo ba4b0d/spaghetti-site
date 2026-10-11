@@ -452,7 +452,7 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
                     {item.description}
                   </p>
                   <p className="text-xs mt-1 tabular-nums" style={{ color: 'var(--text-muted)' }}>
-                    <span className="font-bold">{item.qty}</span> عدد × {formatPrice(item.unit_toman)} تومان
+                    <span className="font-bold">{item.qty}</span> عدد × {formatPrice(item.unit_toman)}
                   </p>
                 </div>
               </div>
@@ -460,7 +460,6 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
                 <span className="text-sm font-bold tabular-nums block" style={{ color: 'var(--text-primary)' }}>
                   {formatPrice(item.line_total_toman)}
                 </span>
-                <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>تومان</span>
               </div>
             </div>
           ))}
@@ -496,13 +495,13 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
           <div className="flex items-center justify-between text-xs sm:text-sm" style={{ color: 'var(--text-secondary)' }}>
             <span>جمع اقلام</span>
             <span className="tabular-nums font-semibold" data-testid="invoice-subtotal">
-              {formatPrice(subtotal)} تومان
+              {formatPrice(subtotal)}
             </span>
           </div>
           <div className="flex items-center justify-between text-xs sm:text-sm" style={{ color: 'var(--text-secondary)' }}>
             <span>هزینه بسته‌بندی و ارسال</span>
             <span className="tabular-nums font-semibold" data-testid="invoice-shipping">
-              {formatPrice(invoice.shipping_toman || 0)} تومان
+              {formatPrice(invoice.shipping_toman || 0)}
             </span>
           </div>
           <div
@@ -519,9 +518,6 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
                 data-testid="invoice-total"
               >
                 {formatPrice(invoice.total_toman)}
-              </span>
-              <span className="text-xs font-semibold mr-1.5" style={{ color: 'var(--brand-orange-deep, #e07b2c)' }}>
-                تومان
               </span>
             </div>
           </div>
