@@ -609,6 +609,28 @@ def read_public_invoice(
     return commerce_service.serialize_public_invoice(invoice)
 
 
+# ── Task 3: public payment-method readiness ──────────────────────────
+
+@router.get("/payment-methods")
+@limiter.limit("60/minute")
+def list_payment_methods(request: Request, response: Response):
+    """Public — non-secret readiness of the selectable payment gateways.
+
+    The storefront pay page reads this before rendering any gateway CTA so a
+    method can never look payable when the backend cannot actually pay through
+    it. DigiPay is parked and the SnappPay onboarding stub is non-settling, so
+    both are always reported disabled; BitPay is enabled only for an explicitly
+    configured *test* deployment (a merchant key present and a non-production
+    ``BITPAY_ENV``). No credential — least of all the API key — is included.
+    """
+    response.headers.update(NO_STORE_HEADERS)
+    return {
+        "bitpay": bitpay.public_readiness(),
+        "digipay": {"enabled": False},
+        "snapppay": {"enabled": False},
+    }
+
+
 # ── Task 3: public payment initiation ────────────────────────────────
 
 @router.post("/invoices/{token}/pay")

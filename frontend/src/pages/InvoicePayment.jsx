@@ -15,7 +15,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { formatPrice } from '../lib/constants';
-import { getPublicInvoice, payInvoice } from '../lib/commerceApi';
+import { getPaymentMethods, getPublicInvoice, payInvoice } from '../lib/commerceApi';
 import { useNoReferrerPolicy } from '../hooks/useNoReferrerPolicy';
 import PaymentShell from '../components/PaymentShell';
 
@@ -29,9 +29,11 @@ import PaymentShell from '../components/PaymentShell';
  *
  * Payment is possible only for an approved, unexpired, unpaid invoice — the
  * server is authoritative, so this page mirrors (never overrides) the invoice
- * state it reads. DigiPay is the only enabled gateway in v1; BitPay and
- * SnappPay are shown as explicitly unavailable so a disabled method can never
- * look payable.
+ * state it reads. The set of *selectable* gateways is not hard-coded here: it
+ * comes from the backend's non-secret readiness endpoint
+ * (``GET …/payment-methods``). BitPay is a selectable choice only when the
+ * server reports it configured for a test deployment; DigiPay stays parked and
+ * SnappPay is disabled, so a non-payable method can never look payable.
  */
 
 /* ── Gateway Logos (Vector SVGs) ────────────────────────────────────────── */
@@ -83,14 +85,22 @@ function BitPayLogo({ className = 'w-7 h-7' }) {
   );
 }
 
-// DigiPay is the sole enabled method. The disabled entries are display-only cards.
+// Display catalog (order = presentation order). Whether a card is *selectable*
+// is decided at runtime from the backend readiness endpoint, never hard-coded:
+// `enabledMethods` below is the single source of truth for that.
 const PAYMENT_METHODS = [
+  {
+    id: 'bitpay',
+    label: 'بیت‌پی',
+    subtitle: 'درگاه پرداخت مستقیم',
+    badge: 'فعال',
+    Logo: BitPayLogo,
+  },
   {
     id: 'digipay',
     label: 'دیجی‌پی',
     subtitle: 'کارت‌های بانکی عضو شتاب',
-    badge: 'فعال',
-    enabled: true,
+    badge: 'غیرفعال',
     Logo: DigiPayLogo,
   },
   {
@@ -98,34 +108,48 @@ const PAYMENT_METHODS = [
     label: 'اسنپ‌پی',
     subtitle: 'پرداخت اقساطی ۴ ماهه',
     badge: 'به‌زودی',
-    enabled: false,
     Logo: SnappPayLogo,
-  },
-  {
-    id: 'bitpay',
-    label: 'بیت‌پی',
-    subtitle: 'درگاه پرداخت مستقیم',
-    badge: 'به‌زودی',
-    enabled: false,
-    Logo: BitPayLogo,
   },
 ];
 
 /**
- * DigiPay web-pay hosts allowed to receive the browser redirect. Mirrors the
- * backend allowlist (live + UAT) as defence in depth: the browser is never
- * handed an arbitrary or plaintext URL even if a response is tampered with.
+ * Per-provider gateway allowlist for the browser redirect.
+ *
+ * Mirrors the backend as defence in depth: the browser is never handed an
+ * arbitrary or plaintext URL even if a provider response is tampered with.
+ * DigiPay host names are whitelisted as-is; BitPay lives entirely on
+ * ``bitpay.ir``, where live vs. sandbox is a **path** prefix (``/payment`` vs
+ * ``/payment-test``), so both documented portal prefixes are accepted while
+ * any other host, path, query or shape is refused.
  */
-export const ALLOWED_GATEWAY_HOSTS = Object.freeze([
-  'web.mydigipay.com',
-  'uatweb.mydigipay.info',
-]);
+export const GATEWAY_ALLOWLIST = Object.freeze({
+  digipay: Object.freeze({
+    hosts: Object.freeze(['web.mydigipay.com', 'uatweb.mydigipay.info']),
+    pathPattern: null,
+    rejectQuery: false,
+  }),
+  bitpay: Object.freeze({
+    hosts: Object.freeze(['bitpay.ir']),
+    // documented live + sandbox portal: /payment[-test]/gateway-<id_get>-get
+    pathPattern: /^\/payment(?:-test)?\/gateway-\d+-get$/,
+    rejectQuery: true,
+  }),
+});
+
+/** DigiPay web-pay hosts (alias kept for callers of the previous name). */
+export const ALLOWED_GATEWAY_HOSTS = GATEWAY_ALLOWLIST.digipay.hosts;
 
 /**
- * Return the validated absolute HTTPS gateway URL, or ``null`` when the server
- * URL is not an allowed DigiPay host.
+ * Return the validated absolute HTTPS gateway URL for ``provider``, or ``null``
+ * when the server's URL is not allowed for that provider. An unknown/missing
+ * provider fails closed.
  */
-export function validateGatewayUrl(url) {
+export function validateGatewayUrl(url, provider) {
+  const hasRules =
+    typeof provider === 'string' &&
+    Object.prototype.hasOwnProperty.call(GATEWAY_ALLOWLIST, provider);
+  const rules = hasRules ? GATEWAY_ALLOWLIST[provider] : null;
+  if (!rules) return null;
   if (typeof url !== 'string' || !url.trim()) return null;
   let parsed;
   try {
@@ -135,7 +159,9 @@ export function validateGatewayUrl(url) {
   }
   if (parsed.protocol !== 'https:') return null;
   if (parsed.username || parsed.password) return null;
-  if (!ALLOWED_GATEWAY_HOSTS.includes(parsed.hostname.toLowerCase())) return null;
+  if (rules.rejectQuery && (parsed.search || parsed.hash)) return null;
+  if (!rules.hosts.includes(parsed.hostname.toLowerCase())) return null;
+  if (rules.pathPattern && !rules.pathPattern.test(parsed.pathname)) return null;
   return parsed.href;
 }
 
@@ -186,6 +212,11 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
   const [httpStatus, setHttpStatus] = useState(null);
   const [loadError, setLoadError] = useState(null);
 
+  // Non-secret gateway readiness from the server. `null` until it resolves, so
+  // nothing is selectable while we do not yet know what the server supports.
+  const [methods, setMethods] = useState(null);
+  const [selectedMethod, setSelectedMethod] = useState(null);
+
   const [payState, setPayState] = useState('idle'); // idle | submitting | error
   const [payError, setPayError] = useState(null);
   const mountedRef = useRef(true);
@@ -224,14 +255,45 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
     return () => controller.abort();
   }, [load]);
 
+  // Read the server's gateway readiness once. A failure is fail-closed: without
+  // a positive signal nothing becomes selectable, so the page can never offer a
+  // method the backend cannot actually pay through.
+  useEffect(() => {
+    const controller = new AbortController();
+    getPaymentMethods({ signal: controller.signal })
+      .then((res) => {
+        if (mountedRef.current) setMethods(res?.data || {});
+      })
+      .catch((err) => {
+        if (isCancel(err) || !mountedRef.current) return;
+        setMethods({});
+      });
+    return () => controller.abort();
+  }, []);
+
+  const enabledMethods = useMemo(() => {
+    const map = {};
+    for (const method of PAYMENT_METHODS) {
+      map[method.id] = Boolean(methods?.[method.id]?.enabled);
+    }
+    return map;
+  }, [methods]);
+
+  // Keep the selection on the first enabled gateway (BitPay is the only one the
+  // server ever enables); never leave a stale selection on a now-disabled one.
+  useEffect(() => {
+    const firstEnabled = PAYMENT_METHODS.find((m) => enabledMethods[m.id])?.id ?? null;
+    setSelectedMethod(firstEnabled);
+  }, [enabledMethods]);
+
   const handlePay = useCallback(async () => {
-    if (payState === 'submitting') return;
+    if (payState === 'submitting' || !selectedMethod) return;
     setPayError(null);
     setPayState('submitting');
     try {
-      const res = await payInvoice(token);
+      const res = await payInvoice(token, selectedMethod);
       const data = res?.data || {};
-      const target = validateGatewayUrl(data.redirect_url);
+      const target = validateGatewayUrl(data.redirect_url, selectedMethod);
       if (!target) {
         // Never follow an unvalidated URL: refuse and let the customer retry.
         setPayState('error');
@@ -243,9 +305,20 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
     } catch (err) {
       if (isCancel(err) || !mountedRef.current) return;
       setPayState('error');
-      setPayError(extractPaymentError(err));
+      const status = err?.response?.status;
+      if (status === 503) {
+        // The gateway is not configured/available right now — say so plainly
+        // instead of echoing a raw server string.
+        setPayError(
+          'درگاه پرداخت در حال حاضر در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.'
+        );
+      } else {
+        // 409 conflicts (another attempt in flight / already paid) surface the
+        // server's own explanation.
+        setPayError(extractPaymentError(err));
+      }
     }
-  }, [payState, token, redirect]);
+  }, [payState, selectedMethod, token, redirect]);
 
   const items = useMemo(() => (Array.isArray(invoice?.items) ? invoice.items : []), [invoice]);
   const subtotal = useMemo(
@@ -381,6 +454,7 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
   }
 
   const submitting = payState === 'submitting';
+  const selectedMeta = PAYMENT_METHODS.find((m) => m.id === selectedMethod) || null;
 
   return (
     <PaymentShell>
@@ -537,7 +611,8 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {PAYMENT_METHODS.map((method) => {
               const LogoComp = method.Logo;
-              const isSelected = method.enabled;
+              const isEnabled = enabledMethods[method.id];
+              const isSelected = isEnabled && selectedMethod === method.id;
               return (
                 <label
                   key={method.id}
@@ -548,8 +623,8 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
                     boxShadow: isSelected
                       ? '0 4px 14px rgba(255, 154, 61, 0.2), 0 0 0 1px var(--brand-orange, #ff9a3d)'
                       : 'none',
-                    opacity: method.enabled ? 1 : 0.6,
-                    cursor: method.enabled ? 'pointer' : 'not-allowed',
+                    opacity: isEnabled ? 1 : 0.6,
+                    cursor: isEnabled ? 'pointer' : 'not-allowed',
                   }}
                 >
                   {/* Semantic Radio Input for accessibility and test suites */}
@@ -557,9 +632,9 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
                     type="radio"
                     name="payment-method"
                     value={method.id}
-                    checked={method.enabled}
-                    disabled={!method.enabled}
-                    readOnly
+                    checked={isSelected}
+                    disabled={!isEnabled}
+                    onChange={() => isEnabled && setSelectedMethod(method.id)}
                     className="sr-only"
                     aria-label={method.label}
                   />
@@ -569,7 +644,7 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
                     <div className="p-0.5 rounded-xl bg-white shadow-sm border border-black/5 shrink-0 flex items-center justify-center">
                       <LogoComp className="w-8 h-8" />
                     </div>
-                    {method.enabled ? (
+                    {isEnabled ? (
                       <span
                         className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold"
                         style={{
@@ -640,24 +715,40 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
 
         {/* Action Button & Security Notes */}
         <div className="p-5 sm:p-6 pt-3 space-y-3.5">
-          <button
-            type="button"
-            className="w-full inline-flex items-center justify-center gap-2.5 py-3.5 px-6 rounded-xl font-bold text-sm text-white shadow-md cursor-pointer transition-all hover:brightness-105 active:scale-[0.99] disabled:cursor-not-allowed"
-            onClick={handlePay}
-            disabled={submitting}
-            style={{
-              background: 'linear-gradient(135deg, var(--brand-orange, #ff9a3d) 0%, var(--brand-orange-deep, #e07b2c) 100%)',
-              boxShadow: '0 4px 16px rgba(224, 123, 44, 0.35)',
-              opacity: submitting ? 0.75 : 1,
-            }}
-          >
-            {submitting ? (
-              <Loader2 size={19} className="animate-spin" />
-            ) : (
-              <ShieldCheck size={19} />
-            )}
-            {submitting ? 'در حال انتقال به درگاه…' : 'پرداخت با دیجی‌پی'}
-          </button>
+          {selectedMeta ? (
+            <button
+              type="button"
+              className="w-full inline-flex items-center justify-center gap-2.5 py-3.5 px-6 rounded-xl font-bold text-sm text-white shadow-md cursor-pointer transition-all hover:brightness-105 active:scale-[0.99] disabled:cursor-not-allowed"
+              onClick={handlePay}
+              disabled={submitting}
+              style={{
+                background: 'linear-gradient(135deg, var(--brand-orange, #ff9a3d) 0%, var(--brand-orange-deep, #e07b2c) 100%)',
+                boxShadow: '0 4px 16px rgba(224, 123, 44, 0.35)',
+                opacity: submitting ? 0.75 : 1,
+              }}
+            >
+              {submitting ? (
+                <Loader2 size={19} className="animate-spin" />
+              ) : (
+                <ShieldCheck size={19} />
+              )}
+              {submitting ? 'در حال انتقال به درگاه…' : `پرداخت با ${selectedMeta.label}`}
+            </button>
+          ) : (
+            <div
+              role="status"
+              data-testid="payment-unavailable"
+              className="w-full p-4 rounded-xl border text-center text-xs leading-relaxed"
+              style={{
+                backgroundColor: 'var(--bg-secondary, #eef1f9)',
+                borderColor: 'var(--border-color)',
+                color: 'var(--text-secondary)',
+              }}
+            >
+              <AlertTriangle size={18} className="mx-auto mb-2" style={{ color: '#f59e0b' }} />
+              پرداخت آنلاین این صورت‌حساب در حال حاضر فعال نیست. لطفاً با پشتیبانی تماس بگیرید تا پرداخت را برای شما هماهنگ کنند.
+            </div>
+          )}
 
           {invoice?.expires_at ? (
             <p className="text-[11px] text-center flex items-center justify-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
@@ -676,7 +767,7 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
           >
             <ShieldCheck size={16} className="shrink-0 mt-0.5 text-[var(--brand-orange)]" />
             <span>
-              پرداخت در بستر امن درگاه دیجی‌پی (شاپرک) انجام می‌شود. پس از واریز، نتیجه به‌طور مستقیم به سیستم فروشگاه مخابره خواهد شد.
+              پرداخت در بستر امن درگاه (شاپرک) انجام می‌شود. پس از واریز، نتیجه به‌طور مستقیم به سیستم فروشگاه مخابره خواهد شد.
             </span>
           </div>
         </div>

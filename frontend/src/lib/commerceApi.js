@@ -75,11 +75,40 @@ export const getPublicInvoice = (token, config) =>
   commerceApi.get(`/invoices/${encodeURIComponent(token)}`, config);
 
 /**
- * Public — start (or resume) a DigiPay UPG payment for an approved invoice.
- * Returns `{ state, amount_rial, redirect_url }`; the caller validates
- * `redirect_url` against the DigiPay allowlist before sending the browser.
+ * Public — non-secret payment-method readiness for the pay page.
+ *
+ * Returns which gateways are actually selectable (`{ bitpay, digipay,
+ * snapppay }`, each `{ enabled }`), so the page never renders a usable CTA for
+ * a method the backend cannot pay through. No secret is involved.
  */
-export const payInvoice = (token) =>
-  commerceApi.post(`/invoices/${encodeURIComponent(token)}/pay`);
+export const getPaymentMethods = (config) =>
+  commerceApi.get('/payment-methods', config);
+
+/**
+ * Explicit provider → pay sub-path. There is deliberately **no ambient
+ * default**: a caller must name the method (BitPay is the only method the page
+ * ever selects; DigiPay stays parked), and an unknown/missing method throws
+ * rather than silently starting the wrong gateway.
+ */
+export const PAY_INVOICE_PATHS = Object.freeze({
+  digipay: '/pay',
+  bitpay: '/pay/bitpay',
+});
+
+/**
+ * Public — start (or resume) a payment for an approved invoice with an
+ * explicitly named provider.
+ *
+ * Returns `{ provider?, state, amount_rial, redirect_url }`; the caller
+ * validates `redirect_url` against that provider's allowlist before sending
+ * the browser.
+ */
+export const payInvoice = (token, method) => {
+  const path = PAY_INVOICE_PATHS[method];
+  if (!path) {
+    return Promise.reject(new Error(`unsupported payment method: ${method}`));
+  }
+  return commerceApi.post(`/invoices/${encodeURIComponent(token)}${path}`);
+};
 
 export default commerceApi;

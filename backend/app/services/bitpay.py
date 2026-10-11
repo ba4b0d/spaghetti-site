@@ -498,6 +498,27 @@ def get_client() -> BitPayClient:
     return BitPayClient(api_key=api_key)
 
 
+def public_readiness() -> dict:
+    """Non-secret readiness snapshot for the public capability endpoint.
+
+    Exposes only booleans and an environment label — never the key. ``enabled``
+    is True *only* for an explicitly-test deployment with a key configured:
+    live stays disabled until a merchant credential and a controlled live
+    payment are authorised (Task 4), so this flag can never switch a customer
+    onto production. A misconfigured ``BITPAY_ENV`` fails closed.
+    """
+    key_present = bool((os.getenv("BITPAY_API_KEY") or "").strip())
+    try:
+        env = resolve_env()
+    except BitPayConfigError:
+        return {"enabled": False, "configured": False, "environment": None}
+    return {
+        "enabled": key_present and env == ENV_TEST,
+        "configured": key_present,
+        "environment": "test" if env == ENV_TEST else "live",
+    }
+
+
 def client_dependency() -> BitPayClient | None:
     """FastAPI dependency placeholder for Task 2.
 
