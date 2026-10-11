@@ -282,6 +282,17 @@ as an untrusted hint — the invoice is settled only after a server-side
     (including the token) when an upstream error embeds the URI. A hardened
     deployment should lower `error_log` to `crit` so those lines are not kept;
     the access-log leak is fully closed.
+- **The SnappPay onboarding callback query is kept out of the logs.** The fixed
+  onboarding URL `/api/v1/commerce/snappay/callback` is a reachability stub —
+  SnappPay has issued no protocol or credentials, so the query string is
+  unparsed and whatever a caller puts there must be assumed sensitive. It is
+  therefore redacted at **both** layers, exactly like the invoice token: nginx
+  disables its access log for the callback prefix (a dedicated `^~` prefix plus
+  a case-insensitive `~*` companion, both proxying identically), and
+  `app/log_redaction.py` rewrites the callback query to `?<redacted>` in
+  `uvicorn.access`. The stub handler additionally logs only the fixed path and
+  method, never the query, headers or body. The same nginx *error*-log residual
+  as above applies.
 
 ---
 

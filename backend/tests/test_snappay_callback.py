@@ -7,7 +7,8 @@ to SnappPay *before* it issues any credentials or protocol details:
 * GET proves the route is active without asserting anything about payments;
 * POST returns a neutral ``202`` "pending" — never a success;
 * neither method mutates state;
-* the request body/query is never logged and never echoed back;
+* the request body/query is never logged by the handler (only the fixed path
+  and method are) and never echoed back; and
 * no notification transport is reached and no provider/settlement code runs; and
 * the response discloses only the fixed, non-secret neutral fields.
 
@@ -242,3 +243,38 @@ def test_responses_disclose_only_the_safe_neutral_fields(client):
     post_body = client.post(CALLBACK, json={"secret": SENTINEL}).json()
     assert set(get_body) == {"provider", "status", "callback_path", "payment_enabled"}
     assert set(post_body) == {"provider", "status", "payment_enabled"}
+
+
+# ── Safe handler logging (neither method is silently handled) ────────────
+# The POST acknowledges ANY unknown body with a neutral 202 and there is no
+# SnappPay contract to reject against, so the handler records exactly the
+# method and the fixed callback path — never the query string, headers or body
+# — so a probe/abuse is traceable without leaking anything a caller controls.
+
+def test_post_emits_one_safe_log_line_with_no_query_or_body(client, caplog):
+    with caplog.at_level(logging.INFO, logger="app.routers.snappay_callback"):
+        r = client.post(
+            f"{CALLBACK}?token={SENTINEL}",
+            json={"secret": SENTINEL, "result": "SUCCESS"},
+        )
+    assert r.status_code == 202
+    lines = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "app.routers.snappay_callback"
+    ]
+    assert lines, "an unexpected POST must not be handled silently"
+    joined = "\n".join(lines)
+    assert "POST" in joined
+    assert CALLBACK in joined
+    assert SENTINEL not in joined, "the callback query/body leaked into the handler log"
+
+
+def test_get_does_not_emit_a_log_line(client, caplog):
+    """GET answers with a descriptive body, so it needs no extra trace."""
+    with caplog.at_level(logging.DEBUG, logger="app.routers.snappay_callback"):
+        client.get(f"{CALLBACK}?token={SENTINEL}")
+    assert not [
+        rec for rec in caplog.records
+        if rec.name == "app.routers.snappay_callback"
+    ]

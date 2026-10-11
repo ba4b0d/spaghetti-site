@@ -21,8 +21,13 @@ Hard guarantees (pinned by ``tests/test_snappay_callback.py``):
   written to the store.
 * **No success assertion.** Neither method ever claims a payment succeeded or
   failed — the POST is explicitly ``pending``.
-* **No callback body/query logging.** The request body and query string are
-  never read, parsed or logged, so nothing a caller sends can leak.
+* **The handler logs nothing sensitive.** The handler never reads, parses,
+  echoes or logs the request body or query string, so nothing a caller sends
+  can leak from *application code*. A reverse proxy and uvicorn still emit a
+  per-request access line for the fixed path — the callback *query string* is
+  redacted at that layer (see ``frontend/nginx.conf`` and
+  ``app/log_redaction.py``; ``tests/test_log_redaction.py`` and
+  ``tests/test_nginx_pay_logging.py`` pin it).
 * **No payment evidence acceptance.** No caller field is parsed, echoed or
   persisted, and no provider call is made. SnappPay stays disabled and
   unintegrated — this is not a gateway.
@@ -32,10 +37,14 @@ settlement code. When SnappPay issues the real protocol and credentials, a
 separate, reviewed adapter must replace this stub; do not grow payment logic in
 this module.
 """
+import logging
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.routers.auth import limiter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/commerce/snappay", tags=["commerce-payments"])
 
@@ -79,7 +88,15 @@ def snappay_callback_acknowledge(request: Request) -> JSONResponse:
     sends is meaningless here. The response is a neutral ``202`` ("received,
     pending") — never a success — so nothing reaching this stub can be read as
     a settled payment.
+
+    Because the ``202`` accepts *any* unknown payload, the handler is not
+    entirely silent about an unexpected POST: it records exactly two safe,
+    caller-independent facts — the method and the fixed callback path. It never
+    logs the query string, headers or body, so the trace cannot leak anything a
+    caller controls (the access-log layers redact the query as well).
     """
+    # No URL (query), no body, no headers: only the fixed path and the method.
+    logger.info("snappay callback received: %s %s", request.method, CALLBACK_PATH)
     return JSONResponse(
         status_code=202,
         content={

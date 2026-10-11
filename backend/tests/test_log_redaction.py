@@ -12,8 +12,10 @@ import pytest
 from app.log_redaction import (
     REDACTED,
     RedactInvoiceTokenFilter,
+    RedactSnappayCallbackFilter,
     install_access_log_redaction,
     redact_access_path,
+    redact_snappay_query,
 )
 
 # uvicorn's access-log line shape (see uvicorn.logging.AccessFormatter).
@@ -141,3 +143,123 @@ def test_uvicorn_real_formatter_renders_the_redacted_line():
     line = formatter.format(record)
     assert "TOK9secret" not in line
     assert "/api/v1/commerce/invoices/<redacted>/pay" in line
+
+
+# ── SnappPay onboarding callback — the fixed path is a reachability stub whose
+# query string is unparsed (SnappPay issued no protocol), so the whole query
+# must be scrubbed from the uvicorn access line while the fixed path, method,
+# HTTP version and status survive and ordinary/invoice paths are untouched. ──
+
+SNAPPAY_CB = "/api/v1/commerce/snappay/callback"
+
+
+def test_redact_snappay_query_unit():
+    assert (
+        redact_snappay_query(f"{SNAPPAY_CB}?token=SEKRET&amount=1")
+        == f"{SNAPPAY_CB}?{REDACTED}"
+    )
+    # a bare callback (no query) is unchanged
+    assert redact_snappay_query(SNAPPAY_CB) == SNAPPAY_CB
+    # a query on a look-alike sub-path is still scrubbed
+    assert (
+        redact_snappay_query(f"{SNAPPAY_CB}/extra?token=SEKRET")
+        == f"{SNAPPAY_CB}/extra?{REDACTED}"
+    )
+    # ordinary paths and the invoice token path are untouched by this redactor
+    assert redact_snappay_query("/api/v1/products?page=2") == "/api/v1/products?page=2"
+    inv = "/api/v1/commerce/invoices/SEKRET/pay"
+    assert redact_snappay_query(inv) == inv
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"{SNAPPAY_CB}?token=SNAPPAYSENTINEL",
+        f"{SNAPPAY_CB}?signature=SNAPPAYSENTINEL&result=SUCCESS",
+        "/API/v1/Commerce/Snappay/Callback?token=SNAPPAYSENTINEL",  # case variant
+    ],
+)
+def test_snappay_filter_scrubs_query_and_preserves_rest(path):
+    record = _access_record(path, method="POST", status=202)
+    RedactSnappayCallbackFilter().filter(record)
+    line = record.getMessage()
+    assert "SNAPPAYSENTINEL" not in line
+    assert SNAPPAY_CB in line.lower()
+    assert REDACTED in line
+    # The method / HTTP version / status are untouched, and the record is kept.
+    assert "POST" in line and "HTTP/1.1" in line and "202" in line
+
+
+def test_snappay_filter_leaves_ordinary_and_invoice_paths_untouched():
+    for path in (
+        "/api/v1/products?page=2",
+        "/api/v1/commerce/invoices/AbC123token/pay",
+    ):
+        record = _access_record(path)
+        before = record.args
+        RedactSnappayCallbackFilter().filter(record)
+        assert record.args == before
+        assert REDACTED not in record.getMessage()
+
+
+def test_invoice_filter_leaves_the_snappay_callback_untouched():
+    """The two filters are independent: neither redacts the other's target."""
+    record = _access_record(f"{SNAPPAY_CB}?token=SEKRET")
+    before = record.args
+    RedactInvoiceTokenFilter().filter(record)
+    assert record.args == before
+    assert REDACTED not in record.getMessage()
+
+
+def test_both_credential_filters_installed_and_idempotent():
+    install_access_log_redaction()
+    install_access_log_redaction()  # must not stack duplicates
+    filters = logging.getLogger("uvicorn.access").filters
+    assert sum(isinstance(f, RedactInvoiceTokenFilter) for f in filters) == 1
+    assert sum(isinstance(f, RedactSnappayCallbackFilter) for f in filters) == 1
+
+
+def test_snappay_query_redacted_end_to_end_through_access_formatter():
+    """End-to-end through uvicorn's own AccessFormatter (it unpacks record.args)."""
+    formatter_cls = pytest.importorskip("uvicorn.logging").AccessFormatter
+    formatter = formatter_cls()
+    logger = logging.getLogger("uvicorn.access")
+    record = logger.makeRecord(
+        "uvicorn.access", logging.INFO, __file__, 0, ACCESS_MSG,
+        ("1.2.3.4", "POST", f"{SNAPPAY_CB}?token=SNAPPAYSENTINEL", "HTTP/1.1", 202),
+        None,
+    )
+    RedactSnappayCallbackFilter().filter(record)
+    line = formatter.format(record)
+    assert "SNAPPAYSENTINEL" not in line
+    assert f"{SNAPPAY_CB}?{REDACTED}" in line
+
+
+def test_snappay_access_record_emitted_and_scrubbed_end_to_end():
+    """A real access record emitted through a handler keeps the path, drops the query."""
+    logger = logging.getLogger("uvicorn.access")
+    captured: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):  # noqa: D401
+            captured.append(record.getMessage())
+
+    handler = _Capture()
+    prev_level, prev_propagate = logger.level, logger.propagate
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    install_access_log_redaction()
+    try:
+        logger.info(
+            ACCESS_MSG, "9.9.9.9", "POST",
+            f"{SNAPPAY_CB}?token=SUPERSENSITIVE&amount=1", "HTTP/1.1", 202,
+        )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
+        logger.propagate = prev_propagate
+
+    assert captured, "access record was not emitted"
+    line = captured[0]
+    assert "SUPERSENSITIVE" not in line
+    assert f"{SNAPPAY_CB}?{REDACTED}" in line
