@@ -278,6 +278,54 @@ def resolve_base_url() -> str:
     return DEFAULT_BASE_URL
 
 
+# ── Sandbox/test-checkout surfacing gate (Task 4 hardening) ──────────
+#
+# The public readiness endpoint is the only thing that "surfaces" BitPay to a
+# customer browser. A test key plus ``BITPAY_ENV=test`` alone is far too easy to
+# copy onto the production host by accident, which would show a real customer a
+# sandbox checkout. Enabling the gateway therefore additionally requires BOTH:
+#
+#   1. an explicit, dedicated opt-in flag (``BITPAY_ENABLE_TEST_CHECKOUT``); and
+#   2. a ``PUBLIC_SITE_ORIGIN`` that is provably NOT a production origin.
+#
+# Any missing piece — including an unresolvable/invalid origin — fails closed.
+TEST_CHECKOUT_OPT_IN_ENV = "BITPAY_ENABLE_TEST_CHECKOUT"
+_TEST_CHECKOUT_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# The real, customer-facing site(s). A test checkout must never be advertised on
+# these hosts, no matter what other configuration is present.
+PRODUCTION_SITE_HOSTS = frozenset({"spaghettiprints.ir", "www.spaghettiprints.ir"})
+
+
+def test_checkout_opt_in() -> bool:
+    """True only for an explicit, dedicated sandbox opt-in flag."""
+    return (
+        os.getenv(TEST_CHECKOUT_OPT_IN_ENV) or ""
+    ).strip().lower() in _TEST_CHECKOUT_TRUTHY
+
+
+def origin_is_production(origin: str) -> bool:
+    """True when ``origin``'s host is a real production site host."""
+    host = (urlsplit(origin or "").hostname or "").lower()
+    return host in PRODUCTION_SITE_HOSTS
+
+
+def origin_is_non_production() -> bool:
+    """True only when the validated public origin is non-production.
+
+    ``PUBLIC_SITE_ORIGIN`` is read through the shared, validating helper, so an
+    unset / invalid / plaintext origin resolves to the production default (and
+    therefore fails this check) rather than silently passing.
+    """
+    try:
+        from app.services.commerce import public_site_origin
+
+        origin = public_site_origin()
+    except Exception:  # noqa: BLE001 - any config/validation failure fails closed
+        return False
+    return not origin_is_production(origin)
+
+
 # ── Client ───────────────────────────────────────────────────────────
 
 class BitPayClient:
@@ -502,10 +550,15 @@ def public_readiness() -> dict:
     """Non-secret readiness snapshot for the public capability endpoint.
 
     Exposes only booleans and an environment label — never the key. ``enabled``
-    is True *only* for an explicitly-test deployment with a key configured:
-    live stays disabled until a merchant credential and a controlled live
-    payment are authorised (Task 4), so this flag can never switch a customer
-    onto production. A misconfigured ``BITPAY_ENV`` fails closed.
+    is True *only* for an explicitly opted-in, **non-production** test
+    deployment: a merchant key, ``BITPAY_ENV=test``, the dedicated
+    ``BITPAY_ENABLE_TEST_CHECKOUT`` opt-in flag **and** a validated, provably
+    non-production ``PUBLIC_SITE_ORIGIN`` are ALL required. A live environment
+    stays disabled until a merchant credential and a controlled live payment are
+    authorised, so this flag can never switch a customer onto production. The
+    extra opt-in + origin checks mean an accidental copy of a sandbox key/env
+    onto the production host cannot surface a test checkout. A misconfigured
+    ``BITPAY_ENV`` fails closed.
     """
     key_present = bool((os.getenv("BITPAY_API_KEY") or "").strip())
     try:
@@ -513,7 +566,12 @@ def public_readiness() -> dict:
     except BitPayConfigError:
         return {"enabled": False, "configured": False, "environment": None}
     return {
-        "enabled": key_present and env == ENV_TEST,
+        "enabled": (
+            key_present
+            and env == ENV_TEST
+            and test_checkout_opt_in()
+            and origin_is_non_production()
+        ),
         "configured": key_present,
         "environment": "test" if env == ENV_TEST else "live",
     }

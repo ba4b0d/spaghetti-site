@@ -104,10 +104,17 @@ export const PAY_INVOICE_PATHS = Object.freeze({
  * the browser.
  */
 export const payInvoice = (token, method) => {
-  const path = PAY_INVOICE_PATHS[method];
-  if (!path) {
+  // Own-property check only: a plain-object index would also resolve inherited
+  // names (`toString`, `constructor`, `__proto__`, …) to a truthy value and let
+  // a bogus method slip past a bare falsy guard. Non-string keys are refused
+  // rather than coerced into a property lookup.
+  const hasMethod =
+    typeof method === 'string' &&
+    Object.prototype.hasOwnProperty.call(PAY_INVOICE_PATHS, method);
+  if (!hasMethod) {
     return Promise.reject(new Error(`unsupported payment method: ${method}`));
   }
+  const path = PAY_INVOICE_PATHS[method];
   return commerceApi.post(`/invoices/${encodeURIComponent(token)}${path}`);
 };
 

@@ -152,6 +152,34 @@ describe('commerceApi public contract', () => {
     expect(commerceClient.post).not.toHaveBeenCalled();
   });
 
+  it('rejects inherited Object.prototype names instead of coercing them to a path', async () => {
+    // `PAY_INVOICE_PATHS[method]` on a plain object resolves inherited names
+    // (toString/constructor/__proto__/valueOf/…) to a truthy function/object,
+    // which the old `if (!path)` guard accepted — a prototype-lookup exploit
+    // that issued a bogus POST. Only own, string keys may ever match.
+    const { mod, commerceClient } = await loadCommerceApi();
+
+    for (const name of [
+      'toString',
+      'constructor',
+      'valueOf',
+      '__proto__',
+      'hasOwnProperty',
+      'isPrototypeOf',
+      'propertyIsEnumerable',
+    ]) {
+      await expect(mod.payInvoice('tok_XYZ', name)).rejects.toThrow(
+        /unsupported payment method/
+      );
+    }
+    // Non-string keys must not be coerced into a lookup either.
+    await expect(mod.payInvoice('tok_XYZ', {})).rejects.toThrow(/unsupported payment method/);
+    await expect(mod.payInvoice('tok_XYZ', ['bitpay'])).rejects.toThrow(
+      /unsupported payment method/
+    );
+    expect(commerceClient.post).not.toHaveBeenCalled();
+  });
+
   it('reads the public payment-method readiness endpoint', async () => {
     const { mod, commerceClient } = await loadCommerceApi();
     const config = { signal: new AbortController().signal };

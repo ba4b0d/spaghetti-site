@@ -620,8 +620,10 @@ def list_payment_methods(request: Request, response: Response):
     method can never look payable when the backend cannot actually pay through
     it. DigiPay is parked and the SnappPay onboarding stub is non-settling, so
     both are always reported disabled; BitPay is enabled only for an explicitly
-    configured *test* deployment (a merchant key present and a non-production
-    ``BITPAY_ENV``). No credential — least of all the API key — is included.
+    opted-in, **non-production** test deployment — a merchant key, ``BITPAY_ENV``
+    = test, the dedicated ``BITPAY_ENABLE_TEST_CHECKOUT`` opt-in **and** a
+    non-production ``PUBLIC_SITE_ORIGIN`` (Task 4). No credential — least of all
+    the API key — is included.
     """
     response.headers.update(NO_STORE_HEADERS)
     return {
