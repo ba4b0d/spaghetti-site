@@ -956,6 +956,11 @@ def start_payment(
     amount_rial = toman_to_rial(invoice.total_toman)
 
     attempt = find_active_payment_attempt(db, invoice)
+    if attempt is not None and attempt.provider != PAYMENT_PROVIDER_DIGIPAY:
+        # Another provider (BitPay) already holds this invoice's shared lock;
+        # a cross-provider click is a conflict, never a resume that reflects the
+        # other gateway's portal through the DigiPay endpoint.
+        raise CommerceStateError("پرداخت از درگاه دیگری برای این فاکتور در حال انجام است")
     if attempt is not None and attempt.redirect_url:
         return attempt
 
@@ -982,7 +987,11 @@ def start_payment(
         # Lost a race against a concurrent initiation (partial unique index).
         db.rollback()
         existing = find_active_payment_attempt(db, invoice)
-        if existing is not None and existing.redirect_url:
+        if (
+            existing is not None
+            and existing.provider == PAYMENT_PROVIDER_DIGIPAY
+            and existing.redirect_url
+        ):
             return existing
         raise CommerceStateError("پرداخت دیگری برای این فاکتور در حال انجام است")
 
@@ -1736,6 +1745,11 @@ def start_bitpay_payment(
     amount_rial = toman_to_rial(invoice.total_toman)
 
     attempt = find_active_payment_attempt(db, invoice)
+    if attempt is not None and attempt.provider != PAYMENT_PROVIDER_BITPAY:
+        # A DigiPay attempt already holds this invoice's shared lock; a
+        # cross-provider click is a conflict, never a resume that reflects the
+        # other gateway's portal through the BitPay endpoint.
+        raise CommerceStateError("پرداخت از درگاه دیگری برای این فاکتور در حال انجام است")
     if attempt is not None and attempt.redirect_url:
         return attempt
 
@@ -1763,7 +1777,11 @@ def start_bitpay_payment(
         # Lost a race against a concurrent initiation (partial unique index).
         db.rollback()
         existing = find_active_payment_attempt(db, invoice)
-        if existing is not None and existing.redirect_url:
+        if (
+            existing is not None
+            and existing.provider == PAYMENT_PROVIDER_BITPAY
+            and existing.redirect_url
+        ):
             return existing
         raise CommerceStateError("پرداخت دیگری برای این فاکتور در حال انجام است")
 

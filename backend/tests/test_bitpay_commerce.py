@@ -617,3 +617,109 @@ def test_bitpay_nginx_case_insensitive_companion_precedes_static_assets():
     assert "access_log off;" in block
     assert "proxy_pass http://backend:8000;" in block
     assert text.index(comp) < text.index("location ~* \\.(js|css|")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Cross-provider lock — one in-flight attempt per invoice, provider-scoped
+# ══════════════════════════════════════════════════════════════════════
+
+class FakeDigiPay:
+    """Minimal DigiPay UPG stand-in for the cross-provider lock tests."""
+
+    def __init__(self):
+        self.redirect_url = "https://web.mydigipay.com/web-pay/v2:cross-provider"
+        self.tickets = {}
+
+    def create_ticket(self, *, amount_rial, mobile, provider_id, callback_url):
+        self.tickets[provider_id] = {"amount_rial": amount_rial}
+        return {
+            "redirect_url": self.redirect_url,
+            "ticket": "v2:cross-provider",
+            "provider_id": provider_id,
+        }
+
+
+@pytest.fixture()
+def fake_digipay(client):
+    from app.main import app
+    from app.services import digipay
+
+    fake = FakeDigiPay()
+    app.dependency_overrides[digipay.client_dependency] = lambda: fake
+    yield fake
+    app.dependency_overrides.pop(digipay.client_dependency, None)
+
+
+def digipay_pay(client, token):
+    return client.post(f"{BASE}/invoices/{token}/pay")
+
+
+def _attempt_count(invoice_id):
+    from app.models import CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    db = TestSessionLocal()
+    try:
+        return (
+            db.query(CommercePaymentAttempt)
+            .filter(CommercePaymentAttempt.invoice_id == invoice_id)
+            .count()
+        )
+    finally:
+        db.close()
+
+
+def test_digipay_pay_conflicts_when_bitpay_attempt_in_flight(
+    client, auth_headers, fake_bitpay, fake_digipay
+):
+    """A live BitPay attempt is not a DigiPay resume - it is a conflict."""
+    invoice_id, token = make_approved(client, auth_headers)
+    started = bitpay_pay(client, token)
+    assert started.status_code == 200, started.text
+    bitpay_redirect = started.json()["redirect_url"]
+
+    r = digipay_pay(client, token)
+    assert r.status_code == 409, r.text
+    # the BitPay portal URL must never leak out of the DigiPay endpoint
+    assert bitpay_redirect not in r.text
+    assert "redirect_url" not in r.json()
+    # DigiPay was never asked to mint a ticket, and no second attempt exists
+    assert fake_digipay.tickets == {}
+    assert _attempt_count(invoice_id) == 1
+
+    attempt = latest_attempt(invoice_id)
+    assert attempt.provider == "bitpay"
+    assert attempt.redirect_url == bitpay_redirect
+    assert attempt.state == "pending"
+
+    # same-provider idempotency is untouched: the BitPay click still resumes
+    again = bitpay_pay(client, token)
+    assert again.status_code == 200
+    assert again.json()["redirect_url"] == bitpay_redirect
+
+
+def test_bitpay_pay_conflicts_when_digipay_attempt_in_flight(
+    client, auth_headers, fake_bitpay, fake_digipay
+):
+    """A live DigiPay attempt blocks BitPay with a controlled conflict."""
+    invoice_id, token = make_approved(client, auth_headers)
+    started = digipay_pay(client, token)
+    assert started.status_code == 200, started.text
+    digipay_redirect = started.json()["redirect_url"]
+
+    r = bitpay_pay(client, token)
+    assert r.status_code == 409, r.text
+    assert digipay_redirect not in r.text
+    assert "redirect_url" not in r.json()
+    assert fake_bitpay.sessions == {}
+    assert _attempt_count(invoice_id) == 1
+
+    attempt = latest_attempt(invoice_id)
+    assert attempt.provider == "digipay"
+    assert attempt.redirect_url == digipay_redirect
+    assert attempt.state == "pending"
+
+    # same-provider idempotency preserved on the DigiPay side too
+    again = digipay_pay(client, token)
+    assert again.status_code == 200
+    assert again.json()["redirect_url"] == digipay_redirect
