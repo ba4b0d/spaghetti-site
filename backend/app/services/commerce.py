@@ -1137,7 +1137,7 @@ def _mark_verified_needs_reconciliation(
 
 def settle_verified_payment(
     db: Session, attempt: CommercePaymentAttempt, *, tracking_code: str,
-    background_tasks=None,
+    background_tasks=None, on_success=None,
 ) -> CommercePaymentAttempt:
     """Atomically mark the attempt verified, the invoice paid and link ONE order.
 
@@ -1150,6 +1150,13 @@ def settle_verified_payment(
     an earlier revision, or a session against an invoice that was since
     revoked/revised) never settles: it is flagged for staff reconciliation and
     ``CommerceReconciliationRequiredError`` is raised.
+
+    ``on_success`` is an optional ``callback(db, invoice, attempt)`` invoked
+    immediately before the single successful commit, so any rows it adds (e.g.
+    an audit entry) are committed *atomically with the settlement* — and are
+    never written on the reconciliation / already-paid no-op branches, where no
+    settlement actually happened. A caller that passes it must add only, never
+    commit or roll back.
     """
     invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
     if invoice is None:
@@ -1218,6 +1225,11 @@ def settle_verified_payment(
     attempt.tracking_code = tracking_code
     attempt.verified_at = _now()
     attempt.last_error = None
+    # Commit any caller-supplied rows (e.g. an audit entry) atomically with the
+    # settlement: they exist only when this branch — the one real settlement —
+    # is taken.
+    if on_success is not None:
+        on_success(db, invoice, attempt)
     db.commit()
     db.refresh(attempt)
     # After-commit: this is the single claimed `approved -> paid` transition, so
@@ -2166,6 +2178,40 @@ def _legacy_bitpay_recovery_target(
     return invoice, id_get, trans_id
 
 
+def _rebind_invoice_after_verify(
+    db: Session, attempt: CommercePaymentAttempt
+) -> CommerceInvoice | None:
+    """Re-read the attempt's invoice from committed state after a provider call.
+
+    The eligibility precheck runs *before* the server-to-server verify, which is
+    slow enough for a concurrent revise/revoke to commit behind an
+    already-loaded, identity-mapped invoice. Expiring forces the next read to
+    hit the database rather than hand back the stale copy.
+    """
+    db.expire_all()
+    return (
+        db.query(CommerceInvoice)
+        .filter(CommerceInvoice.id == attempt.invoice_id)
+        .first()
+    )
+
+
+def _settlement_invoice_is_current(
+    attempt: CommercePaymentAttempt, invoice: CommerceInvoice
+) -> bool:
+    """True only when a freshly-read invoice may still take this settlement.
+
+    Mirrors the caller's eligibility check (payable state, no order yet) plus
+    the shared ``_attempt_binds_invoice`` revision/amount bind, so a concurrent
+    change detected after the verify can never mark the wrong invoice paid.
+    """
+    return (
+        invoice.state == "approved"
+        and invoice.order_id is None
+        and _attempt_binds_invoice(attempt, invoice)
+    )
+
+
 def recover_legacy_bitpay_attempt(
     db: Session,
     attempt: CommercePaymentAttempt | None,
@@ -2233,30 +2279,55 @@ def recover_legacy_bitpay_attempt(
         db.refresh(attempt)
         raise CommerceStateError("درگاه پرداخت این تراکنش را تأیید نکرد")
 
-    # Confirmed. Add the audit row to the SAME session as the settlement so the
-    # single commit inside ``settle_verified_payment`` persists both together.
-    db.add(
-        AuditLog(
-            user=actor or "system",
-            action=LEGACY_RECOVERY_ACTION,
-            entity="commerce_payment_attempt",
-            entity_id=attempt.id,
-            summary=(
-                f"بازیابی پرداخت قدیمی بیت‌پی تراکنش #{attempt.id} "
-                f"(فاکتور #{invoice.id}، مبلغ {attempt.amount_rial} ریال) — {reason}"
-            ),
+    # Confirmed. Re-bind against the invoice as it is *now*: the eligibility
+    # precheck ran before the (potentially slow) provider round trip, so a
+    # concurrent revision/amount change or revoke could since have made the
+    # identity-mapped invoice stale. A stale success must never mark the wrong
+    # invoice paid — keep the genuine confirmation for staff and refuse.
+    fresh_invoice = _rebind_invoice_after_verify(db, attempt)
+    if fresh_invoice is None or not _settlement_invoice_is_current(attempt, fresh_invoice):
+        _mark_verified_needs_reconciliation(
+            db, attempt, str(id_get),
+            "legacy recovery blocked: invoice changed during provider verify "
+            f"(state={getattr(fresh_invoice, 'state', None)} "
+            f"revision={getattr(fresh_invoice, 'revision', None)} "
+            "total_rial="
+            f"{_expected_amount_rial(fresh_invoice) if fresh_invoice is not None else None})",
         )
+        raise CommerceStateError(
+            "فاکتور پس از تأیید درگاه تغییر کرده است؛ نیازمند بررسی دستی"
+        )
+
+    # The audit row is committed by ``settle_verified_payment`` in the *same*
+    # transaction as the settlement (via ``on_success``): it exists exactly when
+    # a settlement happened, and is never written on a reconciliation branch
+    # that did not settle.
+    audit_summary = (
+        f"بازیابی پرداخت قدیمی بیت‌پی تراکنش #{attempt.id} "
+        f"(فاکتور #{invoice.id}، مبلغ {attempt.amount_rial} ریال) — {reason}"
     )
+
+    def _record_audit(inner_db, _invoice, settled_attempt):
+        inner_db.add(
+            AuditLog(
+                user=actor or "system",
+                action=LEGACY_RECOVERY_ACTION,
+                entity="commerce_payment_attempt",
+                entity_id=settled_attempt.id,
+                summary=audit_summary,
+            )
+        )
+
     try:
         settle_verified_payment(
-            db, attempt, tracking_code=str(id_get), background_tasks=background_tasks
+            db, attempt, tracking_code=str(id_get), background_tasks=background_tasks,
+            on_success=_record_audit,
         )
     except CommerceReconciliationRequiredError as exc:
-        # Unreachable in normal operation (eligibility already proved the
-        # invoice matches). If a concurrent change ever causes it, the payment
-        # is preserved for staff and we never claim success; drop the pending
-        # audit row so it cannot assert a settlement that did not happen.
-        db.rollback()
+        # The fresh re-bind above makes this unreachable in normal operation. If
+        # a change ever claims the row between that re-read and the conditional
+        # UPDATE, the settlement already preserved the payment for staff; no
+        # audit row was written and we never claim success.
         raise CommerceStateError(
             "پرداخت تأییدشده با فاکتور فعلی مطابقت ندارد؛ نیازمند بررسی دستی"
         ) from exc

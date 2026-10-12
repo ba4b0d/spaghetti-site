@@ -913,9 +913,12 @@ def reconcile_staff_payment(
 class LegacyBitpayRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # An affirmative opt-in: never a default-true, so no request can settle a
-    # legacy payment without the operator explicitly asking for it.
-    confirm_legacy_recovery: bool = False
+    # An affirmative opt-in: REQUIRED — no default, so a request that omits the
+    # field is a validation error rather than a silently-defaulted ``False``.
+    # (Pydantic does not run a field's validator over its default, so a
+    # default-false opt-in would be a silent bypass: ``{"reason": ...}`` would
+    # pass validation and settle unaudited.)
+    confirm_legacy_recovery: bool
     reason: str = Field(..., min_length=1, max_length=200)
 
     @field_validator("confirm_legacy_recovery")
@@ -944,6 +947,15 @@ def recover_legacy_bitpay_payment(
     on its current payable invoice. The settlement and its audit entry commit
     together; a refused recovery keeps the lock (never an unsafe abandon).
     """
+    # Defence in depth for a security-critical settlement: the request model
+    # already makes the affirmation required and non-false, but the handler
+    # re-asserts it explicitly rather than relying on schema validation alone.
+    if body.confirm_legacy_recovery is not True:
+        raise HTTPException(
+            status_code=422,
+            detail="برای بازیابی پرداخت قدیمی، تأیید صریح الزامی است",
+        )
+
     from app.models import CommercePaymentAttempt
 
     attempt = (
