@@ -9,9 +9,12 @@
  *     private credential attached to exactly the two calls that need it (the
  *     history read and sign-out) and never to the OTP calls, so it can never be
  *     accidentally sprayed at an unrelated endpoint;
- *   * it sends **no cookies** (``withCredentials: false``): the backend accepts
- *     only an explicit bearer, and a logged-in employee's cookie must never
- *     travel to a customer history route;
+ *   * it sets ``withCredentials: false`` so the browser does not attach
+ *     credentials to a cross-origin call. This does **not** stop a same-origin
+ *     request from carrying the browser's cookies, so the real guarantee is
+ *     server-side: the history router authenticates **only** the explicit
+ *     bearer header and ignores any cookie. ``withCredentials: false`` is
+ *     defence in depth, not cookie isolation;
  *   * it propagates errors untouched, so the page can tell a dead session (401)
  *     from a throttle (429) or a delivery failure (503) and react per case.
  */

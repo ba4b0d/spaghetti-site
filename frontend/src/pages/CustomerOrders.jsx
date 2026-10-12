@@ -86,6 +86,15 @@ function normalizeDigits(value) {
 
 const cleanMobile = (value) => normalizeDigits(value).replace(/\s+/g, '');
 
+/** Display-safe masking of a canonical 09… mobile — never the raw number. */
+export function maskMobile(value) {
+  const clean = cleanMobile(value);
+  return MOBILE_RE.test(clean) ? `${clean.slice(0, 4)}***${clean.slice(-4)}` : '';
+}
+
+/** Fallback label used when no masked form is available; never the raw number. */
+export const GENERIC_MOBILE_LABEL = 'شماره شما';
+
 /** Human-readable message from an Axios/FastAPI error. */
 function extractError(err, fallback) {
   const data = err?.response?.data;
@@ -182,6 +191,16 @@ function HistoryEntryCard({ entry }) {
           {label}
         </span>
       </header>
+
+      {kind === 'invoice' && entry?.request_id != null ? (
+        <p
+          data-testid={`entry-link-${kind}-${entry?.id}`}
+          className="text-[11px]"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          مرتبط با درخواست #{entry.request_id}
+        </p>
+      ) : null}
 
       <ul className="space-y-1.5">
         {items.map((item, index) => (
@@ -351,12 +370,17 @@ export default function CustomerOrders() {
       const res = await requestHistoryOtp({ mobile: clean });
       if (!mountedRef.current) return;
       const data = res?.data || {};
+      const serverMasked =
+        typeof data.masked_mobile === 'string' ? data.masked_mobile.trim() : '';
+      // Fail closed: if the server omits masked_mobile, derive a mask from the
+      // already-validated number — never fall back to rendering it in full.
+      const safeMask = serverMasked || maskMobile(clean);
       setOtp({
         challengeId: data.challenge_id,
-        maskedMobile: data.masked_mobile || clean,
+        maskedMobile: safeMask,
         resendAfter: Number(data.resend_after) || 0,
       });
-      setMaskedMobile(data.masked_mobile || clean);
+      setMaskedMobile(safeMask);
       setResendIn(Number(data.resend_after) || 0);
       setCode('');
       setOtpError(null);
@@ -564,9 +588,15 @@ export default function CustomerOrders() {
                 کد تأیید را وارد کنید
               </h2>
               <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                کد ۵ رقمی ارسال‌شده به شماره{' '}
-                <span style={{ direction: 'ltr', fontFamily: 'monospace' }}>{maskedMobile}</span>{' '}
-                را وارد کنید.
+                {maskedMobile ? (
+                  <>
+                    کد ۵ رقمی ارسال‌شده به شماره{' '}
+                    <span style={{ direction: 'ltr', fontFamily: 'monospace' }}>{maskedMobile}</span>{' '}
+                    را وارد کنید.
+                  </>
+                ) : (
+                  `کد ۵ رقمی ارسال‌شده به ${GENERIC_MOBILE_LABEL} را وارد کنید.`
+                )}
               </p>
               <input
                 id="history-otp-code"
@@ -685,7 +715,7 @@ export default function CustomerOrders() {
         </div>
       ) : null}
 
-      {listStatus === 'error' ? (
+      {listStatus === 'error' && items.length === 0 ? (
         <div data-testid="my-orders-error" className="card p-5 rounded-2xl border space-y-3 text-center">
           <AlertTriangle size={26} className="mx-auto" style={{ color: '#f59e0b' }} />
           <ErrorBox>{listError}</ErrorBox>
@@ -722,8 +752,19 @@ export default function CustomerOrders() {
       ) : null}
 
       {listStatus === 'error' && listError && items.length > 0 ? (
-        <div className="mt-3">
+        <div data-testid="my-orders-page-error" className="mt-3 space-y-2">
           <ErrorBox>{listError}</ErrorBox>
+          <div className="text-center">
+            <button
+              type="button"
+              onClick={loadMore}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold text-white"
+              style={{ background: 'var(--brand-orange, #ff9a3d)' }}
+            >
+              <RotateCcw size={15} />
+              تلاش دوباره
+            </button>
+          </div>
         </div>
       ) : null}
 

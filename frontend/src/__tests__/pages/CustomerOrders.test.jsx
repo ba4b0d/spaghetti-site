@@ -462,3 +462,66 @@ describe('CustomerOrders — privacy invariants', () => {
     expect(sessionMock.writeHistorySession).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('CustomerOrders — final hardening (masking, single alert, request link)', () => {
+  it('fails closed when the OTP response omits masked_mobile (never renders the full number)', async () => {
+    // Server contract drift: no masked_mobile field at all.
+    apiMock.requestHistoryOtp.mockResolvedValue({
+      data: { challenge_id: 9, expires_in: 120, resend_after: 0, delivery: 'sms' },
+    });
+    renderPage();
+    const step = await openOtpStep();
+
+    // The raw number must never be displayed; a local masking of the already
+    // validated number (or the generic label) stands in for the server value.
+    expect(step.textContent).not.toContain(MOBILE);
+    expect(step.textContent).toMatch(/0912\*\*\*6789|شماره شما/);
+  });
+
+  it('renders a single error alert on a pagination failure and keeps retry', async () => {
+    withSession();
+    apiMock.getCustomerHistory
+      .mockResolvedValueOnce({ data: { items: [requestEntry], has_more: true } })
+      .mockRejectedValueOnce({ response: { status: 500, data: { detail: 'خطای صفحه‌بندی' } } });
+
+    renderPage();
+    await screen.findByTestId('load-more');
+    fireEvent.click(screen.getByTestId('load-more'));
+
+    await screen.findByTestId('my-orders-page-error');
+    // Exactly one accessible alert and one instance of the message — the old
+    // full error card and the inline box must not both render.
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(screen.getAllByText('خطای صفحه‌بندی')).toHaveLength(1);
+    // The first-page full error card is not the pagination surface.
+    expect(screen.queryByTestId('my-orders-error')).toBeNull();
+    // Retry UX is preserved for the failed page.
+    expect(screen.getByRole('button', { name: /تلاش دوباره/ })).toBeInTheDocument();
+  });
+
+  it('surfaces the request link on a linked invoice without adding a pay CTA', async () => {
+    withSession();
+    apiMock.getCustomerHistory.mockResolvedValue({
+      data: { items: [requestEntry, draftInvoice], has_more: false },
+    });
+    renderPage();
+    await screen.findByTestId('entry-invoice-21');
+
+    const link = screen.getByTestId('entry-link-invoice-21');
+    expect(link.textContent).toMatch(/مرتبط با درخواست/);
+    expect(link.textContent).toContain('#11');
+    // No payment authority is introduced by the relationship label.
+    expect(screen.queryByRole('button', { name: /پرداخت/ })).toBeNull();
+  });
+
+  it('does not show a request link on an unlinked invoice', async () => {
+    withSession();
+    apiMock.getCustomerHistory.mockResolvedValue({
+      data: { items: [approvedInvoice], has_more: false },
+    });
+    renderPage();
+    await screen.findByTestId('entry-invoice-22');
+
+    expect(screen.queryByTestId('entry-link-invoice-22')).toBeNull();
+  });
+});
