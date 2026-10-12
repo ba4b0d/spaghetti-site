@@ -17,6 +17,12 @@ import {
 import { formatPrice } from '../lib/constants';
 import { getPaymentMethods, getPublicInvoice, payInvoice } from '../lib/commerceApi';
 import { useNoReferrerPolicy } from '../hooks/useNoReferrerPolicy';
+import { GATEWAY_HANDOFF_PATH, writeGatewayHandoff } from '../lib/paymentHandoff';
+import {
+  ALLOWED_GATEWAY_HOSTS,
+  GATEWAY_ALLOWLIST,
+  validateGatewayUrl,
+} from '../lib/gatewayValidation';
 import PaymentShell from '../components/PaymentShell';
 
 /**
@@ -112,58 +118,11 @@ const PAYMENT_METHODS = [
   },
 ];
 
-/**
- * Per-provider gateway allowlist for the browser redirect.
- *
- * Mirrors the backend as defence in depth: the browser is never handed an
- * arbitrary or plaintext URL even if a provider response is tampered with.
- * DigiPay host names are whitelisted as-is; BitPay lives entirely on
- * ``bitpay.ir``, where live vs. sandbox is a **path** prefix (``/payment`` vs
- * ``/payment-test``), so both documented portal prefixes are accepted while
- * any other host, path, query or shape is refused.
- */
-export const GATEWAY_ALLOWLIST = Object.freeze({
-  digipay: Object.freeze({
-    hosts: Object.freeze(['web.mydigipay.com', 'uatweb.mydigipay.info']),
-    pathPattern: null,
-    rejectQuery: false,
-  }),
-  bitpay: Object.freeze({
-    hosts: Object.freeze(['bitpay.ir']),
-    // documented live + sandbox portal: /payment[-test]/gateway-<id_get>-get
-    pathPattern: /^\/payment(?:-test)?\/gateway-\d+-get$/,
-    rejectQuery: true,
-  }),
-});
-
-/** DigiPay web-pay hosts (alias kept for callers of the previous name). */
-export const ALLOWED_GATEWAY_HOSTS = GATEWAY_ALLOWLIST.digipay.hosts;
-
-/**
- * Return the validated absolute HTTPS gateway URL for ``provider``, or ``null``
- * when the server's URL is not allowed for that provider. An unknown/missing
- * provider fails closed.
- */
-export function validateGatewayUrl(url, provider) {
-  const hasRules =
-    typeof provider === 'string' &&
-    Object.prototype.hasOwnProperty.call(GATEWAY_ALLOWLIST, provider);
-  const rules = hasRules ? GATEWAY_ALLOWLIST[provider] : null;
-  if (!rules) return null;
-  if (typeof url !== 'string' || !url.trim()) return null;
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return null;
-  }
-  if (parsed.protocol !== 'https:') return null;
-  if (parsed.username || parsed.password) return null;
-  if (rules.rejectQuery && (parsed.search || parsed.hash)) return null;
-  if (!rules.hosts.includes(parsed.hostname.toLowerCase())) return null;
-  if (rules.pathPattern && !rules.pathPattern.test(parsed.pathname)) return null;
-  return parsed.href;
-}
+// Per-provider gateway allowlist + validator now live in
+// ``../lib/gatewayValidation`` so the pay page AND the token-free hand-off page
+// validate against one set of rules. Re-exported here unchanged so existing
+// importers (and tests) keep working.
+export { ALLOWED_GATEWAY_HOSTS, GATEWAY_ALLOWLIST, validateGatewayUrl };
 
 /** Pull a human-readable message out of an Axios/FastAPI error. */
 export function extractPaymentError(err) {
@@ -300,7 +259,16 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
         setPayError('آدرس درگاه پرداخت معتبر نیست؛ به دلایل امنیتی انتقال انجام نشد.');
         return;
       }
-      redirect(target);
+      // Do NOT navigate to the portal straight from this document: it is served
+      // `Referrer-Policy: no-referrer` (the path segment is a bearer token), so
+      // the browser would send no Referer and BitPay would reject the hand-off
+      // with «آدرس ارجاعی نامعتبر». Park the validated URL in per-tab
+      // sessionStorage and hard-navigate to the token-free /pay/redirect page,
+      // which emits an origin-only Referer. If storage is unavailable the
+      // customer is not stranded: we fall back to the (still validated) direct
+      // navigation.
+      const handedOff = writeGatewayHandoff(target, selectedMethod);
+      redirect(handedOff ? GATEWAY_HANDOFF_PATH : target);
       if (mountedRef.current) setPayState('idle');
     } catch (err) {
       if (isCancel(err) || !mountedRef.current) return;

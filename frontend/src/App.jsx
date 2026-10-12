@@ -26,6 +26,7 @@ const Terms = lazy(() => import('./pages/Terms'));
 const DigitalCard = lazy(() => import('./pages/DigitalCard'));
 const InvoicePayment = lazy(() => import('./pages/InvoicePayment'));
 const PaymentResult = lazy(() => import('./pages/PaymentResult'));
+const PaymentHandoff = lazy(() => import('./pages/PaymentHandoff'));
 const UsersPage = lazy(() => import('./pages/Users'));
 const Categories = lazy(() => import('./pages/Categories'));
 const Collections = lazy(() => import('./pages/Collections'));
@@ -97,6 +98,10 @@ function AppRoutes() {
                 <Route path="/card" element={<DigitalCard />} />
                 {/* Generic, token-free result page (backend callback 303 target). */}
                 <Route path="/pay/result" element={<PaymentResult />} />
+                {/* Token-free same-origin gateway hand-off page. Ranked above
+                    the dynamic /pay/:token route (static segments win), so the
+                    private invoice page never resolves here. */}
+                <Route path="/pay/redirect" element={<PaymentHandoff />} />
                 {/* Public private invoice payment page. */}
                 <Route path="/pay/:token" element={<InvoicePayment />} />
                 <Route path="/how-to-order" element={<CatalogLayout><HowToOrder /></CatalogLayout>} />

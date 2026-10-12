@@ -267,6 +267,83 @@ describe('frontend/nginx.conf — token-bearing /pay/ route', () => {
   });
 });
 
+// ── Token-free gateway hand-off page: /pay/redirect ───────────────────────
+// The private /pay/<token> document is served `Referrer-Policy: no-referrer`
+// (the path segment is a bearer credential), so a direct browser navigation to
+// the BitPay portal from it carries no Referer and BitPay rejects the hand-off
+// with «آدرس ارجاعی نامعتبر» (invalid referer address). The fix is a
+// token-free same-origin intermediate page that the pay page hard-navigates
+// to; that page is served with an ORIGIN-only referrer policy, so the browser
+// emits `Referer: https://spaghettiprints.ir/` (scheme+host+port, never the
+// path/query/token) when it goes on to the portal.
+//
+// It is an EXACT-match location so it wins over the case-insensitive `~* /pay/`
+// regex by nginx's precedence rules without weakening that block: every
+// token-bearing /pay/<token> URI is still matched case-insensitively and keeps
+// no-referrer + no-store.
+describe('frontend/nginx.conf — token-free gateway hand-off (/pay/redirect)', () => {
+  const redirectLocation = locations.find((l) => l.type === '=' && l.target === '/pay/redirect');
+
+  it('is served by an exact-match location that beats the /pay/ regex', () => {
+    expect(redirectLocation, 'no `location = /pay/redirect` block found').toBeTruthy();
+    expect(matchLocation(locations, '/pay/redirect')).toBe(redirectLocation);
+  });
+
+  it('emits an origin-only referrer (never no-referrer) so BitPay gets a valid Referer', () => {
+    const rp = headerValue(addHeaders(redirectLocation.body), 'Referrer-Policy');
+    expect(rp).toBeTruthy();
+    expect(rp).not.toBe('no-referrer');
+    // `origin` sends scheme+host+port only — exactly what the portal needs.
+    expect(rp).toBe('origin');
+  });
+
+  it('is never cached and never access-logged', () => {
+    const cc = headerValue(addHeaders(redirectLocation.body), 'Cache-Control');
+    expect(cc).toBeTruthy();
+    expect(cc.toLowerCase()).toContain('no-store');
+    expect(redirectLocation.body).toMatch(/access_log\s+off;/);
+  });
+
+  it('restates every server-level security header (add_header does not inherit)', () => {
+    const headers = addHeaders(redirectLocation.body);
+    for (const [name, value] of SERVER_SECURITY_HEADERS) {
+      expect(headerValue(headers, name), `${name} missing in /pay/redirect`).toBe(value);
+    }
+    const serverCsp = headerValue(addHeaders(CONF), 'Content-Security-Policy');
+    expect(headerValue(headers, 'Content-Security-Policy')).toBe(serverCsp);
+  });
+
+  it('uses a `rewrite ... break` SPA fallback so its headers survive', () => {
+    // A try_files fallback would internally redirect to /index.html, re-match
+    // `~* \.html$` and drop the origin referrer policy set here.
+    expect(redirectLocation.body).toMatch(/rewrite\s+\S+\s+\/index\.html\s+break/);
+    expect(redirectLocation.body).not.toMatch(/try_files/);
+  });
+
+  it('never routes the hand-off to the bot meta-preview branch', () => {
+    const hit = matchLocation(locations, '/pay/redirect');
+    expect(hit.body).not.toMatch(/meta-preview/);
+    expect(hit.body).not.toMatch(/TelegramBot/);
+  });
+
+  it('keeps the token-bearing /pay/<token> route on no-referrer + no-store', () => {
+    for (const uri of ['/pay/abc123token', '/PAY/abc123token']) {
+      const hit = matchLocation(locations, uri);
+      expect(hit.type, `${uri} must stay on the case-insensitive regex`).toBe('~*');
+      expect(headerValue(addHeaders(hit.body), 'Referrer-Policy')).toBe('no-referrer');
+      expect(headerValue(addHeaders(hit.body), 'Cache-Control').toLowerCase()).toContain('no-store');
+      // And it is a different location than the hand-off page.
+      expect(hit).not.toBe(redirectLocation);
+    }
+  });
+
+  it('leaves the site-wide policy untouched', () => {
+    expect(headerValue(addHeaders(CONF), 'Referrer-Policy')).toBe(
+      'strict-origin-when-cross-origin'
+    );
+  });
+});
+
 // ── Two-tier trusted edge: realip recovery of the true client IP ──────────
 // Production path: client → Pi5 edge reverse proxy (192.168.100.50) → this
 // nginx → backend. The edge replaces X-Forwarded-For with the real client, but

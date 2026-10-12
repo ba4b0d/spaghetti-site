@@ -23,6 +23,7 @@ import InvoicePayment, {
 } from '../../pages/InvoicePayment';
 import { formatPrice } from '../../lib/constants';
 import { NO_REFERRER_META_ID } from '../../hooks/useNoReferrerPolicy';
+import { GATEWAY_HANDOFF_KEY, GATEWAY_HANDOFF_PATH } from '../../lib/paymentHandoff';
 
 const TOKEN = 'raw-BEARER-token-123';
 
@@ -76,6 +77,7 @@ const BITPAY_OK_URL = 'https://bitpay.ir/payment/gateway-987654-get';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  window.sessionStorage.clear();
   commerceApiMock.getPublicInvoice.mockResolvedValue({ data: makeInvoice() });
   commerceApiMock.getPaymentMethods.mockResolvedValue({ data: READY_BITPAY });
 });
@@ -161,7 +163,7 @@ describe('InvoicePayment approved invoice', () => {
     );
   });
 
-  it('posts an explicit BitPay pay request and redirects to the validated URL', async () => {
+  it('parks the validated gateway URL and hands off to the token-free /pay/redirect page', async () => {
     commerceApiMock.payInvoice.mockResolvedValue({
       data: { provider: 'bitpay', state: 'pending', amount_rial: 700000, redirect_url: BITPAY_OK_URL },
     });
@@ -178,7 +180,67 @@ describe('InvoicePayment approved invoice', () => {
       TOKEN,
       expect.objectContaining({ signal: expect.anything() })
     );
+
+    // The browser is NOT sent straight to the gateway from this no-referrer
+    // document (which is what made BitPay answer «آدرس ارجاعی نامعتبر»); it is
+    // sent to the token-free intermediate page instead.
+    await waitFor(() => expect(redirect).toHaveBeenCalledWith(GATEWAY_HANDOFF_PATH));
+    expect(redirect).not.toHaveBeenCalledWith(BITPAY_OK_URL);
+
+    // The gateway URL travels through sessionStorage, and the bearer token
+    // never does.
+    const stored = window.sessionStorage.getItem(GATEWAY_HANDOFF_KEY);
+    expect(stored).toBeTruthy();
+    expect(stored).toContain(BITPAY_OK_URL);
+    expect(stored).not.toContain(TOKEN);
+  });
+
+  it('writes no hand-off and redirects nowhere when the gateway URL is not allow-listed', async () => {
+    commerceApiMock.payInvoice.mockResolvedValue({
+      data: { state: 'pending', amount_rial: 700000, redirect_url: 'https://evil.example.com/pay' },
+    });
+
+    const { redirect } = renderAt();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(screen.getByRole('radio', { name: /بیت‌پی/ })).toBeChecked());
+    await user.click(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ }));
+
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    expect(redirect).not.toHaveBeenCalled();
+    expect(window.sessionStorage.getItem(GATEWAY_HANDOFF_KEY)).toBeNull();
+  });
+
+  it('falls back to a direct (validated) navigation when sessionStorage is unavailable', async () => {
+    commerceApiMock.payInvoice.mockResolvedValue({
+      data: { provider: 'bitpay', state: 'pending', amount_rial: 700000, redirect_url: BITPAY_OK_URL },
+    });
+    // Force the storage write to fail (private mode / disabled storage): the
+    // module must degrade, not strand the customer.
+    const original = Object.getOwnPropertyDescriptor(window, 'sessionStorage');
+    Object.defineProperty(window, 'sessionStorage', {
+      configurable: true,
+      get: () => ({
+        setItem() {
+          throw new Error('storage disabled');
+        },
+        getItem: () => null,
+        removeItem() {},
+      }),
+    });
+
+    const { redirect } = renderAt();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(screen.getByRole('radio', { name: /بیت‌پی/ })).toBeChecked());
+    await user.click(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ }));
+
+    // Degraded but never stranded: with no storage the customer still reaches
+    // the (still validated) portal URL directly.
     await waitFor(() => expect(redirect).toHaveBeenCalledWith(BITPAY_OK_URL));
+    expect(redirect).not.toHaveBeenCalledWith(GATEWAY_HANDOFF_PATH);
+
+    if (original) Object.defineProperty(window, 'sessionStorage', original);
   });
 
   it('refuses to redirect to a non-approved gateway host and surfaces an error', async () => {
