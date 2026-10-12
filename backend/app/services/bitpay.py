@@ -278,22 +278,28 @@ def resolve_base_url() -> str:
     return DEFAULT_BASE_URL
 
 
-# ── Sandbox/test-checkout surfacing gate (Task 4 hardening) ──────────
+# ── Checkout surfacing gate — readiness AND initiation, both envs ─────
 #
-# The public readiness endpoint is the only thing that "surfaces" BitPay to a
-# customer browser. A test key plus ``BITPAY_ENV=test`` alone is far too easy to
-# copy onto the production host by accident, which would show a real customer a
-# sandbox checkout. Enabling the gateway therefore additionally requires BOTH:
+# The public readiness endpoint and the public, unauthenticated initiation route
+# are the only things that "surface" BitPay to a customer browser, so they must
+# agree and both must fail closed. A test key plus ``BITPAY_ENV=test`` alone is
+# far too easy to copy onto the production host by accident, and a live key is
+# equally easy to leave on a staging host — so each environment has its own,
+# dedicated opt-in AND its own origin requirement:
 #
-#   1. an explicit, dedicated opt-in flag (``BITPAY_ENABLE_TEST_CHECKOUT``); and
-#   2. a ``PUBLIC_SITE_ORIGIN`` that is provably NOT a production origin.
+#   * test  → ``BITPAY_ENABLE_TEST_CHECKOUT`` AND a ``PUBLIC_SITE_ORIGIN`` that
+#             is provably NOT a production origin; and
+#   * live  → ``BITPAY_ENABLE_LIVE_CHECKOUT`` AND a ``PUBLIC_SITE_ORIGIN`` that
+#             is exactly a production origin.
 #
-# Any missing piece — including an unresolvable/invalid origin — fails closed.
+# Any missing piece — including an unresolvable/invalid origin or a
+# misconfigured ``BITPAY_ENV`` — fails closed.
 TEST_CHECKOUT_OPT_IN_ENV = "BITPAY_ENABLE_TEST_CHECKOUT"
-_TEST_CHECKOUT_TRUTHY = frozenset({"1", "true", "yes", "on"})
+LIVE_CHECKOUT_OPT_IN_ENV = "BITPAY_ENABLE_LIVE_CHECKOUT"
+_CHECKOUT_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # The real, customer-facing site(s). A test checkout must never be advertised on
-# these hosts, no matter what other configuration is present.
+# these hosts, and a live checkout must never run off any other origin.
 PRODUCTION_SITE_HOSTS = frozenset({"spaghettiprints.ir", "www.spaghettiprints.ir"})
 
 
@@ -301,7 +307,18 @@ def test_checkout_opt_in() -> bool:
     """True only for an explicit, dedicated sandbox opt-in flag."""
     return (
         os.getenv(TEST_CHECKOUT_OPT_IN_ENV) or ""
-    ).strip().lower() in _TEST_CHECKOUT_TRUTHY
+    ).strip().lower() in _CHECKOUT_TRUTHY
+
+
+def live_checkout_opt_in() -> bool:
+    """True only for an explicit, dedicated live-checkout opt-in flag.
+
+    A separate flag from the sandbox opt-in, so enabling a test checkout can
+    never accidentally arm a live one (and vice versa).
+    """
+    return (
+        os.getenv(LIVE_CHECKOUT_OPT_IN_ENV) or ""
+    ).strip().lower() in _CHECKOUT_TRUTHY
 
 
 def origin_is_production(origin: str) -> bool:
@@ -332,8 +349,26 @@ def origin_is_non_production() -> bool:
     return not origin_is_production(origin)
 
 
+def public_origin_is_production() -> bool:
+    """True only when the validated public origin is exactly a production host.
+
+    Mirrors :func:`origin_is_non_production`: ``PUBLIC_SITE_ORIGIN`` is read
+    through the shared, validating helper, so an invalid / malformed / plaintext
+    origin raises and this fails closed rather than silently passing. Unset
+    resolves to the documented production default (the only origin a live
+    checkout may run from); a trailing-dot production FQDN is normalised first.
+    """
+    try:
+        from app.services.commerce import public_site_origin
+
+        origin = public_site_origin()
+    except Exception:  # noqa: BLE001 - any config/validation failure fails closed
+        return False
+    return origin_is_production(origin)
+
+
 def test_checkout_allowed() -> bool:
-    """The single sandbox-safety predicate — readiness **and** initiation.
+    """The sandbox branch: key + ``BITPAY_ENV=test`` + sandbox opt-in + non-prod.
 
     True only when ALL of these hold:
 
@@ -345,10 +380,6 @@ def test_checkout_allowed() -> bool:
     Anything else — a live env, a missing opt-in, a production (or
     trailing-dot production) origin, or a misconfigured ``BITPAY_ENV`` — is
     ``False`` (fails closed).
-
-    Both the public readiness snapshot and the payment-initiation route call
-    this one function, so the surfacing gate and the execution gate can never
-    drift apart.
     """
     if not (os.getenv("BITPAY_API_KEY") or "").strip():
         return False
@@ -361,6 +392,57 @@ def test_checkout_allowed() -> bool:
         and test_checkout_opt_in()
         and origin_is_non_production()
     )
+
+
+def live_checkout_allowed() -> bool:
+    """The live branch: key + ``BITPAY_ENV=production`` + live opt-in + prod origin.
+
+    True only when ALL of these hold:
+
+    * a merchant key (``BITPAY_API_KEY``) is present;
+    * ``BITPAY_ENV`` resolves to production (``live`` / ``prod`` are accepted);
+    * the dedicated ``BITPAY_ENABLE_LIVE_CHECKOUT`` opt-in is truthy; and
+    * ``PUBLIC_SITE_ORIGIN`` is validated and is exactly a production origin.
+
+    A sandbox key/env on the production host stays off (no live opt-in), and a
+    live key + live opt-in on a staging / localhost / malformed origin stays off
+    too — live never runs off a provably non-production origin.
+    """
+    if not (os.getenv("BITPAY_API_KEY") or "").strip():
+        return False
+    try:
+        env = resolve_env()
+    except BitPayConfigError:
+        return False
+    return (
+        env == ENV_PRODUCTION
+        and live_checkout_opt_in()
+        and public_origin_is_production()
+    )
+
+
+def checkout_allowed() -> bool:
+    """The single checkout predicate — readiness **and** initiation.
+
+    Dispatches to the environment-specific safety predicate, so ``BITPAY_ENV``
+    selects exactly one gate: a sandbox checkout needs the sandbox opt-in plus a
+    provably non-production origin; a live checkout needs the live opt-in plus
+    exactly the production origin. A key is required in both cases, an unset /
+    invalid / malformed origin fails closed, and a misconfigured ``BITPAY_ENV``
+    fails closed. A test key+env on the production host and a live key on a
+    staging origin are both refused.
+
+    Both the public readiness snapshot and the payment-initiation route call
+    this one function, so the surfacing gate and the execution gate can never
+    drift apart.
+    """
+    try:
+        env = resolve_env()
+    except BitPayConfigError:
+        return False
+    if env == ENV_TEST:
+        return test_checkout_allowed()
+    return live_checkout_allowed()
 
 
 # ── Client ───────────────────────────────────────────────────────────
@@ -587,14 +669,19 @@ def public_readiness() -> dict:
     """Non-secret readiness snapshot for the public capability endpoint.
 
     Exposes only booleans and an environment label — never the key. ``enabled``
-    is True *only* for an explicitly opted-in, **non-production** test
-    deployment: a merchant key, ``BITPAY_ENV=test``, the dedicated
-    ``BITPAY_ENABLE_TEST_CHECKOUT`` opt-in flag **and** a validated, provably
-    non-production ``PUBLIC_SITE_ORIGIN`` are ALL required. A live environment
-    stays disabled until a merchant credential and a controlled live payment are
-    authorised, so this flag can never switch a customer onto production. The
-    extra opt-in + origin checks mean an accidental copy of a sandbox key/env
-    onto the production host cannot surface a test checkout. A misconfigured
+    IS the shared :func:`checkout_allowed` predicate, so this snapshot and the
+    initiation route can never disagree:
+
+    * a sandbox checkout needs a merchant key, ``BITPAY_ENV=test``, the
+      ``BITPAY_ENABLE_TEST_CHECKOUT`` opt-in **and** a validated, provably
+      non-production ``PUBLIC_SITE_ORIGIN``; and
+    * a live checkout needs a merchant key, ``BITPAY_ENV=production``, the
+      dedicated ``BITPAY_ENABLE_LIVE_CHECKOUT`` opt-in **and** a validated
+      origin that is exactly a production host.
+
+    The extra opt-in + origin checks mean an accidental copy of a sandbox
+    key/env onto the production host cannot surface a test checkout — and a live
+    key on a staging origin cannot surface a live one. A misconfigured
     ``BITPAY_ENV`` fails closed.
     """
     key_present = bool((os.getenv("BITPAY_API_KEY") or "").strip())
@@ -604,9 +691,9 @@ def public_readiness() -> dict:
         return {"enabled": False, "configured": False, "environment": None}
     return {
         # ``enabled`` IS the shared predicate, so this snapshot and the
-        # initiation route can never disagree about whether a test checkout is
+        # initiation route can never disagree about whether a checkout is
         # permitted.
-        "enabled": test_checkout_allowed(),
+        "enabled": checkout_allowed(),
         "configured": key_present,
         "environment": "test" if env == ENV_TEST else "live",
     }

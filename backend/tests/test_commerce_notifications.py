@@ -652,9 +652,14 @@ class _FakeDigiPay:
 
 
 @pytest.fixture()
-def fake_provider(client):
+def fake_provider(client, monkeypatch):
     from app.main import app
     from app.services import digipay
+
+    # DigiPay is parked in production (the legacy initiation route is a hard
+    # 503); these notification tests still drive the settlement path, so they opt
+    # in explicitly through the predicate seam.
+    monkeypatch.setattr(digipay, "checkout_enabled", lambda: True)
 
     fake = _FakeDigiPay()
     app.dependency_overrides[digipay.client_dependency] = lambda: fake

@@ -619,16 +619,17 @@ def list_payment_methods(request: Request, response: Response):
     The storefront pay page reads this before rendering any gateway CTA so a
     method can never look payable when the backend cannot actually pay through
     it. DigiPay is parked and the SnappPay onboarding stub is non-settling, so
-    both are always reported disabled; BitPay is enabled only for an explicitly
-    opted-in, **non-production** test deployment — a merchant key, ``BITPAY_ENV``
-    = test, the dedicated ``BITPAY_ENABLE_TEST_CHECKOUT`` opt-in **and** a
-    non-production ``PUBLIC_SITE_ORIGIN`` (Task 4). No credential — least of all
-    the API key — is included.
+    both are always reported disabled (DigiPay through its unconditional
+    predicate); BitPay is enabled only for an explicitly opted-in deployment —
+    either a sandbox test checkout (``BITPAY_ENABLE_TEST_CHECKOUT`` plus a
+    non-production origin) or a live checkout (``BITPAY_ENABLE_LIVE_CHECKOUT``
+    plus the production origin). No credential — least of all the API key — is
+    included.
     """
     response.headers.update(NO_STORE_HEADERS)
     return {
         "bitpay": bitpay.public_readiness(),
-        "digipay": {"enabled": False},
+        "digipay": {"enabled": digipay.checkout_enabled()},
         "snapppay": {"enabled": False},
     }
 
@@ -650,8 +651,22 @@ def pay_invoice(
     returns the provider's HTTPS ``redirect_url``. Valid only for an approved,
     unexpired, unpaid invoice; repeated clicks while an attempt is in flight are
     idempotent. The private bearer token is never forwarded to the gateway.
+
+    DigiPay is parked: :func:`digipay.checkout_enabled` is unconditionally
+    false, so this route is a hard ``503`` checked *before* the provider is ever
+    resolved or used — neither an injected client nor fully-present merchant
+    credentials can start a payment. The public readiness snapshot reports the
+    same predicate, so CTA and route can never disagree.
     """
     response.headers.update(NO_STORE_HEADERS)
+
+    # Unconditional server-side kill switch: DigiPay is parked, so no injected
+    # or configured provider can start a payment. Evaluated before the client is
+    # resolved and before any invoice/attempt work.
+    if not digipay.checkout_enabled():
+        http_exc = HTTPException(status_code=503, detail="درگاه پرداخت دیجی‌پی در این محیط غیرفعال است")
+        http_exc.headers = {**NO_STORE_HEADERS}
+        raise http_exc
 
     if client is None:
         try:
@@ -709,14 +724,15 @@ def pay_invoice_bitpay(
     the gateway.
 
     A sandbox checkout is only *executed* on an explicitly opted-in, provably
-    non-production test deployment (the same Task-4 predicate that gates the
-    public readiness snapshot). The check runs before the provider is resolved
+    non-production test deployment, and a live checkout only on an explicitly
+    opted-in production deployment — the *same* shared predicate that gates the
+    public readiness snapshot. The check runs before the provider is resolved
     and independently of any injected client, so a direct POST cannot run a
-    sandbox payment on the production host; the specific refusal is ``503``.
+    checkout the deployment has not enabled; the specific refusal is ``503``.
     """
     response.headers.update(NO_STORE_HEADERS)
 
-    if not bitpay.test_checkout_allowed():
+    if not bitpay.checkout_allowed():
         http_exc = HTTPException(
             status_code=503,
             detail="درگاه پرداخت بیت‌پی در این محیط غیرفعال است",

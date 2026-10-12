@@ -121,9 +121,14 @@ def no_live_io(monkeypatch):
 
 
 @pytest.fixture()
-def fake_provider(client):
+def fake_provider(client, monkeypatch):
     from app.main import app
     from app.services import digipay
+
+    # DigiPay is parked in production (the legacy initiation route is a hard
+    # 503); this smoke test still drives the full settlement path, so it opts in
+    # explicitly through the predicate seam.
+    monkeypatch.setattr(digipay, "checkout_enabled", lambda: True)
 
     fake = FakeDigiPay()
     app.dependency_overrides[digipay.client_dependency] = lambda: fake

@@ -313,9 +313,16 @@ class FakeDigiPay:
 
 
 @pytest.fixture()
-def fake_provider(client):
+def fake_provider(client, monkeypatch):
     from app.main import app
     from app.services import digipay
+
+    # DigiPay is parked in production: the legacy public initiation route is an
+    # unconditional server-side 503 (see the regression below). This suite still
+    # exercises the durable-attempt/settlement machinery, so it opts into the
+    # checkout path explicitly through the predicate seam — the *only* way the
+    # path can ever run.
+    monkeypatch.setattr(digipay, "checkout_enabled", lambda: True)
 
     fake = FakeDigiPay()
     app.dependency_overrides[digipay.client_dependency] = lambda: fake
@@ -475,6 +482,49 @@ def test_pay_sets_no_store_headers(client, auth_headers, fake_provider):
     r = pay(client, token)
     assert r.headers["Cache-Control"] == "no-store"
     assert r.headers["Referrer-Policy"] == "no-referrer"
+
+
+# ── DigiPay is parked: the legacy initiation route is a hard 503 ─────
+
+def test_digipay_readiness_and_pay_route_are_disabled(client, auth_headers, monkeypatch):
+    """DigiPay reports disabled and the legacy ``/pay`` route refuses with 503.
+
+    Regression: the public readiness snapshot already said DigiPay was disabled,
+    but the legacy ``POST /invoices/{token}/pay`` could still start a payment if
+    a provider was injected or merchant credentials were present. The gate is
+    unconditional and runs before the client is ever used, so neither an
+    injected provider nor full credentials can start one.
+    """
+    from app.main import app
+    from app.services import digipay
+
+    fake = FakeDigiPay()
+    app.dependency_overrides[digipay.client_dependency] = lambda: fake
+    # Simulate fully-present merchant credentials in the environment.
+    for var in (
+        "DIGIPAY_CLIENT_ID", "DIGIPAY_CLIENT_SECRET",
+        "DIGIPAY_USERNAME", "DIGIPAY_PASSWORD",
+    ):
+        monkeypatch.setenv(var, "test-credential")
+    try:
+        assert client.get(f"{BASE}/payment-methods").json()["digipay"]["enabled"] is False
+
+        invoice_id, token = make_approved(client, auth_headers)
+        r = pay(client, token)
+        assert r.status_code == 503, r.text
+        assert fake.tickets == {}                  # the provider was never asked
+        assert latest_attempt(invoice_id) is None  # no attempt is ever recorded
+        assert r.headers["Cache-Control"] == "no-store"
+    finally:
+        app.dependency_overrides.pop(digipay.client_dependency, None)
+
+
+def test_digipay_pay_route_disabled_even_without_credentials(client, auth_headers):
+    """No credentials at all is still a 503 (never a 500/502)."""
+    _, token = make_approved(client, auth_headers)
+    r = pay(client, token)
+    assert r.status_code == 503, r.text
+    assert r.headers["Cache-Control"] == "no-store"
 
 
 # ══════════════════════════════════════════════════════════════════════

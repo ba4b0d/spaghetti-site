@@ -369,6 +369,96 @@ def test_bitpay_pay_allowed_for_valid_non_production_opt_in(
     assert _attempt_count(invoice_id) == 1
 
 
+# ── Live checkout activation need not bypass the gate ────────────────
+#
+# A live checkout is enabled by the *same* shared predicate as the readiness
+# snapshot: it needs a production ``BITPAY_ENV``, the production origin, a key
+# AND the dedicated ``BITPAY_ENABLE_LIVE_CHECKOUT`` opt-in. Anything less — a
+# missing live opt-in, a staging origin, the sandbox opt-in instead — is a 503
+# *before* the injected provider is used, exactly like the sandbox gate.
+
+LIVE_FLAG = "BITPAY_ENABLE_LIVE_CHECKOUT"
+LIVE_ORIGIN = "https://spaghettiprints.ir"
+
+
+def _live_env(
+    monkeypatch, *, origin=LIVE_ORIGIN, live_flag="1", test_flag=None, env="production"
+):
+    """Configure a fully-formed live production deployment."""
+    monkeypatch.setenv("BITPAY_API_KEY", "sk_live_offline-fake-not-a-real-key")
+    monkeypatch.setenv("BITPAY_ENV", env)
+    if live_flag is None:
+        monkeypatch.delenv(LIVE_FLAG, raising=False)
+    else:
+        monkeypatch.setenv(LIVE_FLAG, live_flag)
+    if test_flag is None:
+        monkeypatch.delenv("BITPAY_ENABLE_TEST_CHECKOUT", raising=False)
+    else:
+        monkeypatch.setenv("BITPAY_ENABLE_TEST_CHECKOUT", test_flag)
+    monkeypatch.setenv("PUBLIC_SITE_ORIGIN", origin)
+
+
+@pytest.fixture()
+def fake_bitpay_live(client, monkeypatch):
+    """Offline fake usable from a fully-formed, *production* live deployment."""
+    from app.main import app
+    from app.services import bitpay
+
+    _live_env(monkeypatch)
+    fake = FakeBitPay()
+    app.dependency_overrides[bitpay.client_dependency] = lambda: fake
+    yield fake
+    app.dependency_overrides.pop(bitpay.client_dependency, None)
+
+
+def test_bitpay_pay_allowed_for_valid_live_production_opt_in(
+    client, auth_headers, fake_bitpay_live
+):
+    invoice_id, token = make_approved(client, auth_headers)
+    r = bitpay_pay(client, token)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["provider"] == "bitpay"
+    assert body["redirect_url"] == fake_bitpay_live.redirect_url
+    assert _attempt_count(invoice_id) == 1
+
+
+def test_bitpay_pay_refused_without_live_opt_in(client, auth_headers, fake_bitpay, monkeypatch):
+    _live_env(monkeypatch, live_flag=None)
+    invoice_id, token = make_approved(client, auth_headers)
+    r = bitpay_pay(client, token)
+    assert r.status_code == 503, r.text
+    assert _attempt_count(invoice_id) == 0
+    assert fake_bitpay.sessions == {}
+    assert r.headers["Cache-Control"] == "no-store"
+
+
+def test_bitpay_pay_refused_for_live_env_on_non_production_origin(
+    client, auth_headers, fake_bitpay, monkeypatch
+):
+    _live_env(monkeypatch, origin="https://staging.spaghettiprints.ir")
+    invoice_id, token = make_approved(client, auth_headers)
+    assert bitpay_pay(client, token).status_code == 503
+    assert _attempt_count(invoice_id) == 0
+    assert fake_bitpay.sessions == {}
+
+
+def test_sandbox_opt_in_never_enables_live_pay(client, auth_headers, fake_bitpay, monkeypatch):
+    _live_env(monkeypatch, live_flag=None, test_flag="1")
+    invoice_id, token = make_approved(client, auth_headers)
+    assert bitpay_pay(client, token).status_code == 503
+    assert _attempt_count(invoice_id) == 0
+    assert fake_bitpay.sessions == {}
+
+
+def test_bitpay_pay_refused_for_misconfigured_env(client, auth_headers, fake_bitpay, monkeypatch):
+    _live_env(monkeypatch, env="prodction")
+    invoice_id, token = make_approved(client, auth_headers)
+    assert bitpay_pay(client, token).status_code == 503
+    assert _attempt_count(invoice_id) == 0
+    assert fake_bitpay.sessions == {}
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Callback — GET /bitpay/callback
 # ══════════════════════════════════════════════════════════════════════
@@ -719,9 +809,14 @@ class FakeDigiPay:
 
 
 @pytest.fixture()
-def fake_digipay(client):
+def fake_digipay(client, monkeypatch):
     from app.main import app
     from app.services import digipay
+
+    # DigiPay is parked in production (the legacy initiation route is a hard
+    # 503); the cross-provider lock tests still need a real DigiPay attempt, so
+    # they opt in explicitly through the predicate seam.
+    monkeypatch.setattr(digipay, "checkout_enabled", lambda: True)
 
     fake = FakeDigiPay()
     app.dependency_overrides[digipay.client_dependency] = lambda: fake

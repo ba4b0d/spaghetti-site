@@ -136,6 +136,18 @@ def resolve_base_url() -> str:
     return DIGIPAY_LIVE_BASE_URL
 
 
+def checkout_enabled() -> bool:
+    """Whether DigiPay may start a payment at all — currently always ``False``.
+
+    DigiPay is parked. This is a single, shared, unconditional predicate (there
+    is deliberately no environment override), so the public readiness snapshot
+    and the legacy initiation route can never disagree, and the route can refuse
+    *before* any provider is resolved — an injected client or fully-present
+    merchant credentials cannot start a payment.
+    """
+    return False
+
+
 def build_callback_url() -> str:
     """The callback the gateway posts back to — server config only."""
     raw = (os.getenv("DIGIPAY_CALLBACK_URL") or "").strip()

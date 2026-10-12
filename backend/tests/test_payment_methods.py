@@ -17,17 +17,26 @@ real customers a sandbox checkout. So ``bitpay.enabled`` now requires ALL of:
 ``digipay`` is parked and ``snapppay`` onboarding is non-settling, so both are
 always reported disabled. The API key and every other credential are never
 included, and a misconfigured environment fails closed.
+
+A **live** checkout is a separate risk surface, so it gets its own gate: a
+production ``BITPAY_ENV``, the production origin, a merchant key AND the
+dedicated ``BITPAY_ENABLE_LIVE_CHECKOUT`` opt-in — the sandbox opt-in never
+enables it, and a staging / localhost / malformed origin keeps it off.
 """
 import pytest
 
 BASE = "/api/v1/commerce"
-SECRET_KEY = "«redacted:sk_…»"
+# A clearly-fake, offline credential value: set as ``BITPAY_API_KEY`` only to
+# prove the readiness snapshot reports "configured" WITHOUT ever echoing it.
+SECRET_KEY = "offline-fake-bitpay-key-not-a-real-credential"
 
 FLAG = "BITPAY_ENABLE_TEST_CHECKOUT"
+LIVE_FLAG = "BITPAY_ENABLE_LIVE_CHECKOUT"
 NONPROD_ORIGIN = "https://staging.spaghettiprints.ir"
 PRODUCTION_ORIGINS = ["https://spaghettiprints.ir", "https://www.spaghettiprints.ir"]
+LIVE_ORIGIN = "https://spaghettiprints.ir"
 
-_ENV_VARS = ("BITPAY_API_KEY", "BITPAY_ENV", FLAG, "PUBLIC_SITE_ORIGIN")
+_ENV_VARS = ("BITPAY_API_KEY", "BITPAY_ENV", FLAG, LIVE_FLAG, "PUBLIC_SITE_ORIGIN")
 
 
 def _clear_bitpay_env(monkeypatch):
@@ -198,3 +207,111 @@ def test_response_never_contains_the_api_key(client, monkeypatch):
     # Belt-and-braces: no field name even looks credential-shaped. Both halves
     # must hold (``and``, not ``or``) or the check is vacuous.
     assert "api" not in r.text.lower() and "api_key" not in r.text.lower()
+
+
+# ── Live checkout activation: production + dedicated live opt-in ─────
+# A live checkout is a different risk surface from a sandbox one, so it gets its
+# own gate: a production ``BITPAY_ENV``, the production origin, a merchant key
+# AND the dedicated ``BITPAY_ENABLE_LIVE_CHECKOUT`` opt-in. The sandbox opt-in
+# never enables it, and any other origin (staging, localhost, malformed) keeps
+# it off — exactly mirroring how a sandbox checkout can never run on production.
+
+
+def _live_env(
+    monkeypatch, *, origin=LIVE_ORIGIN, live_flag="1", test_flag=None, env="production"
+):
+    """Configure a fully-formed live production deployment (and nothing test)."""
+    _clear_bitpay_env(monkeypatch)
+    monkeypatch.setenv("BITPAY_API_KEY", SECRET_KEY)
+    monkeypatch.setenv("BITPAY_ENV", env)
+    if live_flag is None:
+        monkeypatch.delenv(LIVE_FLAG, raising=False)
+    else:
+        monkeypatch.setenv(LIVE_FLAG, live_flag)
+    if test_flag is not None:
+        monkeypatch.setenv(FLAG, test_flag)
+    monkeypatch.setenv("PUBLIC_SITE_ORIGIN", origin)
+
+
+def _live_readiness(client, monkeypatch, **kwargs):
+    _live_env(monkeypatch, **kwargs)
+    return client.get(f"{BASE}/payment-methods")
+
+
+def test_live_checkout_enabled_only_for_full_production_opt_in(client, monkeypatch):
+    body = _live_readiness(client, monkeypatch).json()
+
+    assert body["bitpay"]["enabled"] is True
+    assert body["bitpay"]["configured"] is True
+    assert body["bitpay"]["environment"] == "live"
+    assert body["digipay"]["enabled"] is False
+    assert body["snapppay"]["enabled"] is False
+
+
+def test_live_checkout_stays_disabled_without_the_live_opt_in(client, monkeypatch):
+    body = _live_readiness(client, monkeypatch, live_flag=None).json()
+
+    assert body["bitpay"]["enabled"] is False
+    assert body["bitpay"]["configured"] is True
+    assert body["bitpay"]["environment"] == "live"
+
+
+def test_test_opt_in_flag_never_enables_a_live_checkout(client, monkeypatch):
+    # The sandbox opt-in must never activate a live checkout.
+    body = _live_readiness(client, monkeypatch, live_flag=None, test_flag="1").json()
+
+    assert body["bitpay"]["enabled"] is False
+    assert body["bitpay"]["environment"] == "live"
+
+
+def test_live_opt_in_flag_must_be_truthy_not_merely_present(client, monkeypatch):
+    body = _live_readiness(client, monkeypatch, live_flag="0").json()
+    assert body["bitpay"]["enabled"] is False
+
+
+def test_live_checkout_stays_disabled_when_origin_is_non_production(client, monkeypatch):
+    # A live key + live opt-in on a staging origin is refused: live never runs
+    # off a provably non-production origin.
+    body = _live_readiness(
+        client, monkeypatch, origin="https://staging.spaghettiprints.ir"
+    ).json()
+
+    assert body["bitpay"]["enabled"] is False
+    assert body["bitpay"]["environment"] == "live"
+
+
+def test_live_checkout_stays_disabled_for_localhost_origin(client, monkeypatch):
+    body = _live_readiness(
+        client, monkeypatch, origin="http://localhost:5173"
+    ).json()
+    assert body["bitpay"]["enabled"] is False
+
+
+@pytest.mark.parametrize("env", ["live", "prod"])
+def test_live_checkout_env_aliases_are_accepted(client, monkeypatch, env):
+    body = _live_readiness(client, monkeypatch, env=env).json()
+    assert body["bitpay"]["enabled"] is True
+    assert body["bitpay"]["environment"] == "live"
+
+
+@pytest.mark.parametrize(
+    "origin", ["https://spaghettiprints.ir.", "https://www.spaghettiprints.ir."]
+)
+def test_live_checkout_accepts_trailing_dot_production_origin(client, monkeypatch, origin):
+    # A trailing-dot FQDN names the same production host, and it is normalised
+    # before the comparison, so a live deployment using it is still production.
+    body = _live_readiness(client, monkeypatch, origin=origin).json()
+    assert body["bitpay"]["enabled"] is True
+
+
+def test_live_checkout_malformed_origin_fails_closed(client, monkeypatch):
+    body = _live_readiness(
+        client, monkeypatch, origin="https://evil.example/path?leak=1"
+    ).json()
+    assert body["bitpay"]["enabled"] is False
+
+
+def test_live_checkout_misconfigured_env_fails_closed(client, monkeypatch):
+    body = _live_readiness(client, monkeypatch, env="prodction").json()
+    assert body["bitpay"]["enabled"] is False
+    assert body["bitpay"]["configured"] is False
