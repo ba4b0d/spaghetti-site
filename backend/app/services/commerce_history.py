@@ -66,8 +66,8 @@ def _page_index(db: Session, mobile: str, *, limit: int, offset: int):
     """The page's ``(kind, id, created_at)`` rows, ordered and paginated in SQL.
 
     ``UNION ALL`` projects only the three columns pagination needs, so neither
-    table is materialized in Python; the composite index on ``mobile`` keeps the
-    scan bounded to the one number.
+    table is materialized in Python; ``mobile`` is indexed on both tables, which
+    keeps the scan bounded to the one number.
     """
     request_ids = select(
         literal(KIND_REQUEST).label("kind"),

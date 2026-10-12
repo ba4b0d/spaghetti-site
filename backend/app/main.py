@@ -33,6 +33,7 @@ from app.log_redaction import install_access_log_redaction
 install_access_log_redaction()
 from fastapi import FastAPI, Depends, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.database import engine, SessionLocal, Base
@@ -60,7 +61,10 @@ from app.routers.custom_orders import router as custom_orders_router
 from app.routers.customers import router as customers_router
 from app.routers.audit_logs import router as audit_router
 from app.routers.commerce import router as commerce_router
-from app.routers.commerce_history import router as commerce_history_router
+from app.routers.commerce_history import (
+    NO_STORE_HEADERS,
+    router as commerce_history_router,
+)
 from app.routers.digipay_callback import router as digipay_callback_router
 from app.routers.snappay_callback import router as snappay_callback_router
 from app.routers.bitpay_callback import router as bitpay_callback_router
@@ -391,6 +395,25 @@ async def history_api_no_store(request: Request, call_next):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
     return response
+
+
+# ── History API 500 backstop ─────────────────────────────────────────
+# An unhandled exception produces a ``500`` in Starlette's
+# ``ServerErrorMiddleware`` — the OUTERMOST layer, outside every user middleware
+# — so ``history_api_no_store`` above never sees it. FastAPI routes an
+# ``Exception`` (or ``500``) handler into that same outer middleware, so we
+# register one that stamps the history security headers itself. Every other path
+# gets the framework's default ``Internal Server Error`` body verbatim, and
+# ``ServerErrorMiddleware`` still re-raises afterwards, so uvicorn keeps logging
+# the traceback and ``TestClient(raise_server_exceptions=True)`` is unchanged.
+def _history_api_error_response(request: Request, exc: Exception):
+    headers = (
+        NO_STORE_HEADERS if request.url.path.startswith(HISTORY_API_PREFIX) else None
+    )
+    return PlainTextResponse("Internal Server Error", status_code=500, headers=headers)
+
+
+app.add_exception_handler(Exception, _history_api_error_response)
 
 # ── Include routers ──────────────────────────────────────────────────
 app.include_router(settings_router, dependencies=[Depends(require_staff_role)])

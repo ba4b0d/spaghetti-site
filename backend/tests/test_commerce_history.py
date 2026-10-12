@@ -79,6 +79,12 @@ def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
+def _assert_no_store(resp):
+    """Every history response — 200 or error — must forbid caching/referral."""
+    assert resp.headers["Cache-Control"] == "no-store", resp.headers
+    assert resp.headers["Referrer-Policy"] == "no-referrer", resp.headers
+
+
 def _now():
     return datetime.now(timezone.utc)
 
@@ -194,6 +200,7 @@ def test_issue_verify_then_read(client):
     _insert_request()
     r = client.post(f"{BASE}/otp", json={"mobile": MOBILE})
     assert r.status_code == 200, r.text
+    _assert_no_store(r)
     body = r.json()
     assert set(body) == {"challenge_id", "expires_in", "resend_after", "delivery", "masked_mobile"}
     assert body["delivery"] == "sms"
@@ -208,11 +215,13 @@ def test_issue_verify_then_read(client):
         json={"mobile": MOBILE, "challenge_id": body["challenge_id"], "code": _sent_code()},
     )
     assert verified.status_code == 200, verified.text
+    _assert_no_store(verified)
     token = verified.json()["token"]
     assert token and " " not in token
 
     listing = client.get(BASE, headers=_auth(token))
     assert listing.status_code == 200, listing.text
+    _assert_no_store(listing)
     payload = listing.json()
     assert set(payload) == {"items", "has_more"}
     assert [e["kind"] for e in payload["items"]] == ["request"]
@@ -332,6 +341,7 @@ def test_sign_out_revokes_and_requires_session(client):
     token = _get_token(client)
     out = client.post(f"{BASE}/sign-out", headers=_auth(token))
     assert out.status_code == 200 and out.json() == {"ok": True}
+    _assert_no_store(out)
     assert client.get(BASE, headers=_auth(token)).status_code == 401
 
 
@@ -522,7 +532,7 @@ def test_limit_and_offset_bounds(client):
     for query in ("limit=0", "limit=51", "offset=-1"):
         r = client.get(f"{BASE}?{query}", headers=_auth(token))
         assert r.status_code == 422, (query, r.status_code)
-        assert r.headers["Cache-Control"] == "no-store"
+        _assert_no_store(r)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -592,6 +602,87 @@ def test_slowapi_rate_limit_429_is_no_store(client):
             assert r.headers["Referrer-Policy"] == "no-referrer"
         else:
             assert r.status_code == 200, r.text
+
+
+def _server_error_client(monkeypatch):
+    """A TestClient that surfaces 500s instead of re-raising them.
+
+    Mirrors ``conftest.client`` (test-DB override + Telegram poll disabled) but
+    with ``raise_server_exceptions=False`` so an unhandled exception is observed
+    as the HTTP response a real server would emit. Returns ``(app, TestClient)``;
+    the caller clears ``app.dependency_overrides`` afterwards.
+    """
+    from fastapi.testclient import TestClient
+
+    import app.main as app_main
+    from app.database import get_db
+    from app.main import app
+    from tests.conftest import TestSessionLocal
+
+    monkeypatch.setattr(app_main, "start_telegram_bot_thread", lambda: None)
+
+    def _override_get_db():
+        db = TestSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    return app, TestClient(app, raise_server_exceptions=False)
+
+
+def test_unhandled_exception_500_is_no_store(monkeypatch):
+    """A 500 on the history prefix still carries no-store/no-referrer.
+
+    Starlette builds its unhandled-exception ``500`` in the *outermost*
+    ``ServerErrorMiddleware`` — outside every user middleware — so the prefix
+    middleware never sees it. The app-level ``Exception`` backstop must stamp it
+    without leaking the exception.
+    """
+    from app.services import commerce_history_auth
+
+    app, tc = _server_error_client(monkeypatch)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("history-session-boom")
+
+    monkeypatch.setattr(commerce_history_auth, "resolve_history_session", _boom)
+    try:
+        with tc as c:
+            r = c.get(BASE, headers=_auth("whatever"))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert r.status_code == 500, r.text
+    _assert_no_store(r)
+    # The exception type, message and traceback never reach the client.
+    assert "boom" not in r.text and "RuntimeError" not in r.text
+
+
+def test_server_error_backstop_leaves_other_routes_unchanged(monkeypatch):
+    """The 500 backstop must not alter a non-history route's error response."""
+    from app.routers import auth as auth_router
+
+    app, tc = _server_error_client(monkeypatch)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("login-boom")
+
+    monkeypatch.setattr(auth_router, "_verify", _boom)
+    try:
+        with tc as c:
+            other = c.post(
+                "/api/v1/auth/login",
+                json={"username": "admin", "password": "3djat2024"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert other.status_code == 500, other.text
+    assert other.text == "Internal Server Error"
+    assert other.headers.get("Cache-Control") is None
+    assert other.headers.get("Referrer-Policy") is None
 
 
 # ══════════════════════════════════════════════════════════════════════
