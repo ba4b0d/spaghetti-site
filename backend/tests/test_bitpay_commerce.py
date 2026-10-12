@@ -15,12 +15,16 @@ override, exactly as the DigiPay suite injects its fake; every response is
 scripted and no socket is opened.
 """
 import logging
+import re
 
 import pytest
 
 BASE = "/api/v1/commerce"
 BITPAY_CALLBACK = f"{BASE}/bitpay/callback"
 BITPAY_CB_PATH = "/api/v1/commerce/bitpay/callback"
+
+# The documented gateway ``factorId`` is a Latin integer only.
+_LATIN_DECIMAL = re.compile(r"[0-9]+")
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +80,12 @@ class FakeBitPay:
         sess = self.sessions.get(id_get, {})
         amount = self.amount_override if self.amount_override is not None else sess.get("amount_rial")
         factor = self.factor_override if self.factor_override is not None else sess.get("factor_id")
+        # Documented BitPay behaviour: a ``factorId`` that is not a Latin-decimal
+        # integer is silently coerced to ``0`` on the verify reply. This is the
+        # exact silent coercion that broke matching of the historical alnum
+        # ``INV<id>-R<rev>-<hex>`` merchant reference.
+        if factor is not None and not _LATIN_DECIMAL.fullmatch(str(factor).strip()):
+            factor = "0"
         from app.services.bitpay import BitPayVerification
 
         return BitPayVerification(
@@ -207,6 +217,11 @@ def test_bitpay_pay_returns_redirect_and_durable_attempt(client, auth_headers, f
     # the id_get the callback will be matched on is durably persisted
     assert attempt.tracking_code == str(fake_bitpay.id_get)
     assert fake_bitpay.sessions[fake_bitpay.id_get]["factor_id"] == attempt.provider_id
+    # the outbound factorId is the attempt's own Latin-decimal id (the documented
+    # gateway integer), persisted as the expected reference in provider_id
+    assert _LATIN_DECIMAL.fullmatch(str(attempt.provider_id))
+    assert attempt.provider_id == str(attempt.id)
+    assert str(fake_bitpay.sessions[fake_bitpay.id_get]["factor_id"]) == str(attempt.id)
 
 
 def test_bitpay_pay_repeat_clicks_are_idempotent(client, auth_headers, fake_bitpay):
@@ -568,11 +583,242 @@ def test_bitpay_callback_amount_mismatch_never_settles(client, auth_headers, fak
 
 def test_bitpay_callback_factorid_mismatch_never_settles(client, auth_headers, fake_bitpay):
     invoice_id, _, _ = _pay_and_attempt(client, auth_headers, fake_bitpay)
-    fake_bitpay.factor_override = "SOMEONE-ELSES-INVOICE"
+    # a *different invoice's* numeric factorId: a self-consistent success that
+    # must not settle this attempt
+    fake_bitpay.factor_override = "999999"
     r = bitpay_callback(client, trans_id="1", id_get=fake_bitpay.id_get)
     assert "payment=failed" in r.headers["location"]
     assert latest_attempt(invoice_id).state == "unknown"
     assert invoice_state(invoice_id) == "approved"
+
+
+def test_bitpay_pay_sends_latin_decimal_factor_id(client, auth_headers, fake_bitpay):
+    """Regression: the outbound ``factorId`` must be the Latin-decimal attempt
+    id — the documented integer — never the pre-fix alnum merchant reference."""
+    invoice_id, token = make_approved(client, auth_headers)
+    assert bitpay_pay(client, token).status_code == 200
+    attempt = latest_attempt(invoice_id)
+    assert _LATIN_DECIMAL.fullmatch(str(attempt.provider_id))
+    assert attempt.provider_id == str(attempt.id)
+    sent = fake_bitpay.sessions[fake_bitpay.id_get]["factor_id"]
+    assert sent is not None
+    assert _LATIN_DECIMAL.fullmatch(str(sent))
+    assert str(sent) == str(attempt.id)
+
+
+def test_digipay_callback_identity_lookup_ignores_bitpay_attempts(
+    client, auth_headers, fake_bitpay
+):
+    """Hardening: the DigiPay callback resolves its row by ``provider_id``; a
+    BitPay attempt now stores a short numeric id there, so the lookup must be
+    scoped to DigiPay rows — a forged DigiPay callback carrying that number
+    must not resolve (let alone settle) a BitPay attempt."""
+    from app.services import commerce as commerce_service
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, token = make_approved(client, auth_headers)
+    assert bitpay_pay(client, token).status_code == 200
+    attempt = latest_attempt(invoice_id)
+    assert _LATIN_DECIMAL.fullmatch(str(attempt.provider_id))
+
+    db = TestSessionLocal()
+    try:
+        assert (
+            commerce_service.find_payment_attempt_by_provider_id(
+                db, attempt.provider_id
+            )
+            is None
+        )
+    finally:
+        db.close()
+
+
+def test_bitpay_callback_alnum_factor_echo_is_coerced_to_zero_and_never_settles(
+    client, auth_headers, fake_bitpay
+):
+    """A verify reply whose factorId is not a Latin integer is coerced to ``0``
+    by the gateway; ``0`` can never match the numeric reference → no settle."""
+    invoice_id, _, _ = _pay_and_attempt(client, auth_headers, fake_bitpay)
+    fake_bitpay.factor_override = "INV-someone-elses"     # coerced to "0"
+    r = bitpay_callback(client, trans_id="1", id_get=fake_bitpay.id_get)
+    assert "payment=failed" in r.headers["location"]
+    assert latest_attempt(invoice_id).state == "unknown"
+    assert invoice_state(invoice_id) == "approved"
+
+
+def test_bitpay_callback_already_verified_status_11_settles(client, auth_headers, fake_bitpay):
+    """The documented ``11`` (already verified) is a success too, and settles."""
+    invoice_id, _, _ = _pay_and_attempt(client, auth_headers, fake_bitpay)
+    fake_bitpay.verify_status = 11
+    r = bitpay_callback(client, trans_id="12345", id_get=fake_bitpay.id_get)
+    assert "payment=success" in r.headers["location"]
+    assert invoice_state(invoice_id) == "paid"
+
+
+# ── Legacy (pre-fix) attempts: alnum provider_id, factorId coerced to 0 ──
+#
+# Attempts created before this fix sent ``factorId=INV<id>-R<rev>-<hex>``, which
+# the gateway silently coerced to ``0`` on verify. Such a row can never be
+# matched, so it MUST NOT auto-settle through the ordinary callback or a regular
+# staff ``verify`` reconcile — the lock and the staff queue are preserved until
+# an explicit, audited manual settlement releases it.
+def _invoice_amount_rial(invoice_id):
+    from app.models import CommerceInvoice
+    from tests.conftest import TestSessionLocal
+
+    db = TestSessionLocal()
+    try:
+        return db.get(CommerceInvoice, invoice_id).total_toman * 10
+    finally:
+        db.close()
+
+
+def _make_legacy_bitpay_attempt(
+    invoice_id, *, id_get, provider_id="INV3-R1-deadbeef", state="unknown", trans_id=None
+):
+    """Insert a pre-fix BitPay attempt (alnum provider_id) directly."""
+    from app.models import CommerceInvoice, CommercePaymentAttempt
+    from tests.conftest import TestSessionLocal
+
+    db = TestSessionLocal()
+    try:
+        invoice = db.get(CommerceInvoice, invoice_id)
+        attempt = CommercePaymentAttempt(
+            invoice_id=invoice_id,
+            provider="bitpay",
+            state=state,
+            provider_id=provider_id,
+            amount_rial=invoice.total_toman * 10,
+            invoice_revision=invoice.revision,
+            type=0,
+            tracking_code=str(id_get),
+            provider_trans_id=trans_id,
+            redirect_url=f"https://bitpay.ir/payment/gateway-{id_get}-get",
+        )
+        db.add(attempt)
+        db.commit()
+        db.refresh(attempt)
+        return attempt.id
+    finally:
+        db.close()
+
+
+def test_bitpay_legacy_alnum_attempt_never_auto_settles_on_callback(
+    client, auth_headers, fake_bitpay
+):
+    """A pre-fix paid attempt MUST NOT settle via the ordinary callback — even
+    when the gateway verifies success with a matching amount — because its alnum
+    factorId was coerced to ``0``. The lock and the staff queue are preserved."""
+    invoice_id, token = make_approved(client, auth_headers)
+    _make_legacy_bitpay_attempt(invoice_id, id_get=fake_bitpay.id_get)
+    fake_bitpay.sessions[fake_bitpay.id_get] = {
+        "factor_id": "0", "amount_rial": _invoice_amount_rial(invoice_id)
+    }
+    r = bitpay_callback(client, trans_id="12345", id_get=fake_bitpay.id_get)
+    assert "payment=failed" in r.headers["location"]
+    assert invoice_state(invoice_id) == "approved"
+    after = latest_attempt(invoice_id)
+    assert after.state == "unknown"                  # lock held
+    assert after.reconciliation_required is False    # not settled this way
+    assert fake_bitpay.verify_calls == []            # legacy guard: never trusted
+
+
+def test_bitpay_legacy_alnum_attempt_not_settled_by_staff_reconcile(
+    client, auth_headers, fake_bitpay
+):
+    """A regular staff ``verify`` reconcile must not auto-settle a legacy alnum
+    attempt either; only an explicit, audited manual settlement may."""
+    invoice_id, token = make_approved(client, auth_headers)
+    attempt_id = _make_legacy_bitpay_attempt(
+        invoice_id, id_get=fake_bitpay.id_get, trans_id=12345
+    )
+    fake_bitpay.sessions[fake_bitpay.id_get] = {
+        "factor_id": "0", "amount_rial": _invoice_amount_rial(invoice_id)
+    }
+    rr = client.post(
+        f"{BASE}/staff/payments/{attempt_id}/reconcile",
+        json={"action": "verify"},
+        headers=auth_headers,
+    )
+    assert rr.status_code == 200, rr.text
+    assert rr.json()["state"] == "unknown"
+    assert rr.json()["reconciliation_required"] is False
+    assert invoice_state(invoice_id) == "approved"
+    assert fake_bitpay.verify_calls == []            # legacy guard, not auto-queried
+
+
+def test_bitpay_legacy_attempt_can_still_be_abandoned_by_staff(
+    client, auth_headers, fake_bitpay
+):
+    """The legacy row is not hard-locked forever: an explicit, audited staff
+    ``abandon`` (with a reason) still releases the invoice lock."""
+    invoice_id, token = make_approved(client, auth_headers)
+    attempt_id = _make_legacy_bitpay_attempt(
+        invoice_id, id_get=fake_bitpay.id_get, trans_id=12345
+    )
+    rr = client.post(
+        f"{BASE}/staff/payments/{attempt_id}/reconcile",
+        json={"action": "abandon", "reason": "legacy alnum factorId; settled offline"},
+        headers=auth_headers,
+    )
+    assert rr.status_code == 200, rr.text
+    assert rr.json()["state"] == "failed"
+
+
+def test_bitpay_staff_reconcile_foreign_numeric_factor_keeps_lock(
+    client, auth_headers, fake_bitpay
+):
+    """A reconcile that returns a different invoice's numeric factorId must not
+    settle: the lock is kept."""
+    from app.services.bitpay import BitPayError
+
+    invoice_id, _, _ = _pay_and_attempt(client, auth_headers, fake_bitpay)
+    fake_bitpay.verify_error = BitPayError("timeout")
+    held = bitpay_callback(client, trans_id="555", id_get=fake_bitpay.id_get)
+    assert "payment=pending" in held.headers["location"]
+
+    fake_bitpay.verify_error = None
+    fake_bitpay.factor_override = "999999"           # a foreign numeric factor
+    rr = client.post(
+        f"{BASE}/staff/payments/{latest_attempt(invoice_id).id}/reconcile",
+        json={"action": "verify"},
+        headers=auth_headers,
+    )
+    assert rr.status_code == 200, rr.text
+    assert rr.json()["state"] == "unknown"
+    assert invoice_state(invoice_id) == "approved"
+
+
+def test_bitpay_staff_reconcile_stale_revision_preserves_evidence(
+    client, auth_headers, fake_bitpay
+):
+    """A genuine reconcile success on an invoice revised after initiation is
+    preserved for staff, never applied."""
+    from app.models import CommerceInvoice
+    from app.services.bitpay import BitPayError
+    from tests.conftest import TestSessionLocal
+
+    invoice_id, _, _ = _pay_and_attempt(client, auth_headers, fake_bitpay)
+    fake_bitpay.verify_error = BitPayError("timeout")
+    bitpay_callback(client, trans_id="555", id_get=fake_bitpay.id_get)
+    fake_bitpay.verify_error = None
+
+    db = TestSessionLocal()
+    try:
+        db.get(CommerceInvoice, invoice_id).revision = 2   # revised after initiation
+        db.commit()
+    finally:
+        db.close()
+
+    rr = client.post(
+        f"{BASE}/staff/payments/{latest_attempt(invoice_id).id}/reconcile",
+        json={"action": "verify"},
+        headers=auth_headers,
+    )
+    assert rr.status_code == 200, rr.text
+    assert rr.json()["state"] == "verified"
+    assert rr.json()["reconciliation_required"] is True
+    assert invoice_state(invoice_id) != "paid"
 
 
 def test_bitpay_callback_success_then_forged_trans_id_does_not_settle(

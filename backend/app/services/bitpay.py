@@ -10,6 +10,9 @@ frontend). The three documented steps are:
             ``cardNum``). The reply is a **bare integer**, not JSON: a value
             ``> 0`` is the ``id_get`` transaction id, while ``-1``..``-5`` are
             the documented error codes.
+            ``factorId`` is a documented **Latin integer** reference: any other
+            value (e.g. an alnum merchant id) is silently coerced to ``0`` on
+            the verify reply, so a non-integer reference is refused here.
 
     portal  ``https://bitpay.ir/payment/gateway-<id_get>-get``
             where the payer is sent. We always build this URL ourselves — the
@@ -91,6 +94,10 @@ VERIFY_SUCCESS_CODES = (VERIFY_SUCCESS_FRESH, VERIFY_SUCCESS_ALREADY)
 
 _INT_RE = re.compile(r"[+-]?\d+")
 _UNSIGNED_INT_RE = re.compile(r"\d+")
+# The documented ``factorId`` is a Latin *integer* only. ``[0-9]`` (not ``\d``)
+# on purpose: a non-Latin decimal (e.g. Arabic-Indic digits) is likewise coerced
+# to ``0`` by the gateway, so it must be refused just like any other non-integer.
+_LATIN_DECIMAL_RE = re.compile(r"[0-9]+")
 
 
 class BitPayError(Exception):
@@ -553,8 +560,20 @@ class BitPayClient:
         redirect = _valid_callback_url(redirect_url)
 
         data = {"api": self._api_key, "amount": amount_rial, "redirect": redirect}
-        if factor_id not in (None, ""):
-            data["factorId"] = factor_id
+        # The documented gateway accepts a Latin-*integer* ``factorId`` only; any
+        # other value is silently coerced to ``0`` on the verify reply. That is
+        # precisely how the historical alnum ``INV<id>-R<rev>-<hex>`` reference
+        # stopped matching and a genuine payment failed to settle. Refuse a
+        # non-integer reference here, before any transport call, so the failure
+        # is loud and can never recur quietly.
+        factor_reference = "" if factor_id is None else str(factor_id).strip()
+        if factor_reference:
+            if not _LATIN_DECIMAL_RE.fullmatch(factor_reference):
+                raise BitPayError(
+                    "factorId must be a Latin-decimal integer "
+                    "(the gateway coerces any other value to 0)"
+                )
+            data["factorId"] = factor_reference
         if name:
             data["name"] = name
         if email:

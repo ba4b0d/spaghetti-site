@@ -89,7 +89,7 @@ def test_create_posts_documented_form_and_builds_portal_redirect():
     result = client.create_payment(
         amount_rial=50000,
         redirect_url=CALLBACK,
-        factor_id="INV-1-R1",
+        factor_id="3300",
     )
     # The id_get is the raw positive integer body; the payer portal is built
     # by us, never taken from a provider payload.
@@ -101,7 +101,7 @@ def test_create_posts_documented_form_and_builds_portal_redirect():
     assert call["data"]["api"] == "K" * 52
     assert call["data"]["amount"] == 50000
     assert call["data"]["redirect"] == CALLBACK
-    assert call["data"]["factorId"] == "INV-1-R1"
+    assert call["data"]["factorId"] == "3300"
     assert call["timeout"] is not None
 
 
@@ -119,7 +119,7 @@ def test_create_accepts_documented_optional_fields_when_supplied():
     client.create_payment(
         amount_rial=5000,
         redirect_url=CALLBACK,
-        factor_id="INV-2",
+        factor_id="2",
         name="رضا",
         email="r@example.com",
         description="invoice",
@@ -149,6 +149,52 @@ def test_create_omits_unset_optional_fields():
     data = client._session.calls[0]["data"]
     for optional in ("name", "email", "description", "mobileNum", "cardNum", "factorId"):
         assert optional not in data
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(3300, "3300"), ("3300", "3300"), ("  3300  ", "3300"), ("0007", "0007")],
+)
+def test_create_sends_latin_decimal_factor_id(value, expected):
+    """The documented gateway needs a Latin-integer ``factorId``; a numeric
+    string/int is forwarded verbatim (after trimming)."""
+    client = make_client([FakeResponse(200, text="9")])
+    client.create_payment(amount_rial=5000, redirect_url=CALLBACK, factor_id=value)
+    assert client._session.calls[0]["data"]["factorId"] == expected
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "INV-1-R1",        # the pre-fix alnum merchant reference
+        "INV3-R1-deadbeef",
+        "abc",
+        "12.3",
+        "12a",
+        "١٢",              # Arabic-Indic digits are NOT Latin decimals
+        "+5",
+        "-5",
+        "1 2",
+    ],
+)
+def test_create_refuses_non_latin_integer_factor_id(bad):
+    """A non-integer ``factorId`` is silently coerced to ``0`` by the gateway,
+    which is exactly the bug that broke matching — so it is refused up front,
+    before any transport call ever leaves the process."""
+    from app.services.bitpay import BitPayError
+
+    client = make_client([FakeResponse(200, text="9")])
+    with pytest.raises(BitPayError):
+        client.create_payment(amount_rial=5000, redirect_url=CALLBACK, factor_id=bad)
+    assert client._session.calls == []
+
+
+@pytest.mark.parametrize("blank", [None, "", "   ", "\t\n"])
+def test_create_treats_blank_factor_id_as_absent(blank):
+    """An unset/blank ``factorId`` is omitted, never sent as an empty value."""
+    client = make_client([FakeResponse(200, text="9")])
+    client.create_payment(amount_rial=5000, redirect_url=CALLBACK, factor_id=blank)
+    assert "factorId" not in client._session.calls[0]["data"]
 
 
 def test_create_strips_surrounding_whitespace_in_body():

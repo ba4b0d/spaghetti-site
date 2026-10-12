@@ -541,8 +541,12 @@ class CommercePaymentAttempt(Base):
 
     ``provider_id`` is the unique merchant reference sent to DigiPay and echoed
     back on the callback, which is how a stateless callback is matched to its
-    invoice without a bearer token in the URL. ``amount_rial`` is the immutable
-    Toman→Rial conversion (total_toman * 10) computed server-side exactly once.
+    invoice without a bearer token in the URL. For a BitPay attempt it instead
+    holds the attempt's own Latin-decimal id — the integer ``factorId`` the
+    documented gateway requires (any non-integer reference is silently coerced
+    to ``0``) — which is what the verify echo is matched against.
+    ``amount_rial`` is the immutable Toman→Rial conversion (total_toman * 10)
+    computed server-side exactly once.
     """
     __tablename__ = "commerce_payment_attempts"
     __table_args__ = (

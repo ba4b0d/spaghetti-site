@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
@@ -922,7 +923,14 @@ def find_payment_attempt_by_provider_id(db: Session, provider_id: str | None) ->
         return None
     return (
         db.query(CommercePaymentAttempt)
-        .filter(CommercePaymentAttempt.provider_id == provider_id)
+        # DigiPay-only: its alnum merchant reference is the callback identity.
+        # A BitPay attempt now stores a short *numeric* ``provider_id`` (the
+        # factorId), so without this filter a forged DigiPay callback carrying
+        # that number could resolve a BitPay row.
+        .filter(
+            CommercePaymentAttempt.provider == PAYMENT_PROVIDER_DIGIPAY,
+            CommercePaymentAttempt.provider_id == provider_id,
+        )
         .first()
     )
 
@@ -1709,6 +1717,43 @@ def reconcile_payment_attempt(
 # sentinel so staff tooling can distinguish a BitPay attempt from a DigiPay one.
 BITPAY_TICKET_TYPE = 0
 
+# The documented gateway ``factorId`` is a Latin integer only. For a BitPay
+# attempt we send the attempt's own integer id and persist it (as a string) in
+# ``provider_id`` — the one existing, unique merchant-reference column — so the
+# verify echo can be matched exactly. ``[0-9]`` (not ``\d``) on purpose: a
+# non-Latin decimal (e.g. Arabic-Indic digits) is likewise coerced to ``0`` by
+# the gateway, so it must be treated as unreferenceable too.
+_LATIN_DECIMAL_RE = re.compile(r"[0-9]+")
+
+
+def _pending_bitpay_provider_id() -> str:
+    """A temporary unique ``provider_id`` so a new row can be flushed for its id.
+
+    The column is NOT NULL + UNIQUE, so the row cannot be inserted blank; this
+    placeholder lives only across the flush and is overwritten with the attempt's
+    Latin-decimal id before commit.
+    """
+    return f"pending-{secrets.token_hex(12)}"
+
+
+def bitpay_factor_reference(attempt: CommercePaymentAttempt) -> str | None:
+    """The exact numeric ``factorId`` a BitPay attempt was issued with, if any.
+
+    A *new* attempt persists the Latin-decimal ``attempt.id`` in ``provider_id``
+    and sends it as ``factorId``. A row created before the numeric-factor fix
+    holds the historical alnum ``INV<id>-R<rev>-<hex>`` reference, whose factorId
+    the gateway silently coerced to ``0`` on verify: it has no provable numeric
+    reference and MUST NOT be settled by an ordinary callback or a regular staff
+    reconcile. Returns ``None`` for such a legacy row (fail closed).
+    """
+    raw = getattr(attempt, "provider_id", None)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not _LATIN_DECIMAL_RE.fullmatch(text):
+        return None
+    return text
+
 
 def find_bitpay_attempt_by_id_get(db: Session, id_get) -> CommercePaymentAttempt | None:
     """Resolve the attempt whose persisted ``id_get`` matches a callback hint.
@@ -1758,7 +1803,9 @@ def start_bitpay_payment(
             invoice_id=invoice.id,
             provider=PAYMENT_PROVIDER_BITPAY,
             state="initiating",
-            provider_id=generate_payment_provider_id(invoice),
+            # A NOT NULL + UNIQUE column: a placeholder is required so the row
+            # can be flushed to obtain its id, which becomes the factorId.
+            provider_id=_pending_bitpay_provider_id(),
             amount_rial=amount_rial,
             invoice_revision=invoice.revision,
             type=BITPAY_TICKET_TYPE,
@@ -1772,6 +1819,12 @@ def start_bitpay_payment(
         attempt.state = "initiating"
 
     try:
+        # Flush first so the row has its id; the documented gateway ``factorId``
+        # must be a Latin integer, so we send the attempt's own id and persist it
+        # as the expected reference (``provider_id``). A reused in-flight row is
+        # migrated the same way, so it too is issued/expected numerically.
+        db.flush()
+        attempt.provider_id = str(attempt.id)
         db.commit()
     except IntegrityError:
         # Lost a race against a concurrent initiation (partial unique index).
@@ -1816,17 +1869,31 @@ def _bitpay_verification_confirms(verified, attempt: CommercePaymentAttempt) -> 
     """True only when a BitPay verify proves the *exact* amount and factorId.
 
     The provider reply must report success AND carry an ``amount`` equal to the
-    issued ``amount_rial`` AND a ``factorId`` equal to our unique ``provider_id``
-    (the reference we sent). A success missing either identity field is not a
-    confirmation — matching both is what stops a self-consistent forgery (or a
-    genuine payment for a different invoice) from settling this attempt.
+    issued ``amount_rial`` AND a ``factorId`` equal to the Latin-decimal
+    reference we sent (persisted in ``provider_id``). A success missing either
+    identity field is not a confirmation — matching both is what stops a
+    self-consistent forgery (or a genuine payment for a different invoice) from
+    settling this attempt.
+
+    Both sides must be Latin integers. A legacy alnum reference has no numeric
+    value to compare (the gateway coerced it to ``0``) and a non-integer echo is
+    likewise coerced, so neither can ever confirm — that is what keeps a pre-fix
+    paid attempt from auto-settling.
     """
     if not getattr(verified, "is_success", False):
         return False
     if _int_or_none(getattr(verified, "amount_rial", None)) != attempt.amount_rial:
         return False
-    factor_id = getattr(verified, "factor_id", None)
-    if factor_id is None or str(factor_id) != str(attempt.provider_id):
+    expected = bitpay_factor_reference(attempt)
+    if expected is None:
+        return False
+    echoed = getattr(verified, "factor_id", None)
+    if echoed is None:
+        return False
+    echoed_text = str(echoed).strip()
+    if not _LATIN_DECIMAL_RE.fullmatch(echoed_text):
+        return False
+    if echoed_text != expected:
         return False
     return True
 
@@ -1873,6 +1940,19 @@ def handle_bitpay_callback(
         if attempt.reconciliation_required:
             return "pending"
         return "success"
+
+    # A legacy attempt carries the historical alnum ``provider_id``, whose
+    # factorId the gateway coerced to ``0`` — the verify reply can never be
+    # matched to it. Refuse to auto-settle here: keep the lock (the row stays
+    # active and in the staff queue) for an explicit, audited manual settlement.
+    if bitpay_factor_reference(attempt) is None:
+        _hold_bitpay_attempt(
+            db,
+            attempt,
+            "legacy alnum factorId reference; cannot auto-settle — "
+            "needs audited manual settlement",
+        )
+        return "failed"
 
     parsed_trans = _int_or_none(trans_id)
     if parsed_trans is None or parsed_trans <= 0:
@@ -1931,6 +2011,18 @@ def _reconcile_bitpay_attempt(
     id_get = _int_or_none(attempt.tracking_code)
     trans_id = attempt.provider_trans_id
     if id_get is None or id_get <= 0 or not trans_id:
+        return attempt
+    if bitpay_factor_reference(attempt) is None:
+        # Legacy alnum reference (factorId coerced to ``0``): never auto-settle
+        # through a routine staff reconcile. Keep the lock and leave the row in
+        # the queue for an explicit, audited manual settlement (or a staff
+        # abandon).
+        attempt.last_error = _short(
+            "legacy alnum factorId reference; cannot auto-settle — "
+            "needs audited manual settlement"
+        )
+        db.commit()
+        db.refresh(attempt)
         return attempt
     if client is None:
         raise CommerceGatewayUnavailableError("درگاه پرداخت پیکربندی نشده است")
