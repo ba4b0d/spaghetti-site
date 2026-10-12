@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models import CommerceOtpChallenge
+from app.models import CommerceHistoryOtpChallenge, CommerceOtpChallenge
 from app.services import commerce_notifications
 
 # ── Tunables ─────────────────────────────────────────────────────────
@@ -123,12 +123,57 @@ def _generate_code() -> str:
     return f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
 
 
-def _latest_for_mobile(db: Session, mobile: str) -> CommerceOtpChallenge | None:
-    return (
-        db.query(CommerceOtpChallenge)
-        .filter(CommerceOtpChallenge.mobile == mobile)
-        .order_by(CommerceOtpChallenge.id.desc())
-        .first()
+def _latest_for_mobile(db: Session, mobile: str) -> CommerceOtpChallenge | CommerceHistoryOtpChallenge | None:
+    """Newest challenge row for ``mobile`` in *either* purpose.
+
+    Checkout and history keep separate tables but draw on one SMS budget, so the
+    resend cooldown is measured from the newest send of either purpose —
+    otherwise a customer (or an attacker) could alternate flows to send twice as
+    fast. Both models carry ``created_at``, which is all the callers read.
+    """
+    newest = None
+    for model in (CommerceOtpChallenge, CommerceHistoryOtpChallenge):
+        row = (
+            db.query(model)
+            .filter(model.mobile == mobile)
+            .order_by(model.id.desc())
+            .first()
+        )
+        if row is not None and (
+            newest is None or _as_utc(row.created_at) > _as_utc(newest.created_at)
+        ):
+            newest = row
+    return newest
+
+
+def latest_send_at(db: Session, mobile: str) -> datetime | None:
+    """Creation time of the newest challenge for ``mobile``, any purpose."""
+    latest = _latest_for_mobile(db, mobile)
+    return _as_utc(latest.created_at) if latest is not None else None
+
+
+def count_recent_sends(db: Session, mobile: str, *, since: datetime) -> int:
+    """Challenges sent to ``mobile`` since ``since`` — across BOTH purposes.
+
+    The one SMS budget counter: both issue paths must consult it before
+    inserting, so alternating checkout and history cannot multiply a number's
+    hourly allowance.
+    """
+    return sum(
+        db.query(model.id)
+        .filter(model.mobile == mobile, model.created_at >= since)
+        .count()
+        for model in (CommerceOtpChallenge, CommerceHistoryOtpChallenge)
+    )
+
+
+def count_recent_sends_for_ip(db: Session, client_ip_hash: str, *, since: datetime) -> int:
+    """Challenges issued from one client IP since ``since``, any purpose."""
+    return sum(
+        db.query(model.id)
+        .filter(model.client_ip_hash == client_ip_hash, model.created_at >= since)
+        .count()
+        for model in (CommerceOtpChallenge, CommerceHistoryOtpChallenge)
     )
 
 
@@ -142,6 +187,10 @@ def issue_challenge(
     and raises ``OtpDeliveryError`` if the SMS transport does not acknowledge,
     so no unverifiable challenge survives.
 
+    The cooldown and both hourly caps are counted across *both* challenge
+    tables (checkout + order-history), because the two flows share one SMS
+    budget: alternating them must not multiply a number's or an IP's allowance.
+
     The whole check-then-insert runs inside a serialized SQLite write
     transaction (``BEGIN IMMEDIATE``) so concurrent issues for one mobile
     cannot both pass the throttle and each send a real SMS.
@@ -152,9 +201,9 @@ def issue_challenge(
     _begin_immediate(db)
     try:
         # Resend cooldown, measured from the most recent challenge for this
-        # mobile (consumed or not), so a customer cannot spam a number.
-        latest = _latest_for_mobile(db, mobile)
-        latest_at = _as_utc(latest.created_at) if latest is not None else None
+        # mobile in either purpose (consumed or not), so a customer cannot spam
+        # a number — including by alternating checkout and history.
+        latest_at = latest_send_at(db, mobile)
         if latest_at is not None:
             elapsed = (now - latest_at).total_seconds()
             if elapsed < OTP_RESEND_COOLDOWN_SECONDS:
@@ -162,27 +211,13 @@ def issue_challenge(
                 raise OtpThrottled(wait_seconds=wait or 1)
 
         hour_ago = now - timedelta(hours=1)
-        mobile_sends = (
-            db.query(CommerceOtpChallenge)
-            .filter(
-                CommerceOtpChallenge.mobile == mobile,
-                CommerceOtpChallenge.created_at >= hour_ago,
-            )
-            .count()
-        )
+        mobile_sends = count_recent_sends(db, mobile, since=hour_ago)
         if mobile_sends >= OTP_MAX_SENDS_PER_HOUR:
             raise OtpThrottled(wait_seconds=OTP_RESEND_COOLDOWN_SECONDS)
 
         ip_hash = hash_client_ip(client_ip)
         if ip_hash is not None:
-            ip_sends = (
-                db.query(CommerceOtpChallenge)
-                .filter(
-                    CommerceOtpChallenge.client_ip_hash == ip_hash,
-                    CommerceOtpChallenge.created_at >= hour_ago,
-                )
-                .count()
-            )
+            ip_sends = count_recent_sends_for_ip(db, ip_hash, since=hour_ago)
             if ip_sends >= OTP_MAX_SENDS_PER_HOUR_IP:
                 raise OtpThrottled(wait_seconds=OTP_RESEND_COOLDOWN_SECONDS)
 

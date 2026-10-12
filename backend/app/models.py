@@ -607,3 +607,49 @@ class CommercePaymentAttempt(Base):
 
     invoice = relationship("CommerceInvoice", lazy="joined")
 
+
+# ── Commerce: history-purpose OTP challenges + one-visit sessions ────
+# «سفارشهای من» proves ownership of a mobile with its OWN challenge table, so a
+# checkout OTP can never be verified (or consumed) here and a history OTP can
+# never authorize a cart request. The SMS budget, however, is deliberately
+# shared across both purposes — see ``commerce_otp.count_recent_sends``.
+class CommerceHistoryOtpChallenge(Base):
+    """One pending SMS one-time-code challenge for the order-history page.
+
+    Same shape as ``CommerceOtpChallenge`` (salted hash only, single-use,
+    attempt-limited) but purpose-specific state: the history page must not be
+    able to spend — or be spent by — a checkout challenge.
+    """
+
+    __tablename__ = "commerce_history_otp_challenges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    mobile = Column(String(11), nullable=False, index=True)
+    code_salt = Column(String(32), nullable=False)
+    code_hash = Column(String(64), nullable=False)       # SHA-256 hex of salt+code
+    expires_at = Column(DateTime, nullable=False, index=True)
+    consumed_at = Column(DateTime, nullable=True)        # set on success/invalidation
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    # SHA-256 hash of the issuing client IP — never the raw address.
+    client_ip_hash = Column(String(64), nullable=True, index=True)
+
+
+class CommerceHistorySession(Base):
+    """A short-lived, revocable read session for one verified mobile.
+
+    Only the SHA-256 hash of the bearer is persisted: the raw token is returned
+    to the client exactly once, lives in tab-scoped ``sessionStorage`` and is
+    never logged. The 30-minute absolute TTL (enforced by the service) bounds
+    replay of a copied token; revocation is a server-side write.
+    """
+
+    __tablename__ = "commerce_history_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    mobile = Column(String(11), nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+
