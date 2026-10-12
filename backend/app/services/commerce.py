@@ -27,6 +27,7 @@ from app.models import (
     COMMERCE_INVOICE_STATES,
     INVOICE_LINK_TTL_DAYS,
     MAX_INVOICE_TOTAL_TOMAN,
+    AuditLog,
     CommerceInvoice,
     CommerceInvoiceItem,
     CommercePaymentAttempt,
@@ -2048,5 +2049,217 @@ def _reconcile_bitpay_attempt(
         f"reconcile: provider did not confirm (status={getattr(verified, 'status', None)})"
     )
     db.commit()
+    db.refresh(attempt)
+    return attempt
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Audited, admin-only recovery of an already-paid *legacy* BitPay attempt
+# ══════════════════════════════════════════════════════════════════════
+#
+# A pre-fix BitPay attempt persisted the historical alnum merchant reference
+# ``INV<id>-R<rev>-<hex>`` as ``provider_id`` and sent it as ``factorId``. The
+# documented gateway coerces any non-Integer factor to ``0`` on the verify
+# reply, so such a row can NEVER be matched by the ordinary callback or a
+# routine staff ``verify`` reconcile — both correctly fail closed and hold the
+# lock (see ``handle_bitpay_callback`` / ``_reconcile_bitpay_attempt``).
+#
+# When the customer really did pay, an admin needs one explicit, audited way to
+# close that gap. This is it — and it is deliberately the *narrowest* possible
+# path. It re-verifies server-to-server and accepts ONLY the documented
+# ``factorId == 0`` coercion artifact, together with an exact amount match and
+# the attempt's OWN persisted ``id_get`` + ``trans_id`` (never a request value).
+#
+# It refuses, without exception:
+#   * any non-BitPay attempt;
+#   * any modern, numeric-factor attempt (``provider_id`` is a Latin decimal) —
+#     that must settle through the ordinary callback/reconcile, so a genuine
+#     numeric match can never be smuggled through a weaker zero-factor check;
+#   * any attempt whose state is not the strict ``unknown`` one (an already
+#     ``verified`` replay is returned as-is; anything else is a conflict);
+#   * a missing/unpersisted ``id_get`` or ``trans_id`` (nothing to bind to);
+#   * an invoice that is not the attempt's current revision+amount, or is not
+#     payable (paid / revoked / revised);
+#   * a verify that is not documented success ``1``/``11`` with the exact amount
+#     AND the ``factorId`` coercion artifact ``0``.
+#
+# Nothing here is ever automatic: it runs only behind the admin-only route and
+# requires an explicit attempt id + affirmation + reason.
+
+# Documented ``gateway-result-second`` success statuses: ``1`` = fresh success,
+# ``11`` = already verified. Both are genuine success.
+BITPAY_VERIFY_SUCCESS_CODES = (1, 11)
+# The exact ``factorId`` the gateway echoes after coercing a non-Integer factor
+# reference (the historical alnum ``INV<id>-R<rev>-<hex>``) to an integer. It is
+# the documented artifact that lets a legacy payment be recognised at all.
+BITPAY_LEGACY_FACTOR_ECHO = "0"
+# Audit action label; also the stable key the tests assert on.
+LEGACY_RECOVERY_ACTION = "recover_legacy_bitpay"
+
+
+def _bitpay_legacy_recovery_confirms(verified, attempt: CommercePaymentAttempt) -> bool:
+    """True only for the documented legacy success: amount exact + factorId ``0``.
+
+    Distinct from :func:`_bitpay_verification_confirms`, which *requires a
+    numeric match* and therefore can never confirm a legacy row. Here the echo
+    must be the coercion artifact ``0`` and the attempt must genuinely be a
+    legacy (non-numeric) reference — a numeric attempt is refused so this weaker
+    check can never be used to settle a modern payment.
+    """
+    if not getattr(verified, "is_success", False):
+        return False
+    if getattr(verified, "status", None) not in BITPAY_VERIFY_SUCCESS_CODES:
+        return False
+    if _int_or_none(getattr(verified, "amount_rial", None)) != attempt.amount_rial:
+        return False
+    # Only a legacy (non-numeric) reference may use this path.
+    if bitpay_factor_reference(attempt) is not None:
+        return False
+    echoed = getattr(verified, "factor_id", None)
+    if echoed is None:
+        return False
+    echoed_text = str(echoed).strip()
+    if not _LATIN_DECIMAL_RE.fullmatch(echoed_text):
+        return False
+    return echoed_text == BITPAY_LEGACY_FACTOR_ECHO
+
+
+def _legacy_bitpay_recovery_target(
+    db: Session, attempt: CommercePaymentAttempt | None
+) -> tuple[CommerceInvoice, int, int]:
+    """Validate eligibility and return ``(invoice, id_get, trans_id)``.
+
+    Every rejection raises (never silently proceeds) so the caller can only ever
+    settle the exact, payable invoice an eligible legacy attempt binds to.
+    """
+    if attempt is None:
+        raise CommerceNotFoundError("تراکنش یافت نشد")
+    if attempt.provider != PAYMENT_PROVIDER_BITPAY:
+        raise CommerceStateError("این تراکنش مربوط به درگاه بیت‌پی نیست")
+    if bitpay_factor_reference(attempt) is not None:
+        raise CommerceStateError(
+            "این مسیر فقط برای تراکنش‌های قدیمی (ارجاع غیرعددی) است"
+        )
+    if attempt.state != "unknown":
+        raise CommerceStateError("وضعیت این تراکنش برای بازیابی دستی مناسب نیست")
+
+    # Bind to the evidence we durably hold — never to anything the caller sends.
+    id_get = _int_or_none(attempt.tracking_code)
+    if id_get is None or id_get <= 0:
+        raise CommerceStateError("شناسه id_get این تراکنش ثبت نشده است")
+    trans_id = _int_or_none(attempt.provider_trans_id)
+    if trans_id is None or trans_id <= 0:
+        raise CommerceStateError("شناسه trans_id این تراکنش ثبت نشده است")
+
+    invoice = (
+        db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
+    )
+    if invoice is None:
+        raise CommerceNotFoundError("فاکتور یافت نشد")
+    if invoice.state != "approved" or invoice.order_id is not None:
+        raise CommerceStateError("فاکتور در وضعیت قابل تسویه نیست")
+    if attempt.invoice_revision != invoice.revision:
+        raise CommerceStateError("نسخه فاکتور با این تراکنش مطابقت ندارد")
+    expected = _expected_amount_rial(invoice)
+    if expected is None or attempt.amount_rial != expected:
+        raise CommerceStateError("مبلغ تراکنش با فاکتور مطابقت ندارد")
+    return invoice, id_get, trans_id
+
+
+def recover_legacy_bitpay_attempt(
+    db: Session,
+    attempt: CommercePaymentAttempt | None,
+    client,
+    *,
+    reason: str,
+    actor: str = "",
+    background_tasks=None,
+) -> CommercePaymentAttempt:
+    """Admin-only, audited settlement of a genuine *legacy* BitPay payment.
+
+    Re-verifies server-to-server (through the injected provider) using the
+    attempt's own persisted ``trans_id`` + ``id_get``, requires the documented
+    success ``1``/``11`` with the exact amount and the ``factorId == 0``
+    coercion artifact, then settles through the shared
+    :func:`settle_verified_payment` — which claims the ``approved → paid``
+    transition with a single conditional UPDATE, so exactly one order is created
+    even under concurrency or replay.
+
+    The audit entry is added to the *same* session as the settlement, so the
+    single commit inside ``settle_verified_payment`` persists both together —
+    never the best-effort, separately-committed ``audit.log`` helper.
+
+    A refused recovery is never an unsafe abandon: the attempt is left
+    ``unknown`` (lock held, visible in the staff queue) and the invoice stays
+    ``approved``. Nothing is read from or written to the card/PII fields, and no
+    provider secret is logged.
+    """
+    if attempt is None:
+        raise CommerceNotFoundError("تراکنش یافت نشد")
+
+    reason = (reason or "").strip()
+    if not reason:
+        # An explicit, recorded reason is what makes the settlement an
+        # authorized staff decision rather than an accidental one.
+        raise CommerceValidationError("ثبت دلیل برای بازیابی پرداخت الزامی است")
+
+    # Idempotent replay: an already-settled legacy recovery returns as-is and
+    # must never create a second order. (Anything else — e.g. a flagged
+    # reconciliation row — falls through to the strict eligibility check.)
+    if attempt.state == "verified" and not attempt.reconciliation_required:
+        return attempt
+
+    invoice, id_get, trans_id = _legacy_bitpay_recovery_target(db, attempt)
+
+    if client is None:
+        raise CommerceGatewayUnavailableError("درگاه پرداخت پیکربندی نشده است")
+
+    try:
+        verified = client.verify(trans_id=trans_id, id_get=id_get)
+    except Exception as exc:  # noqa: BLE001 - transient → keep the lock, surface it
+        attempt.last_error = _short(f"legacy recovery verify failed: {exc}")
+        db.commit()
+        db.refresh(attempt)
+        raise CommercePaymentError("ارتباط با درگاه پرداخت ناموفق بود") from exc
+
+    if not _bitpay_legacy_recovery_confirms(verified, attempt):
+        # Never settle and never release the lock: keep the attempt open for a
+        # further staff decision. Record the status only — never the card/PII.
+        attempt.last_error = _short(
+            "legacy recovery: provider did not confirm legacy success "
+            f"(status={getattr(verified, 'status', None)})"
+        )
+        db.commit()
+        db.refresh(attempt)
+        raise CommerceStateError("درگاه پرداخت این تراکنش را تأیید نکرد")
+
+    # Confirmed. Add the audit row to the SAME session as the settlement so the
+    # single commit inside ``settle_verified_payment`` persists both together.
+    db.add(
+        AuditLog(
+            user=actor or "system",
+            action=LEGACY_RECOVERY_ACTION,
+            entity="commerce_payment_attempt",
+            entity_id=attempt.id,
+            summary=(
+                f"بازیابی پرداخت قدیمی بیت‌پی تراکنش #{attempt.id} "
+                f"(فاکتور #{invoice.id}، مبلغ {attempt.amount_rial} ریال) — {reason}"
+            ),
+        )
+    )
+    try:
+        settle_verified_payment(
+            db, attempt, tracking_code=str(id_get), background_tasks=background_tasks
+        )
+    except CommerceReconciliationRequiredError as exc:
+        # Unreachable in normal operation (eligibility already proved the
+        # invoice matches). If a concurrent change ever causes it, the payment
+        # is preserved for staff and we never claim success; drop the pending
+        # audit row so it cannot assert a settlement that did not happen.
+        db.rollback()
+        raise CommerceStateError(
+            "پرداخت تأییدشده با فاکتور فعلی مطابقت ندارد؛ نیازمند بررسی دستی"
+        ) from exc
+
     db.refresh(attempt)
     return attempt

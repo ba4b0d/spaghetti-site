@@ -13,6 +13,11 @@ Staff:
     POST /api/v1/commerce/staff/invoices/{id}/revoke   invalidate the private link
     POST /api/v1/commerce/staff/invoices/{id}/notify   re-emit admin alert (retry)
     POST /api/v1/commerce/staff/requests/{id}/notify   re-emit request alert (retry)
+    GET  /api/v1/commerce/staff/payments               payment queue needing attention
+    POST /api/v1/commerce/staff/payments/{id}/reconcile            resolve a stuck attempt
+
+Admin-only (not employee):
+    POST /api/v1/commerce/staff/payments/{id}/recover-legacy-bitpay audited legacy BitPay settle
 
 Payment initiation/callback arrive in Task 3. Handlers stay thin; validation
 and persistence live in ``app.services.commerce``.
@@ -32,7 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.audit import log_user
 from app.database import get_db
-from app.routers.auth import limiter, require_staff_role
+from app.routers.auth import limiter, require_admin, require_staff_role
 from app.services import commerce as commerce_service
 from app.services import commerce_notifications
 from app.services import commerce_otp
@@ -894,4 +899,86 @@ def reconcile_staff_payment(
         user, db, "reconcile", "commerce_payment_attempt", resolved.id,
         f"تسویه دستی تراکنش #{resolved.id} → {resolved.state}",
     )
+    return commerce_service.serialize_staff_payment_attempt(resolved)
+
+
+# ── Legacy BitPay recovery — admin-only, explicit, audited ───────────
+#
+# The ordinary staff ``reconcile`` above deliberately refuses to settle a
+# pre-fix BitPay attempt (its alnum ``factorId`` was coerced to ``0``, so it can
+# never be matched). When such a payment was genuinely taken, this is the single
+# admin-only path that can close it — and only after a fresh server-to-server
+# verify proves the documented ``factorId == 0`` artifact with an exact amount.
+
+class LegacyBitpayRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # An affirmative opt-in: never a default-true, so no request can settle a
+    # legacy payment without the operator explicitly asking for it.
+    confirm_legacy_recovery: bool = False
+    reason: str = Field(..., min_length=1, max_length=200)
+
+    @field_validator("confirm_legacy_recovery")
+    @classmethod
+    def _affirmed(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("برای بازیابی پرداخت قدیمی، تأیید صریح الزامی است")
+        return value
+
+
+@router.post("/staff/payments/{attempt_id}/recover-legacy-bitpay")
+def recover_legacy_bitpay_payment(
+    attempt_id: int,
+    body: LegacyBitpayRecoveryRequest,
+    background_tasks: BackgroundTasks,
+    user=Depends(require_admin),
+    db: Session = Depends(get_db),
+    bitpay_client=Depends(bitpay.client_dependency),
+):
+    """Admin — explicitly recover an already-paid *legacy* (alnum-factor) BitPay attempt.
+
+    Admin-only (never an employee). Requires an affirmative opt-in plus a
+    recorded reason, re-verifies server-to-server through the BitPay adapter, and
+    settles only the documented legacy success (``factorId`` coercion artifact
+    ``0`` + exact amount) for the attempt's own persisted ``id_get``/``trans_id``
+    on its current payable invoice. The settlement and its audit entry commit
+    together; a refused recovery keeps the lock (never an unsafe abandon).
+    """
+    from app.models import CommercePaymentAttempt
+
+    attempt = (
+        db.query(CommercePaymentAttempt)
+        .filter(CommercePaymentAttempt.id == attempt_id)
+        .first()
+    )
+    if attempt is None:
+        raise HTTPException(status_code=404, detail="تراکنش یافت نشد")
+
+    provider_client = bitpay_client
+    if provider_client is None:
+        try:
+            provider_client = bitpay.get_client()
+        except bitpay.BitPayConfigError:
+            provider_client = None
+
+    try:
+        resolved = commerce_service.recover_legacy_bitpay_attempt(
+            db,
+            attempt,
+            provider_client,
+            reason=body.reason,
+            actor=(user.get("username") or "") if isinstance(user, dict) else "",
+            background_tasks=background_tasks,
+        )
+    except commerce_service.CommerceValidationError as exc:
+        raise _validation_error(exc)
+    except commerce_service.CommerceStateError as exc:
+        raise _validation_error(exc)
+    except commerce_service.CommerceGatewayUnavailableError as exc:
+        raise _validation_error(exc)
+    except commerce_service.CommercePaymentError as exc:
+        raise _validation_error(exc)
+    except commerce_service.CommerceNotFoundError as exc:
+        raise _validation_error(exc)
+
     return commerce_service.serialize_staff_payment_attempt(resolved)
