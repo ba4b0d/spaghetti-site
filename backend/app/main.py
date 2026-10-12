@@ -60,6 +60,7 @@ from app.routers.custom_orders import router as custom_orders_router
 from app.routers.customers import router as customers_router
 from app.routers.audit_logs import router as audit_router
 from app.routers.commerce import router as commerce_router
+from app.routers.commerce_history import router as commerce_history_router
 from app.routers.digipay_callback import router as digipay_callback_router
 from app.routers.snappay_callback import router as snappay_callback_router
 from app.routers.bitpay_callback import router as bitpay_callback_router
@@ -373,6 +374,24 @@ async def add_cms_branding_headers(request: Request, call_next):
     response.headers["X-CMS"] = "Spaghetti-CMS/1.0"
     return response
 
+
+# ── Order-history API no-store boundary ──────────────────────────────
+# The public history bearer is private data, and its responses include ones no
+# handler can stamp: FastAPI's request-validation ``422`` and slowapi's ``429``
+# are produced before/around a route handler. This prefix middleware backstops
+# every history response, success or error, with no-store/no-referrer. It is
+# added last, so it wraps the slowapi middleware and observes its 429 too.
+HISTORY_API_PREFIX = "/api/v1/commerce/history"
+
+
+@app.middleware("http")
+async def history_api_no_store(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith(HISTORY_API_PREFIX):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
 # ── Include routers ──────────────────────────────────────────────────
 app.include_router(settings_router, dependencies=[Depends(require_staff_role)])
 # Public branding endpoint (favicon/logo) — no auth required, different path to avoid auth collision
@@ -395,6 +414,7 @@ app.include_router(customers_router)
 app.include_router(audit_router)
 app.include_router(catalog_router)  # No auth — public catalog
 app.include_router(commerce_router)  # Public request intake + staff request listing (auth per route)
+app.include_router(commerce_history_router)  # Public «سفارش‌های من» history (explicit bearer per route)
 app.include_router(digipay_callback_router)  # DigiPay UPG callback (untrusted form POST, verify server-side)
 app.include_router(snappay_callback_router)  # SnappPay onboarding reachability stub (no payment processing)
 app.include_router(bitpay_callback_router)  # BitPay GET callback (untrusted query, verify server-side)
