@@ -112,6 +112,9 @@ def prepare_website_request(
     if not items:
         raise CommerceValidationError("سبد خرید خالی است")
 
+    if not address or len(address.strip()) < 5:
+        raise CommerceValidationError("نشانی تحویل الزامی است")
+
     # Normalise + collapse to distinct product IDs.
     normalized: list[tuple[int, int]] = []
     seen_ids: set[int] = set()

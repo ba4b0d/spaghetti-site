@@ -35,6 +35,9 @@ async function openOtpStep() {
   fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
   fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
   fireEvent.change(screen.getByLabelText('پیامرسان'), { target: { value: 'telegram' } });
+  fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
+    target: { value: 'تهران، خیابان آزادی، پلاک ۱۰' },
+  });
   fireEvent.click(screen.getByRole('button', { name: 'ثبت درخواست' }));
   return screen.findByTestId('checkout-otp-step');
 }
@@ -94,7 +97,7 @@ describe('CheckoutRequest cart OTP gate', () => {
     expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
     // Exactly the accepted fields — no client-supplied price anywhere.
     expect(Object.keys(payload).sort()).toEqual(
-      ['customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
+      ['address', 'customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
     );
     expect(JSON.stringify(payload)).not.toContain('60000');
 
@@ -148,6 +151,9 @@ describe('CheckoutRequest cart OTP gate', () => {
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
+    fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
+      target: { value: 'تهران، خیابان آزادی، پلاک ۱۰' },
+    });
     fireEvent.click(screen.getByRole('button', { name: 'ثبت درخواست' }));
 
     const alert = await screen.findByRole('alert');
@@ -155,5 +161,20 @@ describe('CheckoutRequest cart OTP gate', () => {
     // No OTP step opened: the customer stays on the form.
     expect(screen.queryByTestId('checkout-otp-step')).toBeNull();
     expect(commerceApiMock.submitCommerceRequest).not.toHaveBeenCalled();
+  });
+
+  it('blocks submit with an error when address is blank or too short', async () => {
+    cart.addItem(12, 2);
+    renderCheckout();
+    await screen.findByText(/جاکلیدی تستی/);
+
+    fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
+    fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
+    fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), { target: { value: 'تهر' } });
+    fireEvent.click(screen.getByRole('button', { name: 'ثبت درخواست' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('نشانی تحویل را به صورت کامل وارد کنید');
+    expect(commerceApiMock.requestOtp).not.toHaveBeenCalled();
   });
 });

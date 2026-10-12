@@ -43,6 +43,7 @@ def _valid_payload(product_id, qty=2, **overrides):
         "customer_name": "رضا",
         "mobile": "09123456789",
         "messenger": "telegram",
+        "address": "تهران، میدان آزادی، خیابان آزادی، پلاک ۱۰",
         "items": [{"product_id": product_id, "qty": qty}],
         # The public gate now requires a verified one-time code. Mint a live
         # challenge for the default mobile so these intake tests still exercise
@@ -212,6 +213,20 @@ def test_empty_customer_name_rejected(client, auth_headers):
     product = _create_product(client, auth_headers)
     r = client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], customer_name=""))
     assert r.status_code == 422
+
+
+def test_mandatory_address_rejected_when_empty_or_short(client, auth_headers):
+    product = _create_product(client, auth_headers)
+    # Missing address
+    payload_missing = _valid_payload(product["id"])
+    del payload_missing["address"]
+    assert client.post("/api/v1/commerce/requests", json=payload_missing).status_code == 422
+
+    # Blank / whitespace address
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], address="   ")).status_code == 422
+
+    # Too short address (< 5 chars)
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], address="تهر")).status_code == 422
 
 
 def test_huge_note_rejected(client, auth_headers):
@@ -449,6 +464,7 @@ def _otp_payload(product_id, qty=1, **overrides):
         "customer_name": "رضا",
         "mobile": "09123456789",
         "messenger": "telegram",
+        "address": "تهران، میدان آزادی، خیابان آزادی، پلاک ۱۰",
         "items": [{"product_id": product_id, "qty": qty}],
     }
     payload.update(overrides)

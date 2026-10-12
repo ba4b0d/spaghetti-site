@@ -43,6 +43,7 @@ from app.services import commerce_notifications
 from app.services import commerce_otp
 from app.services import bitpay
 from app.services import digipay
+from app.services import invoice_pdf
 from app.services.commerce import (
     MAX_DISTINCT_PRODUCTS,
     MAX_INVOICE_ITEMS,
@@ -114,7 +115,7 @@ class CommerceRequestCreate(BaseModel):
     mobile: str
     messenger: str
     messenger_handle: str = Field(default="", max_length=100)
-    address: str = Field(default="", max_length=500)
+    address: str = Field(..., min_length=5, max_length=500)
     note: str = Field(default="", max_length=2000)
     # Ownership proof for ``mobile`` (see app.services.commerce_otp): the request
     # is accepted only after the SMS one-time code is verified. Both fields are
@@ -129,6 +130,14 @@ class CommerceRequestCreate(BaseModel):
         if not value.strip():
             raise ValueError("نام مشتری الزامی است")
         return value
+
+    @field_validator("address")
+    @classmethod
+    def _address_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if len(cleaned) < 5:
+            raise ValueError("نشانی تحویل الزامی است (حداقل ۵ کاراکتر)")
+        return cleaned
 
     @field_validator("mobile")
     @classmethod
@@ -512,6 +521,29 @@ def revoke_invoice(
     return payload
 
 
+@router.get("/staff/invoices/{invoice_id}/pdf")
+def download_staff_invoice_pdf(
+    invoice_id: int,
+    user=Depends(require_staff_role),
+    db: Session = Depends(get_db),
+):
+    """Staff — download high-fidelity Persian PDF invoice for an invoice ID."""
+    try:
+        invoice = commerce_service.get_staff_invoice(db, invoice_id)
+    except commerce_service.CommerceNotFoundError as exc:
+        raise _validation_error(exc)
+
+    pdf_bytes = invoice_pdf.generate_invoice_pdf(invoice)
+    filename = f"spaghetti-invoice-{invoice.id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+        },
+    )
+
+
 @router.post("/staff/requests/{request_id}/notify")
 @limiter.limit("10/minute")
 def resend_request_notification(
@@ -612,6 +644,41 @@ def read_public_invoice(
         http_exc.headers = {**(http_exc.headers or {}), **NO_STORE_HEADERS}
         raise http_exc
     return commerce_service.serialize_public_invoice(invoice)
+
+
+@router.get("/invoices/{token}/pdf")
+@limiter.limit("30/minute")
+def download_public_invoice_pdf(
+    request: Request,
+    response: Response,
+    token: str = Path(..., min_length=1, max_length=200),
+    db: Session = Depends(get_db),
+):
+    """Public — download high-fidelity Persian PDF invoice behind its private token.
+
+    Carries NO_STORE_HEADERS to prevent intermediary or browser leaks.
+    """
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        invoice = commerce_service.resolve_public_invoice(db, token)
+    except (
+        commerce_service.CommerceNotFoundError,
+        commerce_service.CommerceGoneError,
+    ) as exc:
+        http_exc = _validation_error(exc)
+        http_exc.headers = {**(http_exc.headers or {}), **NO_STORE_HEADERS}
+        raise http_exc
+
+    pdf_bytes = invoice_pdf.generate_invoice_pdf(invoice, raw_token=token)
+    filename = f"spaghetti-invoice-{invoice.id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            **NO_STORE_HEADERS,
+            "Content-Disposition": f'inline; filename="{filename}"',
+        },
+    )
 
 
 # ── Task 3: public payment-method readiness ──────────────────────────

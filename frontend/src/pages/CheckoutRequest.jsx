@@ -139,12 +139,11 @@ export default function CheckoutRequest() {
     const customerName = form.customer_name.trim();
     const mobile = normalizeDigits(form.mobile).replace(/\s+/g, '');
     const items = cartItems.map((item) => ({ product_id: item.id, qty: item.qty }));
-    const payload = { customer_name: customerName, mobile, messenger: form.messenger, items };
-    const handle = form.messenger_handle.trim();
     const address = form.address.trim();
+    const payload = { customer_name: customerName, mobile, messenger: form.messenger, address, items };
+    const handle = form.messenger_handle.trim();
     const note = form.note.trim();
     if (handle) payload.messenger_handle = handle;
-    if (address) payload.address = address;
     if (note) payload.note = note;
     return payload;
   }, [form, cartItems]);
@@ -251,6 +250,10 @@ export default function CheckoutRequest() {
     }
     if (!MOBILE_RE.test(payload.mobile)) {
       setError('شماره موبایل باید با ۰۹ شروع شود و ۱۱ رقم باشد.');
+      return;
+    }
+    if (!payload.address || payload.address.length < 5) {
+      setError('نشانی تحویل را به صورت کامل وارد کنید (حداقل ۵ کاراکتر).');
       return;
     }
     if (payload.items.length === 0) {
@@ -556,15 +559,17 @@ export default function CheckoutRequest() {
               className="block text-xs font-semibold mb-1.5"
               style={{ color: 'var(--text-secondary)' }}
             >
-              آدرس (اختیاری)
+              نشانی دقیق تحویل (الزامی) <span style={{ color: '#ef4444' }}>*</span>
             </label>
             <input
               id="checkout-address"
               name="address"
               type="text"
+              required
               className="input-field w-full text-sm"
               value={form.address}
               onChange={setField('address')}
+              placeholder="مثال: تهران، خیابان آزادی، پلاک ۱۰، واحد ۲"
               maxLength={500}
             />
           </div>

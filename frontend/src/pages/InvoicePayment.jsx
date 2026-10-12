@@ -15,7 +15,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { formatPrice } from '../lib/constants';
-import { getPaymentMethods, getPublicInvoice, payInvoice } from '../lib/commerceApi';
+import { getPaymentMethods, getPublicInvoice, payInvoice, getPublicInvoicePdfUrl } from '../lib/commerceApi';
 import { useNoReferrerPolicy } from '../hooks/useNoReferrerPolicy';
 import { GATEWAY_HANDOFF_PATH, isHandoffStorageAvailable, writeGatewayHandoff } from '../lib/paymentHandoff';
 import { writePaymentReceipt } from '../lib/paymentReceipt';
@@ -759,6 +759,22 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
               پرداخت آنلاین این صورت‌حساب در حال حاضر فعال نیست. لطفاً با پشتیبانی تماس بگیرید تا پرداخت را برای شما هماهنگ کنند.
             </div>
           )}
+
+          <a
+            href={getPublicInvoicePdfUrl(token)}
+            target="_blank"
+            rel="noopener noreferrer"
+            download={`spaghetti-invoice-${invoice?.id || 'order'}.pdf`}
+            className="w-full inline-flex items-center justify-center gap-2 py-3 px-4 rounded-xl font-bold text-xs border transition-all hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer text-center"
+            style={{
+              borderColor: 'var(--border-color)',
+              color: 'var(--text-primary)',
+              backgroundColor: 'var(--bg-secondary, #eef1f9)',
+            }}
+          >
+            <FileText size={16} className="text-[var(--brand-orange)]" />
+            دریافت نسخه PDF فاکتور
+          </a>
 
           {invoice?.expires_at ? (
             <p className="text-[11px] text-center flex items-center justify-center gap-1.5" style={{ color: 'var(--text-muted)' }}>

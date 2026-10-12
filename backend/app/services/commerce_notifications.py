@@ -48,7 +48,12 @@ from email.message import EmailMessage
 
 import requests
 
-from app.telegram_bot import get_telegram_config, send_telegram_notification
+from app.telegram_bot import (
+    get_telegram_config,
+    send_telegram_notification,
+    send_telegram_document,
+)
+from app.services import invoice_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -321,11 +326,20 @@ def build_payload(event: str, subject) -> dict:
         {"name": SMS_PARAM_CODE, "value": code},
     ]
 
+    pdf_bytes = None
+    if invoice and event in (EVENT_INVOICE_APPROVED, EVENT_PAYMENT_VERIFIED):
+        try:
+            pdf_bytes = invoice_pdf.generate_invoice_pdf(subject)
+        except Exception as pdf_err:
+            logger.warning("Failed to render invoice PDF for notification: %s", pdf_err)
+
     return {
         "telegram": "\n".join(tg_lines),
         "email_subject": f"[Spaghetti Print] {label} {code}",
         "email_body": "\n".join(email_lines),
         "sms": sms_parameters,
+        "pdf_bytes": pdf_bytes,
+        "invoice_code": code,
     }
 
 
@@ -535,10 +549,30 @@ def deliver_payload(event: str, payload: dict) -> dict:
     raise into the ASGI layer after the response was produced.
     """
     try:
+        def _deliver_telegram():
+            res = send_telegram_message(payload["telegram"])
+            pdf_bytes = payload.get("pdf_bytes")
+            if pdf_bytes and res == SENT:
+                temp_path = None
+                try:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp.write(pdf_bytes)
+                        temp_path = tmp.name
+                    caption = f"📄 فاکتور {payload.get('invoice_code', '')} — اسپاگتی پرینت"
+                    send_telegram_document(temp_path, caption=caption)
+                except Exception as doc_err:
+                    logger.warning("commerce telegram PDF dispatch failed: %s", doc_err)
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+            return res
+
         return {
-            "telegram": _run_channel(
-                "telegram", event, lambda: send_telegram_message(payload["telegram"])
-            ),
+            "telegram": _run_channel("telegram", event, _deliver_telegram),
             "sms": _run_channel("sms", event, lambda: send_sms_alert(payload["sms"])),
             "email": _run_channel(
                 "email", event,

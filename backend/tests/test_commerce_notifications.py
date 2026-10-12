@@ -534,6 +534,7 @@ def _request_payload(product_id, qty=1):
         "customer_name": "رضا",
         "mobile": "09123456789",
         "messenger": "telegram",
+        "address": "تهران، خیابان آزادی، کوچه صادقی، پلاک ۱۵",
         "items": [{"product_id": product_id, "qty": qty}],
         # Public intake now requires a verified OTP; mint a live challenge so
         # the notification wiring keeps being exercised (no SMS is sent).
@@ -1066,3 +1067,26 @@ def test_staff_notify_is_rate_limited(client, auth_headers, monkeypatch):
         for _ in range(13)
     ]
     assert 429 in statuses
+
+
+def test_invoice_approval_dispatches_telegram_pdf_document(client, auth_headers, monkeypatch):
+    """When an invoice is approved, the generated PDF document is sent to Telegram admins."""
+    docs_sent = []
+
+    def _fake_doc(file_path, caption=""):
+        with open(file_path, "rb") as f:
+            data = f.read()
+        docs_sent.append({"data": data, "caption": caption})
+        return True
+
+    monkeypatch.setattr(cn, "send_telegram_document", _fake_doc)
+    monkeypatch.setattr(cn, "send_telegram_message", lambda text: cn.SENT)
+
+    invoice_id = _draft_invoice(client, auth_headers)
+    appr = client.post(f"{BASE}/staff/invoices/{invoice_id}/approve", headers=auth_headers)
+    assert appr.status_code == 200, appr.text
+
+    assert len(docs_sent) == 1
+    doc = docs_sent[0]
+    assert doc["data"].startswith(b"%PDF-")
+    assert f"#{invoice_id}" in doc["caption"] or "اسپاگتی پرینت" in doc["caption"]

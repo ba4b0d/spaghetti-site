@@ -13,6 +13,7 @@ const commerceApiMock = vi.hoisted(() => ({
   getPaymentMethods: vi.fn(),
   getPublicInvoice: vi.fn(),
   payInvoice: vi.fn(),
+  getPublicInvoicePdfUrl: vi.fn((token) => `/api/v1/commerce/invoices/${token}/pdf`),
 }));
 vi.mock('../../lib/commerceApi', () => commerceApiMock);
 
@@ -154,6 +155,9 @@ describe('InvoicePayment approved invoice', () => {
     expect(bitpay).toBeEnabled();
     expect(screen.getByRole('radio', { name: /دیجی‌پی/ })).toBeDisabled();
     expect(screen.getByRole('radio', { name: /اسنپ‌پی/ })).toBeDisabled();
+
+    const pdfLink = screen.getByRole('link', { name: /دریافت نسخه PDF فاکتور/ });
+    expect(pdfLink).toHaveAttribute('href', `/api/v1/commerce/invoices/${TOKEN}/pdf`);
   });
 
   it('reads server readiness once before any CTA is usable', async () => {

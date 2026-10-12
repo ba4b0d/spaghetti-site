@@ -147,6 +147,9 @@ describe('CheckoutRequest', () => {
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
     fireEvent.change(screen.getByLabelText('پیامرسان'), { target: { value: 'telegram' } });
+    fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
+      target: { value: 'تهران، خیابان آزادی، پلاک ۱۰' },
+    });
 
     // Item 3: the request is only minted after the SMS code is confirmed.
     await submitCartThroughOtp();
@@ -156,10 +159,11 @@ describe('CheckoutRequest', () => {
     expect(payload.customer_name).toBe('رضا');
     expect(payload.mobile).toBe('09123456789');
     expect(payload.messenger).toBe('telegram');
+    expect(payload.address).toBe('تهران، خیابان آزادی، پلاک ۱۰');
     expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
     // The cart is not an authoritative price source.
     expect(Object.keys(payload).sort()).toEqual(
-      ['customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
+      ['address', 'customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
     );
 
     expect(await screen.findByText(/REQ-ABC123/)).toBeDefined();
@@ -178,6 +182,9 @@ describe('CheckoutRequest', () => {
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
+    fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
+      target: { value: 'تهران، خیابان آزادی، پلاک ۱۰' },
+    });
     // Item 3: reach the server only through a confirmed OTP step.
     await submitCartThroughOtp();
 
@@ -225,13 +232,16 @@ describe('CheckoutRequest estimated total', () => {
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
+    fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
+      target: { value: 'تهران، خیابان آزادی، پلاک ۱۰' },
+    });
     // Item 3: reach the server only through a confirmed OTP step.
     await submitCartThroughOtp();
 
     await waitFor(() => expect(commerceApiMock.submitCommerceRequest).toHaveBeenCalledTimes(1));
     const payload = commerceApiMock.submitCommerceRequest.mock.calls[0][0];
     expect(Object.keys(payload).sort()).toEqual(
-      ['customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
+      ['address', 'customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
     );
     expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
     expect(JSON.stringify(payload)).not.toContain('60000');

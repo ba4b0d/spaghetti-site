@@ -74,6 +74,14 @@ export const revokeStaffInvoice = (id) =>
 export const getPublicInvoice = (token, config) =>
   commerceApi.get(`/invoices/${encodeURIComponent(token)}`, config);
 
+/** Public — URL to stream/download the PDF invoice for a private bearer token. */
+export const getPublicInvoicePdfUrl = (token) =>
+  `/api/v1/commerce/invoices/${encodeURIComponent(token)}/pdf`;
+
+/** Staff — URL to stream/download the PDF invoice for an invoice ID. */
+export const getStaffInvoicePdfUrl = (invoiceId) =>
+  `/api/v1/commerce/staff/invoices/${encodeURIComponent(invoiceId)}/pdf`;
+
 /**
  * Public — non-secret payment-method readiness for the pay page.
  *

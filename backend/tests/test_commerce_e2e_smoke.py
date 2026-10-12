@@ -155,6 +155,7 @@ def _website_request(client, auth_headers, product_id):
             "customer_name": "رضا",
             "mobile": "09123456789",
             "messenger": "telegram",
+            "address": "تهران، شهرک غرب، خیابان ایران زمین، پلاک ۱۲",
             "items": [{"product_id": product_id, "qty": 2}],
             # Public intake now requires a verified OTP (no SMS is sent).
             **issue_test_otp(),

@@ -21,6 +21,7 @@ import {
   updateStaffInvoice,
   approveStaffInvoice,
   revokeStaffInvoice,
+  getStaffInvoicePdfUrl,
 } from '../lib/commerceApi';
 import { formatPrice } from '../lib/utils';
 import Modal from '../components/Modal';
@@ -767,6 +768,16 @@ export default function CommerceAdmin() {
                     </div>
 
                     <div className="flex items-center gap-1 flex-wrap justify-end">
+                      <a
+                        href={getStaffInvoicePdfUrl(invoice.id)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        download={`spaghetti-invoice-${invoice.id}.pdf`}
+                        className="btn-secondary text-xs inline-flex items-center gap-1"
+                        title="دانلود PDF فاکتور"
+                      >
+                        <FileText size={13} className="text-[var(--brand-orange)]" /> PDF
+                      </a>
                       {editable && (
                         <button
                           type="button"
