@@ -18,6 +18,7 @@ import { formatPrice } from '../lib/constants';
 import { getPaymentMethods, getPublicInvoice, payInvoice } from '../lib/commerceApi';
 import { useNoReferrerPolicy } from '../hooks/useNoReferrerPolicy';
 import { GATEWAY_HANDOFF_PATH, isHandoffStorageAvailable, writeGatewayHandoff } from '../lib/paymentHandoff';
+import { writePaymentReceipt } from '../lib/paymentReceipt';
 import {
   ALLOWED_GATEWAY_HOSTS,
   GATEWAY_ALLOWLIST,
@@ -300,6 +301,15 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
         setPayError(PAYMENT_STORAGE_UNAVAILABLE_MESSAGE);
         return;
       }
+      // Park the private invoice token for the token-free result page, so that
+      // after the gateway round-trip it can re-read the SERVER-VERIFIED invoice
+      // state and show the customer a TRUTHFUL confirmation (invoice number +
+      // amount) instead of a generic "we received your request". Best-effort:
+      // the hand-off must not be gated by it — without the receipt the result
+      // page just shows its generic, fail-closed copy. It is parked under its
+      // OWN key, so the (token-free) hand-off entry above still never carries
+      // the bearer token, and it never enters a URL, query or log.
+      writePaymentReceipt(token);
       redirect(GATEWAY_HANDOFF_PATH);
       if (mountedRef.current) setPayState('idle');
     } catch (err) {

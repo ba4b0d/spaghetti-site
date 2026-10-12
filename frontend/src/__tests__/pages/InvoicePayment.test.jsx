@@ -25,6 +25,7 @@ import InvoicePayment, {
 import { formatPrice } from '../../lib/constants';
 import { NO_REFERRER_META_ID } from '../../hooks/useNoReferrerPolicy';
 import { GATEWAY_HANDOFF_KEY, GATEWAY_HANDOFF_PATH } from '../../lib/paymentHandoff';
+import { PAYMENT_RECEIPT_KEY, readPaymentReceipt } from '../../lib/paymentReceipt';
 
 const TOKEN = 'raw-BEARER-token-123';
 
@@ -194,6 +195,48 @@ describe('InvoicePayment approved invoice', () => {
     expect(stored).toBeTruthy();
     expect(stored).toContain(BITPAY_OK_URL);
     expect(stored).not.toContain(TOKEN);
+  });
+
+  it('parks the invoice token for the token-free result page, outside the gateway hand-off entry', async () => {
+    commerceApiMock.payInvoice.mockResolvedValue({
+      data: { provider: 'bitpay', state: 'pending', amount_rial: 700000, redirect_url: BITPAY_OK_URL },
+    });
+
+    const { redirect } = renderAt();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(screen.getByRole('radio', { name: /بیت‌پی/ })).toBeChecked());
+    await user.click(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ }));
+
+    await waitFor(() => expect(redirect).toHaveBeenCalledWith(GATEWAY_HANDOFF_PATH));
+
+    // The result page needs the private invoice read to show a TRUTHFUL
+    // confirmation, so the token is parked for it here — under a dedicated
+    // receipt key, never inside the (token-free) gateway hand-off entry and
+    // never in a URL or query string.
+    expect(readPaymentReceipt()).toEqual({ token: TOKEN });
+    const handoff = window.sessionStorage.getItem(GATEWAY_HANDOFF_KEY);
+    expect(handoff).toBeTruthy();
+    expect(handoff).not.toContain(TOKEN);
+  });
+
+  it('parks no receipt when the hand-off is refused (invalid gateway URL)', async () => {
+    commerceApiMock.payInvoice.mockResolvedValue({
+      data: { state: 'pending', amount_rial: 700000, redirect_url: 'https://evil.example.com/pay' },
+    });
+
+    const { redirect } = renderAt();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(screen.getByRole('radio', { name: /بیت‌پی/ })).toBeChecked());
+    await user.click(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ }));
+
+    await screen.findByRole('alert');
+    expect(redirect).not.toHaveBeenCalled();
+    // No hand-off means no server-side attempt reached a gateway we trust, so
+    // nothing is parked for the result page either.
+    expect(readPaymentReceipt()).toBeNull();
+    expect(window.sessionStorage.getItem(PAYMENT_RECEIPT_KEY)).toBeNull();
   });
 
   it('writes no hand-off and redirects nowhere when the gateway URL is not allow-listed', async () => {
