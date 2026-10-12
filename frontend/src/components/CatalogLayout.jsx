@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { Link, NavLink, useNavigate, useLocation } from 'react-router-dom';
-import { Menu, X, ChevronDown, Search, ShoppingBag } from 'lucide-react';
+import { Menu, X, ChevronDown, Search, ShoppingBag, Package } from 'lucide-react';
 import { Z_INDEX_STICKY } from '../lib/constants';
 import BrandLogo from './BrandLogo';
 import CartDrawer from './CartDrawer';
@@ -330,12 +330,29 @@ export default function CatalogLayout({ children }) {
             <NavLink to="/contact" className={navLinkClass}>
               تماس با ما
             </NavLink>
-            <NavLink to="/my-orders" className={navLinkClass}>
-              سفارش‌های من
-            </NavLink>
           </nav>
 
           <div className="catalog-topbar-actions">
+            <NavLink
+              to="/my-orders"
+              className={({ isActive }) =>
+                `relative inline-flex items-center justify-center w-11 h-11 rounded-[0.85rem] shrink-0 transition-colors ${
+                  isActive ? 'ring-1 ring-white/60' : ''
+                }`
+              }
+              style={({ isActive }) => ({
+                border: '1px solid color-mix(in srgb, #fff 30%, transparent)',
+                background: isActive
+                  ? 'color-mix(in srgb, #fff 24%, transparent)'
+                  : 'color-mix(in srgb, #fff 14%, transparent)',
+                color: '#ffffff',
+                cursor: 'pointer',
+              })}
+              aria-label="سفارش‌های من"
+              title="سفارش‌های من"
+            >
+              <Package size={20} strokeWidth={2.25} />
+            </NavLink>
             <button
               type="button"
               className="relative inline-flex items-center justify-center w-11 h-11 rounded-[0.85rem] shrink-0 transition-colors"
