@@ -19,6 +19,7 @@ vi.mock('../../lib/commerceApi', () => commerceApiMock);
 import InvoicePayment, {
   ALLOWED_GATEWAY_HOSTS,
   GATEWAY_ALLOWLIST,
+  PAYMENT_STORAGE_UNAVAILABLE_MESSAGE,
   validateGatewayUrl,
 } from '../../pages/InvoicePayment';
 import { formatPrice } from '../../lib/constants';
@@ -211,12 +212,11 @@ describe('InvoicePayment approved invoice', () => {
     expect(window.sessionStorage.getItem(GATEWAY_HANDOFF_KEY)).toBeNull();
   });
 
-  it('falls back to a direct (validated) navigation when sessionStorage is unavailable', async () => {
+  it('fails safe (never a direct no-Referer navigation) when sessionStorage is unavailable', async () => {
     commerceApiMock.payInvoice.mockResolvedValue({
       data: { provider: 'bitpay', state: 'pending', amount_rial: 700000, redirect_url: BITPAY_OK_URL },
     });
-    // Force the storage write to fail (private mode / disabled storage): the
-    // module must degrade, not strand the customer.
+    // Force per-tab storage to be unusable (private mode / disabled storage).
     const original = Object.getOwnPropertyDescriptor(window, 'sessionStorage');
     Object.defineProperty(window, 'sessionStorage', {
       configurable: true,
@@ -229,18 +229,72 @@ describe('InvoicePayment approved invoice', () => {
       }),
     });
 
-    const { redirect } = renderAt();
-    const user = userEvent.setup();
+    try {
+      const { redirect } = renderAt();
+      const user = userEvent.setup();
 
-    await waitFor(() => expect(screen.getByRole('radio', { name: /بیت‌پی/ })).toBeChecked());
-    await user.click(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ }));
+      await waitFor(() => expect(screen.getByRole('radio', { name: /بیت‌پی/ })).toBeChecked());
+      await user.click(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ }));
 
-    // Degraded but never stranded: with no storage the customer still reaches
-    // the (still validated) portal URL directly.
-    await waitFor(() => expect(redirect).toHaveBeenCalledWith(BITPAY_OK_URL));
-    expect(redirect).not.toHaveBeenCalledWith(GATEWAY_HANDOFF_PATH);
+      // Navigating the portal straight from this no-referrer document is
+      // KNOWN-BROKEN (BitPay answers «آدرس ارجاعی نامعتبر»), so the customer
+      // must NOT be sent there — and nowhere else either, since nothing was
+      // parked for the token-free hand-off page.
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent(PAYMENT_STORAGE_UNAVAILABLE_MESSAGE);
+      expect(redirect).not.toHaveBeenCalledWith(BITPAY_OK_URL);
+      expect(redirect).not.toHaveBeenCalledWith(GATEWAY_HANDOFF_PATH);
+      expect(redirect).not.toHaveBeenCalled();
 
-    if (original) Object.defineProperty(window, 'sessionStorage', original);
+      // No server-side payment attempt was created for a hand-off that cannot
+      // complete (so a retry is clean, not a 409 "attempt in flight").
+      expect(commerceApiMock.payInvoice).not.toHaveBeenCalled();
+
+      // The CTA is still offered so the customer can retry.
+      expect(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ })).toBeInTheDocument();
+    } finally {
+      if (original) Object.defineProperty(window, 'sessionStorage', original);
+    }
+  });
+
+  it('lets the customer retry the hand-off once sessionStorage is available again', async () => {
+    commerceApiMock.payInvoice.mockResolvedValue({
+      data: { provider: 'bitpay', state: 'pending', amount_rial: 700000, redirect_url: BITPAY_OK_URL },
+    });
+    const original = Object.getOwnPropertyDescriptor(window, 'sessionStorage');
+    Object.defineProperty(window, 'sessionStorage', {
+      configurable: true,
+      get: () => ({
+        setItem() {
+          throw new Error('storage disabled');
+        },
+        getItem: () => null,
+        removeItem() {},
+      }),
+    });
+
+    try {
+      const { redirect } = renderAt();
+      const user = userEvent.setup();
+
+      await waitFor(() => expect(screen.getByRole('radio', { name: /بیت‌پی/ })).toBeChecked());
+      await user.click(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ }));
+      await screen.findByRole('alert');
+      expect(redirect).not.toHaveBeenCalled();
+
+      // Storage is available again (private mode closed / permission granted).
+      if (original) Object.defineProperty(window, 'sessionStorage', original);
+
+      await user.click(screen.getByRole('button', { name: /پرداخت با بیت‌پی/ }));
+
+      await waitFor(() => expect(redirect).toHaveBeenCalledWith(GATEWAY_HANDOFF_PATH));
+      expect(redirect).not.toHaveBeenCalledWith(BITPAY_OK_URL);
+      const stored = window.sessionStorage.getItem(GATEWAY_HANDOFF_KEY);
+      expect(stored).toContain(BITPAY_OK_URL);
+      expect(stored).not.toContain(TOKEN);
+    } finally {
+      if (original) Object.defineProperty(window, 'sessionStorage', original);
+    }
   });
 
   it('refuses to redirect to a non-approved gateway host and surfaces an error', async () => {

@@ -20,7 +20,7 @@ try {
 // Register service worker for PWA offline support
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js?v=4').catch(() => {});
+    navigator.serviceWorker.register('/sw.js?v=5').catch(() => {});
   });
 }
 

@@ -17,7 +17,7 @@ import {
 import { formatPrice } from '../lib/constants';
 import { getPaymentMethods, getPublicInvoice, payInvoice } from '../lib/commerceApi';
 import { useNoReferrerPolicy } from '../hooks/useNoReferrerPolicy';
-import { GATEWAY_HANDOFF_PATH, writeGatewayHandoff } from '../lib/paymentHandoff';
+import { GATEWAY_HANDOFF_PATH, isHandoffStorageAvailable, writeGatewayHandoff } from '../lib/paymentHandoff';
 import {
   ALLOWED_GATEWAY_HOSTS,
   GATEWAY_ALLOWLIST,
@@ -140,6 +140,20 @@ export function extractPaymentError(err) {
 
 const isCancel = (err) => err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED';
 
+/**
+ * Shown when the gateway hand-off cannot be set up safely because the browser
+ * gives us no per-tab sessionStorage to park the validated portal URL in.
+ *
+ * We must NOT fall back to navigating the portal straight from this document:
+ * it is served `Referrer-Policy: no-referrer` (the path segment is a bearer
+ * token), so the browser sends no Referer and BitPay rejects the hand-off with
+ * «آدرس ارجاعی نامعتبر» — a known-broken dead end. Failing here with an
+ * actionable message (and leaving the CTA in place so the customer can retry
+ * once storage is available) is the safe behaviour.
+ */
+export const PAYMENT_STORAGE_UNAVAILABLE_MESSAGE =
+  'برای انتقال امن به درگاه پرداخت، مرورگر شما باید «حافظهٔ موقت نشست» (session storage) را فعال کند. لطفاً حالت ناشناس مرورگر را ببندید یا اجازهٔ ذخیره‌سازی را بدهید و دوباره تلاش کنید.';
+
 function StateCard({ icon, title, children }) {
   return (
     <div
@@ -248,6 +262,20 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
   const handlePay = useCallback(async () => {
     if (payState === 'submitting' || !selectedMethod) return;
     setPayError(null);
+
+    // The gateway hand-off REQUIRES per-tab sessionStorage: it is how the
+    // validated portal URL is parked for the token-free /pay/redirect page. With
+    // no usable storage there is no safe hand-off, and navigating the portal
+    // straight from this `no-referrer` document is known-broken (BitPay answers
+    // «آدرس ارجاعی نامعتبر»). Detect that HERE — before creating a server-side
+    // payment attempt — so the customer gets an actionable error and a clean
+    // retry, instead of a dangling attempt and a rejected portal page.
+    if (!isHandoffStorageAvailable()) {
+      setPayState('error');
+      setPayError(PAYMENT_STORAGE_UNAVAILABLE_MESSAGE);
+      return;
+    }
+
     setPayState('submitting');
     try {
       const res = await payInvoice(token, selectedMethod);
@@ -264,11 +292,15 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
       // the browser would send no Referer and BitPay would reject the hand-off
       // with «آدرس ارجاعی نامعتبر». Park the validated URL in per-tab
       // sessionStorage and hard-navigate to the token-free /pay/redirect page,
-      // which emits an origin-only Referer. If storage is unavailable the
-      // customer is not stranded: we fall back to the (still validated) direct
-      // navigation.
-      const handedOff = writeGatewayHandoff(target, selectedMethod);
-      redirect(handedOff ? GATEWAY_HANDOFF_PATH : target);
+      // which emits an origin-only Referer. If the write fails anyway (storage
+      // vanished between the check above and here) fail safe rather than send
+      // the customer to a portal page that will reject them.
+      if (!writeGatewayHandoff(target, selectedMethod)) {
+        setPayState('error');
+        setPayError(PAYMENT_STORAGE_UNAVAILABLE_MESSAGE);
+        return;
+      }
+      redirect(GATEWAY_HANDOFF_PATH);
       if (mountedRef.current) setPayState('idle');
     } catch (err) {
       if (isCancel(err) || !mountedRef.current) return;

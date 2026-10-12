@@ -42,10 +42,35 @@ function safeSession() {
   }
 }
 
+const HANDOFF_PROBE_KEY = 'spaghetti:payment:handoff-probe';
+
+/**
+ * True when per-tab sessionStorage can actually be *written*.
+ *
+ * Some browsers expose the ``sessionStorage`` object but throw on ``setItem``
+ * (locked-down private mode), so presence alone is not enough — we probe with a
+ * throwaway key. This lets callers detect an unusable hand-off transport
+ * BEFORE creating a server-side payment attempt, rather than discovering it
+ * only after the gateway URL comes back.
+ */
+export function isHandoffStorageAvailable() {
+  const store = safeSession();
+  if (!store) return false;
+  try {
+    store.setItem(HANDOFF_PROBE_KEY, '1');
+    store.removeItem(HANDOFF_PROBE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Park a validated gateway URL for the intermediate page.
- * Returns false when storage is unavailable — the caller must then take the
- * direct (degraded) path rather than stranding the customer.
+ * Returns false when storage is unavailable. The caller must NOT fall back to a
+ * direct navigation: this document is served `Referrer-Policy: no-referrer`, so
+ * a straight jump to the portal carries no Referer and is rejected. Surface a
+ * clear error and let the customer retry instead.
  */
 export function writeGatewayHandoff(url, provider) {
   const store = safeSession();

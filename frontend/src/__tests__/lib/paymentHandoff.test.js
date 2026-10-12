@@ -19,6 +19,7 @@ import {
   GATEWAY_HANDOFF_KEY,
   GATEWAY_HANDOFF_PATH,
   GATEWAY_HANDOFF_MAX_AGE_MS,
+  isHandoffStorageAvailable,
   writeGatewayHandoff,
   readGatewayHandoff,
   clearGatewayHandoff,
@@ -112,5 +113,45 @@ describe('payment hand-off transport', () => {
     expect(anchor.getAttribute('referrerpolicy')).toBe('origin');
     // A `noreferrer`/`no-referrer` rel would strip the Referer BitPay requires.
     expect(anchor.getAttribute('rel') || '').not.toMatch(/noreferrer/i);
+  });
+});
+
+describe('hand-off storage availability', () => {
+  const originalDescriptor = () =>
+    Object.getOwnPropertyDescriptor(window, 'sessionStorage');
+
+  it('reports true when sessionStorage can be written, leaving no residue', () => {
+    expect(isHandoffStorageAvailable()).toBe(true);
+    // The probe key must be removed again.
+    expect(window.sessionStorage.length).toBe(0);
+  });
+
+  it('reports false when setItem throws (locked-down private mode)', () => {
+    const original = originalDescriptor();
+    Object.defineProperty(window, 'sessionStorage', {
+      configurable: true,
+      get: () => ({
+        setItem() {
+          throw new Error('storage disabled');
+        },
+        getItem: () => null,
+        removeItem() {},
+      }),
+    });
+    try {
+      expect(isHandoffStorageAvailable()).toBe(false);
+    } finally {
+      if (original) Object.defineProperty(window, 'sessionStorage', original);
+    }
+  });
+
+  it('reports false when sessionStorage is absent', () => {
+    const original = originalDescriptor();
+    Object.defineProperty(window, 'sessionStorage', { configurable: true, get: () => undefined });
+    try {
+      expect(isHandoffStorageAvailable()).toBe(false);
+    } finally {
+      if (original) Object.defineProperty(window, 'sessionStorage', original);
+    }
   });
 });
