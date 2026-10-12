@@ -330,6 +330,9 @@ export default function CatalogLayout({ children }) {
             <NavLink to="/contact" className={navLinkClass}>
               تماس با ما
             </NavLink>
+            <NavLink to="/my-orders" className={navLinkClass}>
+              سفارش‌های من
+            </NavLink>
           </nav>
 
           <div className="catalog-topbar-actions">
@@ -423,6 +426,9 @@ export default function CatalogLayout({ children }) {
           <NavLink to="/contact" className={drawerLinkClass} onClick={closeMenu}>
             تماس با ما
           </NavLink>
+          <NavLink to="/my-orders" className={drawerLinkClass} onClick={closeMenu}>
+            سفارش‌های من
+          </NavLink>
 
           {catTree.length > 0 && (
             <div className="mt-3 pt-3 border-t catalog-drawer-cats" style={{ borderColor: 'var(--border-color)' }}>
@@ -510,6 +516,7 @@ export default function CatalogLayout({ children }) {
               <Link to="/how-to-order" className="catalog-footer-link">سفارش از کاتالوگ</Link>
               <Link to="/custom-order" className="catalog-footer-link">سفارش طرح دلخواه</Link>
               <Link to="/contact" className="catalog-footer-link">تماس با ما</Link>
+              <Link to="/my-orders" className="catalog-footer-link">سفارش‌های من</Link>
               <Link to="/card" className="catalog-footer-link">کارت ویزیت</Link>
               <Link to="/privacy" className="catalog-footer-link">حریم خصوصی</Link>
               <Link to="/terms" className="catalog-footer-link">قوانین</Link>

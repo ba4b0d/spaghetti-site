@@ -22,6 +22,21 @@ const PRIVATE_PAYMENT_PATH = /^\/pay(\/|$)/i;
 const isPrivatePaymentPath = (pathname) =>
   typeof pathname === 'string' && PRIVATE_PAYMENT_PATH.test(pathname);
 
+// The one-visit «سفارش‌های من» page at `/my-orders` is a session-ENTRY
+// document: the customer proves a mobile number with an SMS code and the
+// short-lived bearer lives only in that tab's sessionStorage, while the actual
+// history arrives through no-store API calls. The document itself carries no
+// token, but — like the /pay/… family — it must never be cached or served from
+// cache: a stale/offline copy of a session-entry page must not be replayed, and
+// no future change can then accidentally let a cached shell hold personal data.
+// Matched case-insensitively because React Router resolves /MY-ORDERS,
+// /My-Orders … just as nginx now does; `(/|$)` avoids catching lookalikes such
+// as /my-orders-archive.
+const PRIVATE_HISTORY_PATH = /^\/my-orders(\/|$)/i;
+
+const isPrivateHistoryPath = (pathname) =>
+  typeof pathname === 'string' && PRIVATE_HISTORY_PATH.test(pathname);
+
 // Delete every cached entry whose URL is on the private payment path. Run on
 // BOTH install and activate so a client whose older worker already poisoned its
 // cache is repaired as soon as this version takes over, not just for future
@@ -107,6 +122,12 @@ self.addEventListener('fetch', (e) => {
   // network fetch, so the /pay/<token> document is always fetched live (or the
   // request simply fails offline) and no copy of it can ever be replayed.
   if (isPrivatePaymentPath(url.pathname)) {
+    return;
+  }
+
+  // One-visit history page: same rule — the session-entry document is never
+  // cached and never served from cache, so the request goes to the network.
+  if (isPrivateHistoryPath(url.pathname)) {
     return;
   }
 

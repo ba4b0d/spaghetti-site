@@ -34,6 +34,7 @@ const Orders = lazy(() => import('./pages/Orders'));
 const CommerceAdmin = lazy(() => import('./pages/CommerceAdmin'));
 const CustomOrders = lazy(() => import('./pages/CustomOrders'));
 const Customers = lazy(() => import('./pages/Customers'));
+const CustomerOrders = lazy(() => import('./pages/CustomerOrders'));
 const AuditLogs = lazy(() => import('./pages/AuditLogs'));
 const BlogList = lazy(() => import('./pages/BlogList'));
 const BlogPostDetail = lazy(() => import('./pages/BlogPostDetail'));
@@ -96,6 +97,8 @@ function AppRoutes() {
                 <Route path="/cart" element={<CatalogLayout><CheckoutRequest /></CatalogLayout>} />
                 <Route path="/contact" element={<CatalogLayout><Contact /></CatalogLayout>} />
                 <Route path="/card" element={<DigitalCard />} />
+                {/* Public one-visit order history — no account, tab-only session. */}
+                <Route path="/my-orders" element={<CatalogLayout><CustomerOrders /></CatalogLayout>} />
                 {/* Generic, token-free result page (backend callback 303 target). */}
                 <Route path="/pay/result" element={<PaymentResult />} />
                 {/* Token-free same-origin gateway hand-off page. Ranked above

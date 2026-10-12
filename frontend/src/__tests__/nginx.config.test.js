@@ -386,3 +386,76 @@ describe('frontend/nginx.conf — two-tier trusted edge (realip)', () => {
     );
   });
 });
+
+// ── One-visit «سفارش‌های من» route: /my-orders ────────────────────────────
+// The public history page is a session-ENTRY document. It carries no token and
+// no personal data (the bearer lives only in tab sessionStorage; the history
+// arrives through the no-store /api/v1/commerce/history API), but it must still
+// never be cached and never leak a Referer. React Router resolves /MY-ORDERS and
+// /My-Orders as well, so — exactly like /pay/ — the rule is a case-INSENSITIVE
+// regex, and it must precede the static-asset regex.
+describe('frontend/nginx.conf — one-visit /my-orders route', () => {
+  const historyLocations = locations.filter(
+    (l) => (l.type === '~' || l.type === '~*') && /my-orders/i.test(l.target)
+  );
+  const historyLocation = historyLocations[0];
+
+  it('matches the history route with a case-insensitive regex', () => {
+    expect(historyLocations.length, 'no /my-orders location found').toBeGreaterThan(0);
+    expect(historyLocation.type, '/my-orders must be a case-insensitive regex').toBe('~*');
+    expect(historyLocation.target).toMatch(/my-orders/i);
+  });
+
+  it('places the history regex before the static-asset regex', () => {
+    const historyIdx = locations.indexOf(historyLocation);
+    const staticIdx = locations.indexOf(staticLocation);
+    expect(historyIdx).toBeGreaterThanOrEqual(0);
+    expect(staticIdx).toBeGreaterThan(historyIdx);
+  });
+
+  it.each(['/my-orders', '/MY-ORDERS', '/My-Orders', '/mY-oRdErS', '/my-orders/'])(
+    'routes %s to the hardened history location',
+    (uri) => {
+      const hit = matchLocation(locations, uri);
+      expect(hit).toBe(historyLocation);
+      // Hardening must travel with the location that actually serves the URI.
+      expect(headerValue(addHeaders(hit.body), 'Referrer-Policy')).toBe('no-referrer');
+      const cc = headerValue(addHeaders(hit.body), 'Cache-Control');
+      expect(cc).toBeTruthy();
+      expect(cc.toLowerCase()).toContain('no-store');
+    }
+  );
+
+  it('restates every server-level security header (add_header does not inherit)', () => {
+    const headers = addHeaders(historyLocation.body);
+    for (const [name, value] of SERVER_SECURITY_HEADERS) {
+      expect(headerValue(headers, name), `${name} missing in /my-orders`).toBe(value);
+    }
+    const serverCsp = headerValue(addHeaders(CONF), 'Content-Security-Policy');
+    expect(serverCsp, 'server-level CSP not found').toBeTruthy();
+    expect(headerValue(headers, 'Content-Security-Policy')).toBe(serverCsp);
+  });
+
+  it('uses a `rewrite ... break` SPA fallback and never the bot meta-preview branch', () => {
+    expect(historyLocation.body).toMatch(/rewrite\s+\S+\s+\/index\.html\s+break/);
+    expect(historyLocation.body).not.toMatch(/try_files/);
+    expect(historyLocation.body).not.toMatch(/meta-preview/);
+    expect(historyLocation.body).not.toMatch(/TelegramBot/);
+  });
+
+  it('never access-logs the history page (no personal query string may reach the log)', () => {
+    expect(historyLocation.body).toMatch(/access_log\s+off;/);
+  });
+
+  it('does not over-reach: lookalike paths keep the default SPA handling', () => {
+    for (const uri of ['/my-orders-archive', '/my-ordersx']) {
+      expect(matchLocation(locations, uri)).toBe(rootLocation);
+    }
+  });
+
+  it('leaves the site-wide policy untouched', () => {
+    expect(headerValue(addHeaders(CONF), 'Referrer-Policy')).toBe(
+      'strict-origin-when-cross-origin'
+    );
+  });
+});

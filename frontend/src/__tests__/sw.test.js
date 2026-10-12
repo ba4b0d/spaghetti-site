@@ -272,3 +272,40 @@ describe('sw.js — existing behaviour preserved', () => {
     }
   });
 });
+
+// ── One-visit history page: never cached ──────────────────────────────────
+// The /my-orders «سفارش‌های من» page is a session-ENTRY document. Its bearer
+// lives only in tab sessionStorage and its history arrives through no-store API
+// calls, so the document must be excluded from the cache exactly like /pay/…:
+// never intercepted, never cached, never served from cache, and covered in
+// every case variant React Router (and nginx) accept.
+describe('sw.js — the one-visit history page is never cached', () => {
+  const HISTORY_PATHS = ['/my-orders', '/MY-ORDERS', '/My-Orders', '/mY-oRdErS', '/my-orders/'];
+
+  it.each(HISTORY_PATHS)(
+    'hands %s straight to the network without intercepting or caching it',
+    (path) => {
+      const { listeners, harness } = loadSW();
+      const { responded } = dispatchFetch(listeners, nav(path));
+
+      expect(responded).toBeUndefined();
+      expect(harness.entries()).toEqual([]);
+    }
+  );
+
+  it('never serves a cached copy of the history page even when one is stored', () => {
+    const { listeners, harness } = loadSW();
+    harness.preload(CACHE_NAME, ORIGIN + '/my-orders', makeResponse('cached shell'));
+
+    const { responded } = dispatchFetch(listeners, nav('/my-orders'));
+    expect(responded).toBeUndefined();
+  });
+
+  it('does not over-reach: lookalike routes keep their normal handling', () => {
+    for (const path of ['/my-orders-archive', '/my-ordersx', '/my']) {
+      const { listeners } = loadSW();
+      const { responded } = dispatchFetch(listeners, nav(path));
+      expect(responded, `${path} should still be intercepted`).toBeDefined();
+    }
+  });
+});
