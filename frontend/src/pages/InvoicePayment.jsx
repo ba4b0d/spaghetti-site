@@ -664,7 +664,7 @@ export default function InvoicePayment({ redirect = (url) => window.location.ass
                         }}
                       >
                         <CheckCircle2 size={11} />
-                        {method.badge}
+                        فعال
                       </span>
                     ) : (
                       <span

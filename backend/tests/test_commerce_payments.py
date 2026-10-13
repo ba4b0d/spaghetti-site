@@ -500,6 +500,8 @@ def test_digipay_readiness_and_pay_route_are_disabled(client, auth_headers, monk
 
     fake = FakeDigiPay()
     app.dependency_overrides[digipay.client_dependency] = lambda: fake
+    monkeypatch.delenv("DIGIPAY_ENABLE_CHECKOUT", raising=False)
+    monkeypatch.delenv("DIGIPAY_ENABLE_LIVE_CHECKOUT", raising=False)
     # Simulate fully-present merchant credentials in the environment.
     for var in (
         "DIGIPAY_CLIENT_ID", "DIGIPAY_CLIENT_SECRET",
@@ -519,8 +521,10 @@ def test_digipay_readiness_and_pay_route_are_disabled(client, auth_headers, monk
         app.dependency_overrides.pop(digipay.client_dependency, None)
 
 
-def test_digipay_pay_route_disabled_even_without_credentials(client, auth_headers):
+def test_digipay_pay_route_disabled_even_without_credentials(client, auth_headers, monkeypatch):
     """No credentials at all is still a 503 (never a 500/502)."""
+    monkeypatch.delenv("DIGIPAY_ENABLE_CHECKOUT", raising=False)
+    monkeypatch.delenv("DIGIPAY_ENABLE_LIVE_CHECKOUT", raising=False)
     _, token = make_approved(client, auth_headers)
     r = pay(client, token)
     assert r.status_code == 503, r.text

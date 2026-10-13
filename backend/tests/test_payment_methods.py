@@ -36,7 +36,15 @@ NONPROD_ORIGIN = "https://staging.spaghettiprints.ir"
 PRODUCTION_ORIGINS = ["https://spaghettiprints.ir", "https://www.spaghettiprints.ir"]
 LIVE_ORIGIN = "https://spaghettiprints.ir"
 
-_ENV_VARS = ("BITPAY_API_KEY", "BITPAY_ENV", FLAG, LIVE_FLAG, "PUBLIC_SITE_ORIGIN")
+_ENV_VARS = (
+    "BITPAY_API_KEY",
+    "BITPAY_ENV",
+    FLAG,
+    LIVE_FLAG,
+    "PUBLIC_SITE_ORIGIN",
+    "DIGIPAY_ENABLE_CHECKOUT",
+    "DIGIPAY_ENABLE_LIVE_CHECKOUT",
+)
 
 
 def _clear_bitpay_env(monkeypatch):

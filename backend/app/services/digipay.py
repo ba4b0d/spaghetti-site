@@ -137,15 +137,23 @@ def resolve_base_url() -> str:
 
 
 def checkout_enabled() -> bool:
-    """Whether DigiPay may start a payment at all — currently always ``False``.
+    """Whether DigiPay may start a payment at all.
 
-    DigiPay is parked. This is a single, shared, unconditional predicate (there
-    is deliberately no environment override), so the public readiness snapshot
-    and the legacy initiation route can never disagree, and the route can refuse
-    *before* any provider is resolved — an injected client or fully-present
-    merchant credentials cannot start a payment.
+    Requires an explicit opt-in (DIGIPAY_ENABLE_CHECKOUT or DIGIPAY_ENABLE_LIVE_CHECKOUT)
+    plus all four merchant credentials.
     """
-    return False
+    flag = (
+        os.getenv("DIGIPAY_ENABLE_CHECKOUT")
+        or os.getenv("DIGIPAY_ENABLE_LIVE_CHECKOUT")
+        or ""
+    ).strip().lower()
+    if flag not in ("1", "true", "yes", "on", "enabled"):
+        return False
+    client_id = (os.getenv("DIGIPAY_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("DIGIPAY_CLIENT_SECRET") or "").strip()
+    username = (os.getenv("DIGIPAY_USERNAME") or "").strip()
+    password = (os.getenv("DIGIPAY_PASSWORD") or "").strip()
+    return bool(client_id and client_secret and username and password)
 
 
 def build_callback_url() -> str:
