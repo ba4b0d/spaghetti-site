@@ -4,19 +4,27 @@ import {
   AlertTriangle,
   ArrowRight,
   Clock,
+  CreditCard,
   FileText,
   Inbox,
   Loader2,
   LogOut,
+  Mail,
+  MapPin,
   Package,
+  Phone,
   Receipt,
   RotateCcw,
+  Send,
   ShieldCheck,
+  ShoppingBag,
+  User,
 } from 'lucide-react';
 import { formatPrice } from '../lib/utils';
 import { useNoReferrerPolicy } from '../hooks/useNoReferrerPolicy';
 import {
   getCustomerHistory,
+  getCustomerProfile,
   requestHistoryOtp,
   signOutHistory,
   verifyHistoryOtp,
@@ -284,6 +292,8 @@ export default function CustomerOrders() {
   const [hasMore, setHasMore] = useState(false);
   const [listStatus, setListStatus] = useState('idle'); // idle | loading | ready | error
   const [listError, setListError] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [activeTab, setActiveTab] = useState('orders'); // orders | profile
 
   const mountedRef = useRef(true);
   const abortRef = useRef(null);
@@ -305,6 +315,8 @@ export default function CustomerOrders() {
     setHasMore(false);
     setListStatus('idle');
     setListError(null);
+    setProfile(null);
+    setActiveTab('orders');
     setOtp(null);
     setCode('');
     setMaskedMobile('');
@@ -323,6 +335,15 @@ export default function CustomerOrders() {
       abortRef.current = controller;
       setListStatus('loading');
       setListError(null);
+
+      // Fetch profile identity and addresses
+      getCustomerProfile(bearer, { signal: controller.signal })
+        .then((res) => {
+          if (!mountedRef.current || controller.signal.aborted) return;
+          setProfile(res?.data || null);
+        })
+        .catch(() => {});
+
       return getCustomerHistory(bearer, { limit: PAGE_SIZE, offset: 0 }, { signal: controller.signal })
         .then((res) => {
           if (!mountedRef.current || controller.signal.aborted) return;
@@ -667,8 +688,9 @@ export default function CustomerOrders() {
 
   return (
     <div dir="rtl" className="max-w-3xl mx-auto animate-fade-in" data-testid="my-orders-list">
+      {/* ── Profile Header ── */}
       <div
-        className="rounded-2xl border p-5 sm:p-6 mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        className="rounded-2xl border p-5 sm:p-6 mb-6"
         style={{
           background: 'var(--brand-header-gradient)',
           borderColor: 'var(--brand-header-border)',
@@ -676,33 +698,225 @@ export default function CustomerOrders() {
           color: 'var(--brand-header-fg)',
         }}
       >
-        <div className="min-w-0">
-          <h1 className="text-xl sm:text-2xl font-bold mb-1">سفارش‌های من</h1>
-          {maskedMobile ? (
-            <p className="text-xs sm:text-sm" style={{ color: 'color-mix(in srgb, #fff 82%, transparent)' }}>
-              سفارش‌های ثبت‌شده با شمارهٔ{' '}
-              <bdi dir="ltr" style={{ display: 'inline-block', fontFamily: 'monospace', fontWeight: 600 }}>
-                {maskedMobile}
-              </bdi>
-            </p>
-          ) : null}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-xl sm:text-2xl font-bold mb-2">
+              {profile?.customer_name ? `سلام، ${profile.customer_name} عزیز 👋` : 'سفارش‌های من'}
+            </h1>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
+                style={{
+                  background: 'color-mix(in srgb, #fff 14%, transparent)',
+                  border: '1px solid color-mix(in srgb, #fff 24%, transparent)',
+                }}
+              >
+                <Phone size={13} />
+                <bdi dir="ltr" style={{ fontFamily: 'monospace', fontWeight: 600 }}>
+                  {maskedMobile || profile?.masked_mobile || '—'}
+                </bdi>
+              </span>
+
+              {profile?.email ? (
+                <span
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
+                  style={{
+                    background: 'color-mix(in srgb, #fff 14%, transparent)',
+                    border: '1px solid color-mix(in srgb, #fff 24%, transparent)',
+                  }}
+                >
+                  <Mail size={13} />
+                  <span style={{ direction: 'ltr' }}>{profile.email}</span>
+                </span>
+              ) : null}
+
+              {profile?.messenger_handle ? (
+                <span
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
+                  style={{
+                    background: 'color-mix(in srgb, #fff 14%, transparent)',
+                    border: '1px solid color-mix(in srgb, #fff 24%, transparent)',
+                  }}
+                >
+                  <Send size={13} />
+                  <span style={{ direction: 'ltr' }}>
+                    {profile.messenger === 'bale' ? 'بله: ' : 'تلگرام: '}
+                    {profile.messenger_handle}
+                  </span>
+                </span>
+              ) : null}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            data-testid="sign-out"
+            onClick={handleSignOut}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold shrink-0 self-start sm:self-auto"
+            style={{
+              border: '1px solid color-mix(in srgb, #fff 40%, transparent)',
+              background: 'color-mix(in srgb, #fff 16%, transparent)',
+              color: '#ffffff',
+              cursor: 'pointer',
+            }}
+          >
+            <LogOut size={15} />
+            خروج از حساب
+          </button>
         </div>
+
+        {/* ── Quick Stats ── */}
+        <div
+          className="grid grid-cols-3 gap-2 mt-5 pt-4 border-t"
+          style={{ borderColor: 'color-mix(in srgb, #fff 20%, transparent)' }}
+        >
+          <div className="text-center sm:text-right">
+            <div className="text-[11px] opacity-80">کل سفارش‌ها</div>
+            <div className="text-base sm:text-lg font-black mt-0.5">
+              {profile?.stats?.total_orders ?? items.length}
+            </div>
+          </div>
+          <div className="text-center sm:text-right">
+            <div className="text-[11px] opacity-80">در انتظار پرداخت</div>
+            <div
+              className="text-base sm:text-lg font-black mt-0.5"
+              style={profile?.stats?.pending_payment ? { color: '#ffedd5' } : undefined}
+            >
+              {profile?.stats?.pending_payment ?? 0}
+            </div>
+          </div>
+          <div className="text-center sm:text-right">
+            <div className="text-[11px] opacity-80">تکمیل و پرداخت‌شده</div>
+            <div className="text-base sm:text-lg font-black mt-0.5">
+              {profile?.stats?.paid ?? 0}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Tabs ── */}
+      <div className="flex items-center gap-2 mb-6 border-b pb-1" style={{ borderColor: 'var(--border-color)' }}>
         <button
           type="button"
-          data-testid="sign-out"
-          onClick={handleSignOut}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold shrink-0 self-start sm:self-auto"
-          style={{
-            border: '1px solid color-mix(in srgb, #fff 40%, transparent)',
-            background: 'color-mix(in srgb, #fff 16%, transparent)',
-            color: '#ffffff',
-            cursor: 'pointer',
-          }}
+          onClick={() => setActiveTab('orders')}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all ${
+            activeTab === 'orders'
+              ? 'btn-primary'
+              : 'text-[var(--text-secondary)] hover:bg-[var(--bg-card)]'
+          }`}
         >
-          <LogOut size={15} />
-          خروج
+          <ShoppingBag size={15} />
+          سفارش‌ها و فاکتورها ({profile?.stats?.total_orders ?? items.length})
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('profile')}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all ${
+            activeTab === 'profile'
+              ? 'btn-primary'
+              : 'text-[var(--text-secondary)] hover:bg-[var(--bg-card)]'
+          }`}
+        >
+          <MapPin size={15} />
+          نشانی‌ها و مشخصات
         </button>
       </div>
+
+      {activeTab === 'profile' ? (
+        <div className="space-y-5 animate-fade-in mb-6">
+          <div
+            className="card p-5 sm:p-6 rounded-2xl border space-y-4"
+            style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
+          >
+            <h2 className="text-sm font-bold flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>
+              <User size={16} style={{ color: 'var(--brand-orange, #ff9a3d)' }} />
+              اطلاعات حساب کاربری
+            </h2>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div className="p-3 rounded-xl border" style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}>
+                <span className="block mb-1 font-medium" style={{ color: 'var(--text-secondary)' }}>نام و نام خانوادگی</span>
+                <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                  {profile?.customer_name || '—'}
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl border" style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}>
+                <span className="block mb-1 font-medium" style={{ color: 'var(--text-secondary)' }}>شماره تماس تأییدشده</span>
+                <bdi dir="ltr" className="text-sm font-semibold block text-right font-mono" style={{ color: 'var(--text-primary)' }}>
+                  {profile?.mobile || maskedMobile || '—'}
+                </bdi>
+              </div>
+
+              <div className="p-3 rounded-xl border" style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}>
+                <span className="block mb-1 font-medium" style={{ color: 'var(--text-secondary)' }}>آدرس ایمیل</span>
+                <span className="text-sm font-semibold block text-left font-mono" style={{ color: 'var(--text-primary)', direction: 'ltr' }}>
+                  {profile?.email || '—'}
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl border" style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}>
+                <span className="block mb-1 font-medium" style={{ color: 'var(--text-secondary)' }}>کانال ارتباطی ترجیحی</span>
+                <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                  {profile?.messenger_handle
+                    ? `${profile.messenger === 'bale' ? 'بله' : 'تلگرام'}: ${profile.messenger_handle}`
+                    : '—'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div
+            className="card p-5 sm:p-6 rounded-2xl border space-y-4"
+            style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
+          >
+            <h2 className="text-sm font-bold flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>
+              <MapPin size={16} style={{ color: 'var(--brand-orange, #ff9a3d)' }} />
+              نشانی‌های ثبت‌شده تحویل
+            </h2>
+
+            {profile?.addresses && profile.addresses.length > 0 ? (
+              <div className="space-y-2.5">
+                {profile.addresses.map((addr, idx) => (
+                  <div
+                    key={idx}
+                    className="p-3.5 rounded-xl border flex items-start gap-3"
+                    style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}
+                  >
+                    <div
+                      className="w-6 h-6 rounded-lg shrink-0 flex items-center justify-center font-bold text-xs"
+                      style={{ background: 'var(--accent-light)', color: 'var(--brand-orange, #ff9a3d)' }}
+                    >
+                      {idx + 1}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs leading-relaxed" style={{ color: 'var(--text-primary)' }}>
+                        {addr}
+                      </p>
+                      {idx === 0 && (
+                        <span className="inline-block mt-1 text-[10px] font-semibold text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded-md">
+                          آخرین نشانی استفاده‌شده
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs py-4 text-center" style={{ color: 'var(--text-secondary)' }}>
+                هنوز نشانی تحویلی برای این شماره ثبت نشده است.
+              </p>
+            )}
+
+            <p className="text-[11px] leading-relaxed border-t pt-3" style={{ borderColor: 'var(--border-color)', color: 'var(--text-muted)' }}>
+              💡 نشانی‌های فوق از سفارش‌های قبلی شما به‌صورت خودکار ذخیره شده‌اند تا در خریدهای بعدی نیاز به ورود مجدد اطلاعات نداشته باشید.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      {activeTab === 'orders' ? (
+        <>
 
       {loading && items.length === 0 ? (
         <div className="text-center py-16" role="status" aria-busy="true">
@@ -801,6 +1015,8 @@ export default function CustomerOrders() {
           برای پرداخت فاکتور، لینک اختصاصی صادرشده توسط پشتیبانی را از طریق پیام‌رسان دریافت کنید.
         </span>
       </div>
+        </>
+      ) : null}
 
       <div className="mt-3 flex items-center justify-center">
         <Link

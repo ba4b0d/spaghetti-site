@@ -33,6 +33,7 @@ from sqlalchemy import literal, select, union_all
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import CommerceInvoice, CommerceRequest
+from app.services.commerce_notifications import mask_mobile
 
 # ── Bounds ───────────────────────────────────────────────────────────
 HISTORY_DEFAULT_LIMIT = 20
@@ -187,3 +188,66 @@ def list_history(
             if obj is not None:
                 entries.append(_serialize_invoice(obj))
     return entries
+
+
+def get_customer_profile(db: Session, mobile: str) -> dict:
+    """Return aggregated customer identity, saved addresses and order counts."""
+    reqs = (
+        db.query(CommerceRequest)
+        .filter(CommerceRequest.mobile == mobile)
+        .order_by(CommerceRequest.created_at.desc(), CommerceRequest.id.desc())
+        .all()
+    )
+    invs = (
+        db.query(CommerceInvoice)
+        .filter(CommerceInvoice.mobile == mobile)
+        .order_by(CommerceInvoice.created_at.desc(), CommerceInvoice.id.desc())
+        .all()
+    )
+
+    customer_name = ""
+    email = ""
+    messenger = "telegram"
+    messenger_handle = ""
+
+    candidates = list(invs) + list(reqs)
+    candidates.sort(
+        key=lambda x: _as_utc(x.created_at) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+    for item in candidates:
+        if not customer_name and getattr(item, "customer_name", "").strip():
+            customer_name = item.customer_name.strip()
+        if not email and getattr(item, "email", "").strip():
+            email = item.email.strip()
+        if not messenger_handle and getattr(item, "messenger_handle", "").strip():
+            messenger_handle = item.messenger_handle.strip()
+            messenger = getattr(item, "messenger", "telegram")
+
+    seen_addresses = set()
+    addresses = []
+    for item in candidates:
+        addr = (getattr(item, "address", "") or "").strip()
+        if addr and addr not in seen_addresses:
+            seen_addresses.add(addr)
+            addresses.append(addr)
+
+    pending_payment = sum(1 for i in invs if i.state == "approved")
+    paid = sum(1 for i in invs if i.state == "paid")
+    total_orders = len(reqs) + len(invs)
+
+    return {
+        "customer_name": customer_name,
+        "mobile": mobile,
+        "masked_mobile": mask_mobile(mobile),
+        "email": email,
+        "messenger": messenger,
+        "messenger_handle": messenger_handle,
+        "addresses": addresses,
+        "stats": {
+            "total_orders": total_orders,
+            "pending_payment": pending_payment,
+            "paid": paid,
+        },
+    }

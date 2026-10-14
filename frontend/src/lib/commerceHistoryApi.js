@@ -87,6 +87,16 @@ export const getCustomerHistory = (token, params = {}, config) => {
   });
 };
 
+/** Public — the verified customer's profile, contact info and saved addresses. */
+export const getCustomerProfile = (token, config) => {
+  const missing = missingBearer(token);
+  if (missing) return missing;
+  return historyApi.get('/history/profile', {
+    ...config,
+    headers: bearerHeaders(token, config),
+  });
+};
+
 /** Public — revoke the presented bearer server-side (idempotent). */
 export const signOutHistory = (token, config) => {
   const missing = missingBearer(token);

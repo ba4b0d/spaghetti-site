@@ -105,7 +105,16 @@ def _get_token(client, mobile=MOBILE):
     return v.json()["token"]
 
 
-def _insert_request(mobile=MOBILE, *, state="pending_review", created_at=None, items=None):
+def _insert_request(
+    mobile=MOBILE,
+    *,
+    customer_name="مشتری",
+    email="",
+    address="آدرس کامل محرمانه",
+    state="pending_review",
+    created_at=None,
+    items=None,
+):
     from app.models import CommerceRequest, CommerceRequestItem
     from app.services.commerce import generate_receipt_id
 
@@ -113,11 +122,12 @@ def _insert_request(mobile=MOBILE, *, state="pending_review", created_at=None, i
     try:
         req = CommerceRequest(
             receipt_id=generate_receipt_id(),
-            customer_name="مشتری",
+            customer_name=customer_name,
+            email=email,
             mobile=mobile,
             messenger="telegram",
             messenger_handle="@handle",
-            address="آدرس کامل محرمانه",
+            address=address,
             note="یادداشت",
             state=state,
             created_at=created_at or _now(),
@@ -702,3 +712,32 @@ def test_list_history_reads_only_the_requested_mobile(client):
     finally:
         db.close()
     assert len(rows) == 1 and rows[0]["kind"] == "request"
+
+
+def test_customer_profile_requires_bearer_and_returns_data(client):
+    from app.services import commerce_history
+
+    # 401 without auth
+    unauth = client.get(f"{BASE}/profile")
+    assert unauth.status_code == 401
+
+    stamp = datetime(2026, 4, 1, 8, 0, 0, tzinfo=timezone.utc)
+    _insert_request(
+        MOBILE,
+        customer_name="باربد رضایی",
+        email="barbad@example.com",
+        address="تهران، خیابان آزادی، پلاک ۵",
+        created_at=stamp,
+    )
+    token = _get_token(client, MOBILE)
+
+    resp = client.get(f"{BASE}/profile", headers=_auth(token))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["customer_name"] == "باربد رضایی"
+    assert data["email"] == "barbad@example.com"
+    assert data["mobile"] == MOBILE
+    assert "addresses" in data and "تهران، خیابان آزادی، پلاک ۵" in data["addresses"]
+    assert data["stats"]["total_orders"] == 1
+    assert data["stats"]["pending_payment"] == 0
+

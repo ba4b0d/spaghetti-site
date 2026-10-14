@@ -13,6 +13,7 @@ const apiMock = vi.hoisted(() => ({
   requestHistoryOtp: vi.fn(),
   verifyHistoryOtp: vi.fn(),
   getCustomerHistory: vi.fn(),
+  getCustomerProfile: vi.fn(),
   signOutHistory: vi.fn(),
 }));
 const sessionMock = vi.hoisted(() => ({
@@ -111,6 +112,14 @@ beforeEach(() => {
   });
   apiMock.verifyHistoryOtp.mockResolvedValue({ data: { token: TOKEN, expires_at: futureIso() } });
   apiMock.getCustomerHistory.mockResolvedValue({ data: { items: [], has_more: false } });
+  apiMock.getCustomerProfile.mockResolvedValue({
+    data: {
+      customer_name: 'رضا',
+      email: 'reza@example.com',
+      addresses: ['تهران، خیابان آزادی، پلاک ۱۰'],
+      stats: { total_orders: 0, pending_payment: 0, paid: 0 },
+    },
+  });
   apiMock.signOutHistory.mockResolvedValue({ data: { ok: true } });
 });
 
@@ -195,6 +204,37 @@ describe('CustomerOrders — session and list lifecycle', () => {
       expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
     expect(await screen.findByText('جاکلیدی تستی')).toBeInTheDocument();
+  });
+
+  it('renders personalized customer greeting, stats and saved addresses in the profile tab', async () => {
+    withSession();
+    apiMock.getCustomerHistory.mockResolvedValue({
+      data: { items: [requestEntry], has_more: false },
+    });
+    apiMock.getCustomerProfile.mockResolvedValue({
+      data: {
+        customer_name: 'باربد',
+        mobile: '09123456789',
+        masked_mobile: '0912***6789',
+        email: 'barbad@example.com',
+        messenger: 'telegram',
+        messenger_handle: '@barbad',
+        addresses: ['تهران، خیابان آزادی، کوچه صادقی، پلاک ۱۵'],
+        stats: { total_orders: 4, pending_payment: 1, paid: 3 },
+      },
+    });
+
+    renderPage();
+
+    // Verify name greeting
+    expect(await screen.findByText('سلام، باربد عزیز 👋')).toBeInTheDocument();
+
+    // Click profile tab
+    fireEvent.click(screen.getByRole('button', { name: /نشانی‌ها و مشخصات/ }));
+
+    // Verify address and email displayed
+    expect(await screen.findByText(/تهران، خیابان آزادی، کوچه صادقی، پلاک ۱۵/)).toBeInTheDocument();
+    expect(screen.getAllByText('barbad@example.com').length).toBeGreaterThanOrEqual(1);
   });
 
   it('still shows the list when tab storage is unavailable (write returns false)', async () => {

@@ -191,6 +191,20 @@ def read_history(
     return {"items": rows[:limit], "has_more": has_more}
 
 
+@router.get("/profile")
+@limiter.limit("30/minute")
+def read_customer_profile(
+    request: Request,
+    response: Response,
+    session: tuple[str, str] = Depends(current_history_session),
+    db: Session = Depends(get_db),
+):
+    """Public — the verified mobile's identity, saved addresses and order counts."""
+    response.headers.update(NO_STORE_HEADERS)
+    _, mobile = session
+    return commerce_history.get_customer_profile(db, mobile)
+
+
 @router.post("/sign-out")
 def sign_out_history(
     response: Response,
