@@ -39,6 +39,7 @@ Design rules enforced here (see spec "Notifications"):
   channel is fully configured.
 """
 import html
+import inspect
 import logging
 import math
 import os
@@ -53,7 +54,7 @@ from app.telegram_bot import (
     send_telegram_notification,
     send_telegram_document,
 )
-from app.services import invoice_pdf
+from app.services import invoice_pdf, email_templates
 
 logger = logging.getLogger(__name__)
 
@@ -333,10 +334,27 @@ def build_payload(event: str, subject) -> dict:
         except Exception as pdf_err:
             logger.warning("Failed to render invoice PDF for notification: %s", pdf_err)
 
+    email_html = None
+    try:
+        email_html = email_templates.render_commerce_email(
+            event=event,
+            code=code,
+            customer_name=name,
+            mobile=mobile,
+            channel=channel,
+            items=items,
+            total=total,
+            order_id=order_id,
+            is_admin=True,
+        )
+    except Exception as render_err:
+        logger.warning("Failed to render email HTML for notification: %s", render_err)
+
     return {
         "telegram": "\n".join(tg_lines),
         "email_subject": f"[Spaghetti Print] {label} {code}",
         "email_body": "\n".join(email_lines),
+        "email_html": email_html,
         "sms": sms_parameters,
         "pdf_bytes": pdf_bytes,
         "invoice_code": code,
@@ -430,15 +448,20 @@ def send_smtp_mail(
     config: dict,
     subject: str,
     body: str,
+    html_body: str | None = None,
+    recipient_override: str | None = None,
     timeout: float = SMTP_TIMEOUT,
     smtp_factory=None,
 ) -> bool:
-    """Send one admin email over STARTTLS or SSL. Returns True on completion."""
+    """Send one admin or customer email over STARTTLS or SSL. Returns True on completion."""
+    recipient = recipient_override or config["recipient"]
     message = EmailMessage()
     message["From"] = config["sender"]
-    message["To"] = config["recipient"]
+    message["To"] = recipient
     message["Subject"] = subject
     message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
 
     host, port, tls = config["host"], config["port"], config["tls"]
     if smtp_factory is not None:
@@ -454,7 +477,7 @@ def send_smtp_mail(
         if tls == TLS_STARTTLS:
             smtp.starttls(context=ssl.create_default_context())
         smtp.login(config["username"], config["password"])
-        smtp.sendmail(config["sender"], [config["recipient"]], message.as_string())
+        smtp.sendmail(config["sender"], [recipient], message.as_string())
     return True
 
 
@@ -508,17 +531,43 @@ def send_sms_alert(parameters: list) -> str:
     return SENT if acked else FAILED
 
 
-def send_email_alert(subject: str, body: str) -> str:
+def send_email_alert(subject: str, body: str, html_body: str | None = None) -> str:
     """SMTP admin channel; SKIPPED when unconfigured, FAILED on send error."""
     config = smtp_config()
     if config is None:
         return SKIPPED
     try:
-        ok = send_smtp_mail(config=config, subject=subject, body=body)
+        ok = send_smtp_mail(config=config, subject=subject, body=body, html_body=html_body)
     except Exception as exc:  # noqa: BLE001 - SMTP/network error
         logger.warning("SMTP admin notification error: %s", _safe(exc))
         return FAILED
     return SENT if ok else FAILED
+
+
+def send_customer_email(
+    recipient: str,
+    subject: str,
+    body: str,
+    html_body: str | None = None,
+) -> bool:
+    """Send a transactional email to a customer's mailbox.
+
+    Returns False when SMTP is unconfigured or send fails; never raises.
+    """
+    config = smtp_config()
+    if not config or not recipient:
+        return False
+    try:
+        return send_smtp_mail(
+            config=config,
+            subject=subject,
+            body=body,
+            html_body=html_body,
+            recipient_override=recipient,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to send customer email to %s: %s", recipient, _safe(exc))
+        return False
 
 
 # ── Entry point ──────────────────────────────────────────────────────
@@ -571,13 +620,30 @@ def deliver_payload(event: str, payload: dict) -> dict:
                             pass
             return res
 
+        def _deliver_email():
+            send_fn = send_email_alert
+            subj = payload["email_subject"]
+            body = payload["email_body"]
+            html_body = payload.get("email_html")
+            try:
+                sig = inspect.signature(send_fn)
+                accepts_html = "html_body" in sig.parameters or len(sig.parameters) >= 3 or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+            except (ValueError, TypeError):
+                accepts_html = True
+
+            if accepts_html and html_body:
+                try:
+                    return send_fn(subj, body, html_body=html_body)
+                except TypeError:
+                    pass
+            return send_fn(subj, body)
+
         return {
             "telegram": _run_channel("telegram", event, _deliver_telegram),
             "sms": _run_channel("sms", event, lambda: send_sms_alert(payload["sms"])),
-            "email": _run_channel(
-                "email", event,
-                lambda: send_email_alert(payload["email_subject"], payload["email_body"]),
-            ),
+            "email": _run_channel("email", event, _deliver_email),
         }
     except Exception as exc:  # noqa: BLE001 - never leak out of a background task
         logger.warning("commerce notification delivery failed event=%s: %s", event, _safe(exc))
