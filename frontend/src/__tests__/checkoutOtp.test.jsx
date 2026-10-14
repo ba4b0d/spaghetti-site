@@ -33,6 +33,7 @@ function renderCheckout() {
 /** Fill the contact form and press «ثبت درخواست» to open the OTP step. */
 async function openOtpStep() {
   fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
+  fireEvent.change(screen.getByLabelText(/ایمیل/), { target: { value: 'reza@example.com' } });
   fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
   fireEvent.change(screen.getByLabelText('پیامرسان'), { target: { value: 'telegram' } });
   fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
@@ -97,7 +98,7 @@ describe('CheckoutRequest cart OTP gate', () => {
     expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
     // Exactly the accepted fields — no client-supplied price anywhere.
     expect(Object.keys(payload).sort()).toEqual(
-      ['address', 'customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
+      ['address', 'customer_name', 'email', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
     );
     expect(JSON.stringify(payload)).not.toContain('60000');
 
@@ -150,6 +151,7 @@ describe('CheckoutRequest cart OTP gate', () => {
     await screen.findByText(/جاکلیدی تستی/);
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
+    fireEvent.change(screen.getByLabelText(/ایمیل/), { target: { value: 'reza@example.com' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
     fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
       target: { value: 'تهران، خیابان آزادی، پلاک ۱۰' },

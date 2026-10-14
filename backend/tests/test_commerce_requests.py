@@ -41,6 +41,7 @@ def _create_product(client, auth_headers, *, name="محصول تستی", price=5
 def _valid_payload(product_id, qty=2, **overrides):
     payload = {
         "customer_name": "رضا",
+        "email": "reza@example.com",
         "mobile": "09123456789",
         "messenger": "telegram",
         "address": "تهران، میدان آزادی، خیابان آزادی، پلاک ۱۰",
@@ -227,6 +228,21 @@ def test_mandatory_address_rejected_when_empty_or_short(client, auth_headers):
 
     # Too short address (< 5 chars)
     assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], address="تهر")).status_code == 422
+
+
+def test_mandatory_email_rejected_when_empty_or_invalid(client, auth_headers):
+    product = _create_product(client, auth_headers)
+    # Missing email
+    payload_missing = _valid_payload(product["id"])
+    del payload_missing["email"]
+    assert client.post("/api/v1/commerce/requests", json=payload_missing).status_code == 422
+
+    # Blank / whitespace email
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], email="   ")).status_code == 422
+
+    # Invalid email syntax
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], email="not-an-email")).status_code == 422
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], email="user@no-domain")).status_code == 422
 
 
 def test_huge_note_rejected(client, auth_headers):
@@ -462,6 +478,7 @@ def _otp_payload(product_id, qty=1, **overrides):
     """A payload bound to ONE explicit challenge (unlike ``_valid_payload``)."""
     payload = {
         "customer_name": "رضا",
+        "email": "reza@example.com",
         "mobile": "09123456789",
         "messenger": "telegram",
         "address": "تهران، میدان آزادی، خیابان آزادی، پلاک ۱۰",

@@ -110,6 +110,7 @@ function catalogPrice(product) {
 
 const emptyForm = {
   customer_name: '',
+  email: '',
   mobile: '',
   messenger: 'telegram',
   messenger_handle: '',
@@ -350,6 +351,7 @@ export default function CommerceAdmin() {
     setLinkedRequestId(request.id);
     setForm({
       customer_name: request.customer_name || '',
+      email: request.email || '',
       mobile: request.mobile || '',
       messenger: request.messenger || 'telegram',
       messenger_handle: request.messenger_handle || '',
@@ -375,6 +377,7 @@ export default function CommerceAdmin() {
     setLinkedRequestId(null);
     setForm({
       customer_name: invoice.customer_name || '',
+      email: invoice.email || '',
       mobile: invoice.mobile || '',
       messenger: invoice.messenger || 'telegram',
       messenger_handle: invoice.messenger_handle || '',
@@ -478,6 +481,7 @@ export default function CommerceAdmin() {
       // A revision must never silently re-point the invoice at another request.
       request_id: editingId ? null : linkedRequestId ?? null,
       customer_name: name,
+      email: form.email.trim(),
       mobile,
       messenger: form.messenger,
       messenger_handle: form.messenger_handle.trim(),
@@ -675,9 +679,10 @@ export default function CommerceAdmin() {
                     <p className="text-xs mt-0.5" style={{ color: 'var(--text-secondary)' }}>
                       {(req.items || []).map((i) => `${i.display_name}×${i.qty}`).join('، ') || '—'}
                     </p>
-                    <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)', direction: 'ltr' }}>
-                      {req.mobile}
-                    </p>
+                    <div className="flex items-center gap-2 text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                      <span style={{ direction: 'ltr' }}>{req.mobile}</span>
+                      {req.email ? <span>• <span style={{ direction: 'ltr' }}>{req.email}</span></span> : null}
+                    </div>
                   </div>
                   {convertible && (
                     <button
@@ -910,6 +915,21 @@ export default function CommerceAdmin() {
                 value={form.mobile}
                 onChange={(e) => setForm((f) => ({ ...f, mobile: e.target.value }))}
                 maxLength={11}
+              />
+            </div>
+            <div>
+              <label htmlFor="inv-email" className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+                ایمیل
+              </label>
+              <input
+                id="inv-email"
+                type="email"
+                className="input-field w-full"
+                style={{ direction: 'ltr' }}
+                placeholder="name@example.com"
+                value={form.email}
+                onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
+                maxLength={255}
               />
             </div>
           </div>

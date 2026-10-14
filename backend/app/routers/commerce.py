@@ -22,6 +22,7 @@ Admin-only (not employee):
 Payment initiation/callback arrive in Task 3. Handlers stay thin; validation
 and persistence live in ``app.services.commerce``.
 """
+import re
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -112,6 +113,7 @@ class CommerceRequestCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     customer_name: str = Field(..., min_length=1, max_length=120)
+    email: str = Field(..., min_length=5, max_length=255)
     mobile: str
     messenger: str
     messenger_handle: str = Field(default="", max_length=100)
@@ -130,6 +132,14 @@ class CommerceRequestCreate(BaseModel):
         if not value.strip():
             raise ValueError("نام مشتری الزامی است")
         return value
+
+    @field_validator("email")
+    @classmethod
+    def _valid_email(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", cleaned):
+            raise ValueError("ایمیل معتبر الزامی است")
+        return cleaned
 
     @field_validator("address")
     @classmethod
@@ -238,6 +248,7 @@ def create_request(
         created = commerce_service.prepare_website_request(
             db,
             customer_name=body.customer_name,
+            email=body.email,
             mobile=body.mobile,
             messenger=body.messenger,
             messenger_handle=body.messenger_handle,
@@ -314,6 +325,7 @@ class InvoiceWrite(BaseModel):
     # PUT so a revision cannot silently re-point the invoice at another request.
     request_id: StrictInt | None = Field(default=None, ge=1)
     customer_name: str = Field(..., min_length=1, max_length=120)
+    email: str = Field(default="", max_length=255)
     mobile: str
     messenger: str = "telegram"
     messenger_handle: str = Field(default="", max_length=100)
@@ -369,6 +381,7 @@ def create_staff_invoice(
             db,
             request_id=body.request_id,
             customer_name=body.customer_name,
+            email=body.email,
             mobile=body.mobile,
             messenger=body.messenger,
             messenger_handle=body.messenger_handle,
@@ -432,6 +445,7 @@ def update_staff_invoice(
             db,
             invoice_id,
             customer_name=body.customer_name,
+            email=body.email,
             mobile=body.mobile,
             messenger=body.messenger,
             messenger_handle=body.messenger_handle,

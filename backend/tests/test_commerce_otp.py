@@ -84,8 +84,10 @@ def _wrong_code(code):
 def _request_payload(product_id, challenge_id, code, *, mobile=MOBILE, qty=1):
     return {
         "customer_name": "رضا",
+        "email": "reza@example.com",
         "mobile": mobile,
         "messenger": "telegram",
+        "address": "تهران، میدان آزادی، خیابان آزادی، پلاک ۱۰",
         "items": [{"product_id": product_id, "qty": qty}],
         "otp_challenge_id": challenge_id,
         "otp_code": code,

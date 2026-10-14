@@ -23,8 +23,11 @@ const MESSENGER_OPTIONS = [
   { value: 'bale', label: 'بله' },
 ];
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 const EMPTY_FORM = {
   customer_name: '',
+  email: '',
   mobile: '',
   messenger: 'telegram',
   messenger_handle: '',
@@ -137,10 +140,11 @@ export default function CheckoutRequest() {
   /** The exact public request payload — no prices, no surplus keys. */
   const buildPayload = useCallback(() => {
     const customerName = form.customer_name.trim();
+    const email = form.email.trim().toLowerCase();
     const mobile = normalizeDigits(form.mobile).replace(/\s+/g, '');
     const items = cartItems.map((item) => ({ product_id: item.id, qty: item.qty }));
     const address = form.address.trim();
-    const payload = { customer_name: customerName, mobile, messenger: form.messenger, address, items };
+    const payload = { customer_name: customerName, email, mobile, messenger: form.messenger, address, items };
     const handle = form.messenger_handle.trim();
     const note = form.note.trim();
     if (handle) payload.messenger_handle = handle;
@@ -254,6 +258,10 @@ export default function CheckoutRequest() {
     }
     if (!payload.address || payload.address.length < 5) {
       setError('نشانی تحویل را به صورت کامل وارد کنید (حداقل ۵ کاراکتر).');
+      return;
+    }
+    if (!payload.email || !EMAIL_RE.test(payload.email)) {
+      setError('لطفاً یک آدرس ایمیل معتبر وارد کنید.');
       return;
     }
     if (payload.items.length === 0) {
@@ -506,6 +514,29 @@ export default function CheckoutRequest() {
               maxLength={11}
               required
               autoComplete="tel"
+            />
+          </div>
+
+          <div>
+            <label
+              htmlFor="checkout-email"
+              className="block text-xs font-semibold mb-1.5"
+              style={{ color: 'var(--text-secondary)' }}
+            >
+              ایمیل (جهت ارسال فاکتور و وضعیت سفارش)
+            </label>
+            <input
+              id="checkout-email"
+              name="email"
+              type="email"
+              className="input-field w-full text-sm"
+              style={{ direction: 'ltr', textAlign: 'left' }}
+              value={form.email}
+              onChange={setField('email')}
+              placeholder="name@example.com"
+              maxLength={255}
+              required
+              autoComplete="email"
             />
           </div>
 

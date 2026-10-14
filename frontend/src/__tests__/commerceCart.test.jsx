@@ -145,6 +145,7 @@ describe('CheckoutRequest', () => {
     expect(await screen.findByText(/جاکلیدی تستی/)).toBeDefined();
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
+    fireEvent.change(screen.getByLabelText(/ایمیل/), { target: { value: 'reza@example.com' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
     fireEvent.change(screen.getByLabelText('پیامرسان'), { target: { value: 'telegram' } });
     fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
@@ -157,13 +158,14 @@ describe('CheckoutRequest', () => {
     await waitFor(() => expect(commerceApiMock.submitCommerceRequest).toHaveBeenCalledTimes(1));
     const payload = commerceApiMock.submitCommerceRequest.mock.calls[0][0];
     expect(payload.customer_name).toBe('رضا');
+    expect(payload.email).toBe('reza@example.com');
     expect(payload.mobile).toBe('09123456789');
     expect(payload.messenger).toBe('telegram');
     expect(payload.address).toBe('تهران، خیابان آزادی، پلاک ۱۰');
     expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
     // The cart is not an authoritative price source.
     expect(Object.keys(payload).sort()).toEqual(
-      ['address', 'customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
+      ['address', 'customer_name', 'email', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
     );
 
     expect(await screen.findByText(/REQ-ABC123/)).toBeDefined();
@@ -181,6 +183,7 @@ describe('CheckoutRequest', () => {
     await screen.findByText(/جاکلیدی تستی/);
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
+    fireEvent.change(screen.getByLabelText(/ایمیل/), { target: { value: 'reza@example.com' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
     fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
       target: { value: 'تهران، خیابان آزادی، پلاک ۱۰' },
@@ -231,6 +234,7 @@ describe('CheckoutRequest estimated total', () => {
     await screen.findByText(/جاکلیدی تستی/);
 
     fireEvent.change(screen.getByLabelText('نام و نام خانوادگی'), { target: { value: 'رضا' } });
+    fireEvent.change(screen.getByLabelText(/ایمیل/), { target: { value: 'reza@example.com' } });
     fireEvent.change(screen.getByLabelText('شماره موبایل'), { target: { value: '09123456789' } });
     fireEvent.change(screen.getByLabelText(/نشانی دقیق تحویل/), {
       target: { value: 'تهران، خیابان آزادی، پلاک ۱۰' },
@@ -241,7 +245,7 @@ describe('CheckoutRequest estimated total', () => {
     await waitFor(() => expect(commerceApiMock.submitCommerceRequest).toHaveBeenCalledTimes(1));
     const payload = commerceApiMock.submitCommerceRequest.mock.calls[0][0];
     expect(Object.keys(payload).sort()).toEqual(
-      ['address', 'customer_name', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
+      ['address', 'customer_name', 'email', 'items', 'messenger', 'mobile', 'otp_challenge_id', 'otp_code'].sort()
     );
     expect(payload.items).toEqual([{ product_id: 12, qty: 2 }]);
     expect(JSON.stringify(payload)).not.toContain('60000');

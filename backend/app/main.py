@@ -259,6 +259,23 @@ async def lifespan(app: FastAPI):
                     )
                 print("Added commerce_payment_attempts.reconciliation_required column.")
 
+        # Migration: commerce_requests.email + commerce_invoices.email
+        tables = inspect(engine).get_table_names()
+        if "commerce_requests" in tables:
+            req_cols = {c["name"] for c in inspect(engine).get_columns("commerce_requests")}
+            if "email" not in req_cols:
+                print("Adding commerce_requests.email column...")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE commerce_requests ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT ''"))
+                print("Added commerce_requests.email column.")
+        if "commerce_invoices" in tables:
+            inv_cols = {c["name"] for c in inspect(engine).get_columns("commerce_invoices")}
+            if "email" not in inv_cols:
+                print("Adding commerce_invoices.email column...")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE commerce_invoices ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT ''"))
+                print("Added commerce_invoices.email column.")
+
         # Migration: products.created_at
         product_cols = {c["name"] for c in inspector.get_columns("products")}
         if "created_at" not in product_cols:

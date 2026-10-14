@@ -153,6 +153,7 @@ def _website_request(client, auth_headers, product_id):
         f"{BASE}/requests",
         json={
             "customer_name": "رضا",
+            "email": "reza@example.com",
             "mobile": "09123456789",
             "messenger": "telegram",
             "address": "تهران، شهرک غرب، خیابان ایران زمین، پلاک ۱۲",

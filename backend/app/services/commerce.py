@@ -92,6 +92,7 @@ def prepare_website_request(
     *,
     customer_name: str,
     mobile: str,
+    email: str = "",
     messenger: str,
     messenger_handle: str = "",
     address: str = "",
@@ -114,6 +115,10 @@ def prepare_website_request(
 
     if not address or len(address.strip()) < 5:
         raise CommerceValidationError("نشانی تحویل الزامی است")
+
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise CommerceValidationError("ایمیل معتبر الزامی است")
 
     # Normalise + collapse to distinct product IDs.
     normalized: list[tuple[int, int]] = []
@@ -149,6 +154,7 @@ def prepare_website_request(
         receipt_id=generate_receipt_id(),
         customer_name=customer_name.strip(),
         mobile=mobile.strip(),
+        email=email,
         messenger=messenger,
         messenger_handle=(messenger_handle or "").strip(),
         address=(address or "").strip(),
@@ -189,6 +195,7 @@ def create_website_request(
     *,
     customer_name: str,
     mobile: str,
+    email: str = "",
     messenger: str,
     messenger_handle: str = "",
     address: str = "",
@@ -207,6 +214,7 @@ def create_website_request(
         db,
         customer_name=customer_name,
         mobile=mobile,
+        email=email,
         messenger=messenger,
         messenger_handle=messenger_handle,
         address=address,
@@ -244,6 +252,7 @@ def serialize_staff_request(request: CommerceRequest) -> dict:
         "id": request.id,
         "receipt_id": request.receipt_id,
         "customer_name": request.customer_name,
+        "email": getattr(request, "email", "") or "",
         "mobile": request.mobile,
         "messenger": request.messenger,
         "messenger_handle": request.messenger_handle,
@@ -556,6 +565,7 @@ def create_staff_invoice(
     *,
     customer_name: str,
     mobile: str,
+    email: str = "",
     items: list[dict],
     request_id: int | None = None,
     messenger: str = "telegram",
@@ -583,10 +593,15 @@ def create_staff_invoice(
         if linked_request.state != "pending_review":
             raise CommerceStateError("این درخواست قبلاً بررسی شده است")
 
+    inv_email = (email or "").strip().lower()
+    if not inv_email and linked_request:
+        inv_email = (getattr(linked_request, "email", "") or "").strip().lower()
+
     invoice = CommerceInvoice(
         request_id=linked_request.id if linked_request else None,
         customer_name=customer_name.strip(),
         mobile=mobile.strip(),
+        email=inv_email,
         messenger=messenger,
         messenger_handle=(messenger_handle or "").strip(),
         address=(address or "").strip(),
@@ -612,6 +627,7 @@ def update_staff_invoice(
     *,
     customer_name: str,
     mobile: str,
+    email: str = "",
     items: list[dict],
     messenger: str = "telegram",
     messenger_handle: str = "",
@@ -641,6 +657,8 @@ def update_staff_invoice(
 
     invoice.customer_name = customer_name.strip()
     invoice.mobile = mobile.strip()
+    if email:
+        invoice.email = email.strip().lower()
     invoice.messenger = messenger
     invoice.messenger_handle = (messenger_handle or "").strip()
     invoice.address = (address or "").strip()
@@ -782,6 +800,7 @@ def serialize_staff_invoice(invoice: CommerceInvoice) -> dict:
         "id": invoice.id,
         "request_id": invoice.request_id,
         "customer_name": invoice.customer_name,
+        "email": getattr(invoice, "email", "") or "",
         "mobile": invoice.mobile,
         "messenger": invoice.messenger,
         "messenger_handle": invoice.messenger_handle,

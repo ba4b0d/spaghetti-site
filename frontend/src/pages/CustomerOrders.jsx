@@ -591,7 +591,7 @@ export default function CustomerOrders() {
                 {maskedMobile ? (
                   <>
                     کد ۵ رقمی ارسال‌شده به شماره{' '}
-                    <span style={{ direction: 'ltr', fontFamily: 'monospace' }}>{maskedMobile}</span>{' '}
+                    <bdi dir="ltr" style={{ display: 'inline-block', fontFamily: 'monospace', fontWeight: 600 }}>{maskedMobile}</bdi>{' '}
                     را وارد کنید.
                   </>
                 ) : (
@@ -681,7 +681,9 @@ export default function CustomerOrders() {
           {maskedMobile ? (
             <p className="text-xs sm:text-sm" style={{ color: 'color-mix(in srgb, #fff 82%, transparent)' }}>
               سفارش‌های ثبت‌شده با شمارهٔ{' '}
-              <span style={{ direction: 'ltr', fontFamily: 'monospace' }}>{maskedMobile}</span>
+              <bdi dir="ltr" style={{ display: 'inline-block', fontFamily: 'monospace', fontWeight: 600 }}>
+                {maskedMobile}
+              </bdi>
             </p>
           ) : null}
         </div>

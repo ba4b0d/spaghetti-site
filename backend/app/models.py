@@ -318,6 +318,7 @@ class CommerceRequest(Base):
     receipt_id = Column(String(40), unique=True, nullable=False, index=True)  # opaque public receipt
     customer_name = Column(String(120), nullable=False)
     mobile = Column(String(11), nullable=False, index=True)   # Iranian 09xxxxxxxxx
+    email = Column(String(255), nullable=False, default="")
     messenger = Column(String(20), nullable=False)            # telegram | bale
     messenger_handle = Column(String(100), default="")
     address = Column(String(500), default="")
@@ -432,6 +433,7 @@ class CommerceInvoice(Base):
     )
     customer_name = Column(String(120), nullable=False, default="")
     mobile = Column(String(11), nullable=False, default="", index=True)
+    email = Column(String(255), nullable=False, default="")
     messenger = Column(String(20), nullable=False, default="telegram")
     messenger_handle = Column(String(100), default="")
     address = Column(String(500), default="")

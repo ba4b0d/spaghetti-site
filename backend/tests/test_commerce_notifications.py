@@ -532,6 +532,7 @@ def _create_product(client, auth_headers, *, name="محصول تستی", price=5
 def _request_payload(product_id, qty=1):
     return {
         "customer_name": "رضا",
+        "email": "reza@example.com",
         "mobile": "09123456789",
         "messenger": "telegram",
         "address": "تهران، خیابان آزادی، کوچه صادقی، پلاک ۱۵",
