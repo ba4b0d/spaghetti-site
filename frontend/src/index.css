@@ -2073,6 +2073,42 @@ body {
   transform: translateY(-1px);
 }
 
+.public-btn-telegram {
+  color: #fff !important;
+  background: linear-gradient(135deg, #2AABEE, #229ED9);
+  box-shadow: 0 4px 14px rgba(42, 171, 238, 0.35);
+}
+
+.public-btn-telegram:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(42, 171, 238, 0.45);
+  color: #fff !important;
+}
+
+.public-btn-bale {
+  color: #fff !important;
+  background: linear-gradient(135deg, #00A3E0, #0077A8);
+  box-shadow: 0 4px 14px rgba(0, 163, 224, 0.35);
+}
+
+.public-btn-bale:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(0, 163, 224, 0.45);
+  color: #fff !important;
+}
+
+.public-btn-phone {
+  color: #fff !important;
+  background: linear-gradient(135deg, #10B981, #059669);
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.35);
+}
+
+.public-btn-phone:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(16, 185, 129, 0.45);
+  color: #fff !important;
+}
+
 /* Legal pages (Privacy / Terms) — matches Contact / HowToOrder visual language:
    dark hero strip on the slate-900 body, light cards with dark text. */
 .public-page--legal {
