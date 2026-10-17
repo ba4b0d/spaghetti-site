@@ -37,7 +37,21 @@ from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.database import engine, SessionLocal, Base
-from app.models import Settings, Machine, Material, Product, Category, ProductImage, Order, ProductCategory, BlogPost, SiteView
+from app.models import (
+    Settings,
+    Machine,
+    Material,
+    Product,
+    Category,
+    ProductImage,
+    Order,
+    ProductCategory,
+    BlogPost,
+    SiteView,
+    AccountingCategory,
+    AccountingTransaction,
+    seed_accounting_categories,
+)
 from app.seed import seed_all
 from fastapi import HTTPException
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -75,6 +89,29 @@ from sqlalchemy import inspect, text
 # ── Uploads directory ────────────────────────────────────────────────
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ── Accounting module: schema + chart-of-accounts seed (Task 1) ───────
+# ``Base.metadata.create_all`` already creates these two tables on a fresh
+# database; the explicit existence check keeps a deployed database that predates
+# the accounting module in step without a manual migration, and is a no-op once
+# the tables exist. ``create_all`` never alters an existing table, so nothing
+# else here needs to change on a later startup.
+def ensure_accounting_schema_and_seed(db, bind=None) -> int:
+    """Create the accounting tables if missing, then seed default categories.
+
+    Idempotent — safe on every startup. Returns the number of seed categories
+    inserted (0 when the chart of accounts is already complete).
+    """
+    bind = bind if bind is not None else engine
+    tables = set(inspect(bind).get_table_names())
+    if "accounting_categories" not in tables:
+        print("Creating accounting_categories table...")
+        AccountingCategory.__table__.create(bind=bind)
+    if "accounting_transactions" not in tables:
+        print("Creating accounting_transactions table...")
+        AccountingTransaction.__table__.create(bind=bind)
+    return seed_accounting_categories(db)
 
 
 @asynccontextmanager
@@ -199,6 +236,13 @@ async def lifespan(app: FastAPI):
             print("Creating site_views table...")
             from app.models import SiteView
             SiteView.__table__.create(bind=engine)
+
+        # Migration: accounting tables + default chart of accounts (Task 1).
+        # Idempotent: creates the tables on a pre-accounting database and seeds
+        # any missing system «سرفصل» without duplicating or resurrecting rows.
+        seeded_categories = ensure_accounting_schema_and_seed(db)
+        if seeded_categories:
+            print(f"Seeded {seeded_categories} default accounting categories.")
 
         # Always sync: move any products with old category string but no m2m association
         from app.models import ProductCategory
