@@ -78,19 +78,15 @@ describe('HowToOrder Page', () => {
     });
   });
 
-  it('can switch to two-column view to show both site and messenger ordering simultaneously', async () => {
-    const user = userEvent.setup();
+  it('does not render two-column mode and only provides site and messenger tabs', () => {
     render(
       <MemoryRouter>
         <HowToOrder />
       </MemoryRouter>
     );
 
-    const twoColumnTab = screen.getByRole('tab', { name: /نمایش دو ستونه/ });
-    await user.click(twoColumnTab);
-
-    // Both site and messenger steps must be visible in two columns
-    expect(screen.getByText('انتخاب محصول و افزودن به سبد')).toBeDefined();
-    expect(screen.getByText('کد محصول را یادداشت نمایید.')).toBeDefined();
+    expect(screen.queryByRole('tab', { name: /نمایش دو ستونه/ })).toBeNull();
+    expect(screen.queryByText('روش اول: سفارش آنلاین از سایت')).toBeNull();
+    expect(screen.queryByText('روش دوم: سفارش در پیام‌رسان‌ها')).toBeNull();
   });
 });

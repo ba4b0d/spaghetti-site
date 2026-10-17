@@ -13,7 +13,6 @@ import {
   CreditCard,
   Send,
   Globe,
-  Columns,
 } from 'lucide-react';
 import { useSEO, buildWebSiteJsonLd } from '../lib/seo';
 import { getContact } from '../lib/api';
@@ -139,7 +138,7 @@ export default function HowToOrder() {
     jsonLd: buildWebSiteJsonLd(),
   });
 
-  const [activeTab, setActiveTab] = useState('site'); // 'site' | 'messenger' | 'columns'
+  const [activeTab, setActiveTab] = useState('site'); // 'site' | 'messenger'
   const [contact, setContact] = useState({
     telegram: 'spaghetti_print',
     bale: 'spaghetti_print',
@@ -163,7 +162,7 @@ export default function HowToOrder() {
   const baleHref = formatBaleHref(contact.bale);
 
   return (
-    <div className={`public-page ${activeTab === 'columns' ? 'public-page--wide' : ''}`} dir="rtl">
+    <div className="public-page" dir="rtl">
       <header className="public-page-hero public-page-hero--dark">
         <p className="public-page-kicker">راهنمای مشتریان</p>
         <h1 className="public-page-title public-page-title--white">نحوه ثبت سفارش</h1>
@@ -198,19 +197,6 @@ export default function HowToOrder() {
         >
           <MessageCircle size={17} />
           <span>سفارش در پیام‌رسان‌ها (تلگرام / بله)</span>
-        </button>
-
-        <button
-          type="button"
-          role="tab"
-          id="tab-columns"
-          aria-selected={activeTab === 'columns'}
-          aria-controls="panel-columns"
-          onClick={() => setActiveTab('columns')}
-          className={`order-mode-tab ${activeTab === 'columns' ? 'active' : ''}`}
-        >
-          <Columns size={17} />
-          <span>نمایش دو ستونه</span>
         </button>
       </div>
 
@@ -286,80 +272,6 @@ export default function HowToOrder() {
             <Link to="/" className="public-btn public-btn-secondary">
               <span>مشاهده کاتالوگ</span>
             </Link>
-          </div>
-        </div>
-      )}
-
-      {activeTab === 'columns' && (
-        <div id="panel-columns" role="tabpanel" aria-labelledby="tab-columns" className="animate-fade-in">
-          <div className="order-methods-grid">
-            {/* Column 1: Site */}
-            <div className="order-method-col">
-              <div className="order-method-header">
-                <div className="order-method-header-icon" aria-hidden="true">
-                  <Globe size={22} />
-                </div>
-                <div>
-                  <h2 className="order-method-title">روش اول: سفارش آنلاین از سایت</h2>
-                  <p className="order-method-subtitle">افزودن به سبد، تأیید پیامکی و پرداخت امن</p>
-                </div>
-              </div>
-
-              <StepsList steps={SITE_STEPS} variant="primary" />
-
-              <div className="order-method-actions">
-                <Link to="/" className="public-btn public-btn-primary">
-                  <ShoppingBag size={17} />
-                  <span>مشاهده کاتالوگ</span>
-                </Link>
-                <Link to="/checkout" className="public-btn public-btn-secondary">
-                  <span>سبد خرید</span>
-                </Link>
-              </div>
-            </div>
-
-            {/* Column 2: Messenger */}
-            <div className="order-method-col">
-              <div className="order-method-header">
-                <div className="order-method-header-icon order-method-header-icon--messenger" aria-hidden="true">
-                  <Send size={22} />
-                </div>
-                <div>
-                  <h2 className="order-method-title">روش دوم: سفارش در پیام‌رسان‌ها</h2>
-                  <p className="order-method-subtitle">هماهنگی و ارسال کد محصول در تلگرام و بله</p>
-                </div>
-              </div>
-
-              <StepsList steps={MESSENGER_STEPS} variant="messenger" />
-
-              <div className="order-method-actions">
-                <a
-                  href={telegramHref}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="public-btn public-btn-telegram"
-                >
-                  <Send size={17} />
-                  <span>ارسال پیام در تلگرام</span>
-                </a>
-                <a
-                  href={baleHref}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="public-btn public-btn-bale"
-                >
-                  <MessageCircle size={17} />
-                  <span>ارسال پیام در بله</span>
-                </a>
-              </div>
-            </div>
-          </div>
-
-          <div className="order-note mt-6">
-            <p className="order-note-title">نکات مهم:</p>
-            <p>• هنگام انتخاب محصول به ابعاد و مشخصات درج‌شده توجه فرمایید.</p>
-            <p>• تمامی محصولات در رنگ‌ها و ابعاد مختلف قابل سفارش هستند.</p>
-            <p>• در هر دو روش، پشتیبانی اسپاگتی پرینت در تمامی مراحل تولید و ارسال همراه شماست.</p>
           </div>
         </div>
       )}
