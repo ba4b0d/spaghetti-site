@@ -52,6 +52,19 @@ import Modal from '../components/Modal';
 import ShamsiDateField from '../components/ShamsiDateField';
 import StatCard from '../components/StatCard';
 
+function extractError(err, fallback = 'عملیات ناموفق بود. لطفاً دوباره تلاش کنید.') {
+  const data = err?.response?.data;
+  const detail = data?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0];
+    if (typeof first === 'string') return first;
+    if (first?.msg) return String(first.msg);
+  }
+  if (typeof data?.message === 'string' && data.message.trim()) return data.message;
+  return fallback;
+}
+
 const pad2 = (n) => String(n).padStart(2, '0');
 
 const PERIOD_OPTIONS = [
@@ -311,7 +324,7 @@ export default function Accounting() {
       const res = await uploadAccountingAttachment(fd);
       setField('attachment_url', res.data?.attachment_url || '');
     } catch (err) {
-      setFormError(err.response?.data?.detail || 'خطا در بارگذاری فایل رسید');
+      setFormError(extractError(err, 'خطا در بارگذاری فایل رسید'));
     } finally {
       setUploading(false);
       event.target.value = '';
@@ -370,7 +383,7 @@ export default function Accounting() {
       setEditing(null);
       await reload();
     } catch (err) {
-      setFormError(err.response?.data?.detail || 'خطا در ذخیره تراکنش');
+      setFormError(extractError(err, 'خطا در ذخیره تراکنش'));
     } finally {
       setSaving(false);
     }
@@ -383,7 +396,7 @@ export default function Accounting() {
       await deleteAccountingTransaction(txn.id);
       await reload();
     } catch (err) {
-      alert(err.response?.data?.detail || 'خطا در حذف تراکنش');
+      alert(extractError(err, 'خطا در حذف تراکنش'));
     }
   };
 
@@ -417,7 +430,7 @@ export default function Accounting() {
       setNewCat({ name: '', type: newCat.type });
       await loadCategories();
     } catch (err) {
-      setCatError(err.response?.data?.detail || 'خطا در ثبت سرفصل');
+      setCatError(extractError(err, 'خطا در ثبت سرفصل'));
     }
   };
 
@@ -429,7 +442,7 @@ export default function Accounting() {
       setEditingCatName('');
       await loadCategories();
     } catch (err) {
-      setCatError(err.response?.data?.detail || 'خطا در ویرایش سرفصل');
+      setCatError(extractError(err, 'خطا در ویرایش سرفصل'));
     }
   };
 
@@ -441,7 +454,7 @@ export default function Accounting() {
       await deleteAccountingCategory(category.id);
       await loadCategories();
     } catch (err) {
-      setCatError(err.response?.data?.detail || 'خطا در بایگانی سرفصل');
+      setCatError(extractError(err, 'خطا در بایگانی سرفصل'));
     }
   };
 

@@ -46,7 +46,7 @@ class CategoryUpdate(BaseModel):
 
 
 class TransactionCreate(BaseModel):
-    title: str
+    title: str = Field(..., max_length=200)
     category_id: int
     type: str
     amount_toman: int
