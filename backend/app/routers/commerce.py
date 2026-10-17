@@ -15,6 +15,9 @@ Staff:
     POST /api/v1/commerce/staff/requests/{id}/notify   re-emit request alert (retry)
     GET  /api/v1/commerce/staff/payments               payment queue needing attention
     POST /api/v1/commerce/staff/payments/{id}/reconcile            resolve a stuck attempt
+    POST /api/v1/commerce/admin/invoices/{id}/manual-pay           record an off-gateway
+                                                                  (card-to-card / cash)
+                                                                  payment + book the ledger
 
 Admin-only (not employee):
     POST /api/v1/commerce/staff/payments/{id}/recover-legacy-bitpay audited legacy BitPay settle
@@ -23,6 +26,8 @@ Payment initiation/callback arrive in Task 3. Handlers stay thin; validation
 and persistence live in ``app.services.commerce``.
 """
 import re
+from datetime import date
+
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -629,6 +634,95 @@ def resend_invoice_notification(
         f"ارسال مجدد اطلاع فاکتور #{invoice.id}",
     )
     return {"invoice_id": invoice.id, "event": event, "channels": channels}
+
+
+# ── Task 4: admin manual payment (کارت به کارت / نقدی) ────────────────
+
+class ManualPayRequest(BaseModel):
+    """Staff payload recording an off-gateway payment on an invoice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # ``card_to_card`` | ``cash`` — the two ways money actually arrives here.
+    payment_method: str
+    # Staff tracking/reference: the bank transfer reference, a receipt number,
+    # or empty for a cash payment that has none.
+    reference_code: str = Field(default="", max_length=100)
+    # Gregorian ``YYYY-MM-DD`` (the UI converts its Shamsi picker); the accounting
+    # row is booked on exactly this day, never "today".
+    paid_at: str
+    note: str = Field(default="", max_length=1000)
+
+    @field_validator("payment_method")
+    @classmethod
+    def _valid_payment_method(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if cleaned not in commerce_service.MANUAL_PAYMENT_METHODS:
+            raise ValueError("روش پرداخت باید کارت به کارت یا نقدی باشد")
+        return cleaned
+
+    @field_validator("reference_code")
+    @classmethod
+    def _clean_reference_code(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("note")
+    @classmethod
+    def _clean_note(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("paid_at")
+    @classmethod
+    def _valid_gregorian_date(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        try:
+            return date.fromisoformat(cleaned).isoformat()
+        except ValueError:
+            raise ValueError("تاریخ پرداخت باید به شکل YYYY-MM-DD باشد")
+
+
+@router.post("/admin/invoices/{invoice_id}/manual-pay")
+def pay_invoice_manually(
+    invoice_id: int,
+    body: ManualPayRequest,
+    user=Depends(require_staff_role),
+    db: Session = Depends(get_db),
+):
+    """Staff/Admin — record an off-gateway payment and sync the ledger.
+
+    Marks the invoice paid (refusing an already-paid one), records the manual
+    attempt, creates the fulfillment order for the production queue and books the
+    invoice-linked accounting income row — all in one commit, so the ledger can
+    never disagree with the invoice. The bookable ``invoice_id`` unique
+    constraint makes the ledger entry idempotent.
+    """
+    try:
+        invoice, _attempt = commerce_service.record_manual_payment(
+            db,
+            invoice_id,
+            payment_method=body.payment_method,
+            reference_code=body.reference_code,
+            paid_at=date.fromisoformat(body.paid_at),
+            note=body.note,
+            user_id=user.get("id"),
+        )
+    except commerce_service.CommerceStateError as exc:
+        # An already-paid invoice is a rejected staff request (400), not a
+        # conflicting transition: the same money must never be booked twice.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except (
+        commerce_service.CommerceValidationError,
+        commerce_service.CommerceNotFoundError,
+        commerce_service.CommerceGoneError,
+        commerce_service.CommerceConfigError,
+    ) as exc:
+        raise _validation_error(exc)
+
+    log_user(
+        user, db, "manual_pay", "commerce_invoice", invoice.id,
+        f"ثبت پرداخت دستی فاکتور #{invoice.id} ({body.payment_method})",
+    )
+    return commerce_service.serialize_staff_invoice(invoice)
 
 
 @router.get("/invoices/{token}")

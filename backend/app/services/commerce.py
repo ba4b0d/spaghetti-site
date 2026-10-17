@@ -16,8 +16,9 @@ import logging
 import os
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
@@ -27,6 +28,9 @@ from app.models import (
     COMMERCE_INVOICE_STATES,
     INVOICE_LINK_TTL_DAYS,
     MAX_INVOICE_TOTAL_TOMAN,
+    SYSTEM_SALES_INCOME_CATEGORY_NAME,
+    AccountingCategory,
+    AccountingTransaction,
     AuditLog,
     CommerceInvoice,
     CommerceInvoiceItem,
@@ -891,6 +895,23 @@ PROVIDER_ID_PREFIX = "INV"
 # since that would leak the token into the redirect/logs.
 PAYMENT_RESULT_PATH = "/pay/result"
 
+# ── Task 4: manual payments + invoice→accounting auto-sync ───────────
+# The workshop takes most of its money off-gateway (card-to-card transfers and
+# cash), so a staff member must be able to close an invoice by hand. Such an
+# attempt is tagged ``manual`` on the shared attempt table (never resolvable by
+# a gateway callback) and is booked against the matching account type.
+MANUAL_PAYMENT_PROVIDER = "manual"
+MANUAL_PAYMENT_METHODS = ("card_to_card", "cash")
+# Where the money actually landed, per the accounting module's ``account_type``
+# vocabulary (bank | cash | gateway | other).
+MANUAL_PAYMENT_ACCOUNT_TYPES = {"card_to_card": "bank", "cash": "cash"}
+# Online (gateway) settlements book against the gateway pocket.
+GATEWAY_ACCOUNT_TYPE = "gateway"
+# Transaction dates for gateway settlements are the *Tehran* calendar day, not
+# the UTC one: a payment at 02:00 Tehran is 22:30 UTC the previous day, and the
+# ledger must not file it under yesterday.
+TEHRAN_TZ = ZoneInfo("Asia/Tehran")
+
 
 class CommercePaymentError(Exception):
     """Provider/network failure while initiating or verifying (HTTP 502)."""
@@ -1061,7 +1082,11 @@ def _provider_label(provider: str | None) -> str:
 
 
 def _create_legacy_order(
-    db: Session, invoice: CommerceInvoice, *, provider: str | None = PAYMENT_PROVIDER_DIGIPAY
+    db: Session,
+    invoice: CommerceInvoice,
+    *,
+    provider: str | None = PAYMENT_PROVIDER_DIGIPAY,
+    note: str | None = None,
 ) -> Order:
     """One legacy Order (+items) mirroring the paid invoice, paid in full.
 
@@ -1069,7 +1094,9 @@ def _create_legacy_order(
     so the existing order board's accounting stays consistent. Status stays
     ``new``: fulfillment remains a staff decision, never auto-set to printing.
     ``provider`` selects the gateway named in the order note so a BitPay payment
-    is never mislabelled as DigiPay.
+    is never mislabelled as DigiPay. ``note`` overrides that generated note
+    entirely — a hand-recorded (card-to-card / cash) payment must never reach the
+    production queue claiming it was an online DigiPay payment.
     """
     items = list(invoice.items)
     qty = sum(i.qty for i in items) or 1
@@ -1081,7 +1108,8 @@ def _create_legacy_order(
         quoted_price=float(invoice.total_toman) / qty,
         paid_amount=float(invoice.total_toman),
         status="new",
-        notes=f"پرداخت آنلاین فاکتور #{invoice.id} از طریق {_provider_label(provider)}",
+        notes=note
+        or f"پرداخت آنلاین فاکتور #{invoice.id} از طریق {_provider_label(provider)}",
         is_active=True,
     )
     db.add(order)
@@ -1155,6 +1183,100 @@ def _mark_verified_needs_reconciliation(
     attempt.last_error = _short(reason)
     db.commit()
     db.refresh(attempt)
+
+
+def _tehran_today() -> date:
+    """Today's *Tehran* calendar date (the ledger's booking day)."""
+    return datetime.now(TEHRAN_TZ).date()
+
+
+def _resolve_sales_income_category(db: Session) -> AccountingCategory | None:
+    """The system income «سرفصل» every invoice income is booked against.
+
+    Prefers the seeded system category (``SYSTEM_SALES_INCOME_CATEGORY_NAME``);
+    if a deployment's chart of accounts lacks it, any *active* income category is
+    used so revenue is still recorded rather than silently dropped. Returns
+    ``None`` only when no income category exists at all — the caller must then
+    skip the booking instead of failing the payment it just took.
+    """
+    category = (
+        db.query(AccountingCategory)
+        .filter(
+            AccountingCategory.name == SYSTEM_SALES_INCOME_CATEGORY_NAME,
+            AccountingCategory.type == "income",
+        )
+        .order_by(AccountingCategory.id)
+        .first()
+    )
+    if category is not None:
+        return category
+    return (
+        db.query(AccountingCategory)
+        .filter(
+            AccountingCategory.type == "income",
+            AccountingCategory.is_active.is_(True),
+        )
+        .order_by(AccountingCategory.id)
+        .first()
+    )
+
+
+def _sync_invoice_income_transaction(
+    db: Session,
+    invoice: CommerceInvoice,
+    *,
+    account_type: str,
+    transaction_date: date,
+    reference_code: str = "",
+    description: str = "",
+    order_id: int | None = None,
+    created_by_user_id: int | None = None,
+) -> AccountingTransaction | None:
+    """Book the invoice→income ledger row exactly once (idempotent), or skip.
+
+    The pre-check reads the existing row for ``invoice_id``; the table's UNIQUE
+    ``invoice_id`` constraint is the real backstop, so a replayed callback or a
+    second manual confirmation can never double-book the same invoice. Adds the
+    row to the caller's session *without committing*: the booking is committed
+    atomically with the payment it belongs to, so the ledger can never show
+    income for a settlement that rolled back.
+    """
+    existing = (
+        db.query(AccountingTransaction)
+        .filter(AccountingTransaction.invoice_id == invoice.id)
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    category = _resolve_sales_income_category(db)
+    if category is None:  # pragma: no cover - defensive: chart of accounts empty
+        _logger.warning(
+            "accounting sync skipped: no income category for invoice %s", invoice.id
+        )
+        return None
+
+    txn = AccountingTransaction(
+        title=f"فروش فاکتور #{invoice.id} - {invoice.customer_name}",
+        category_id=category.id,
+        type="income",
+        amount_toman=invoice.total_toman,
+        transaction_date=transaction_date,
+        account_type=account_type,
+        reference_code=(reference_code or "")[:100],
+        description=(description or "")[:1000],
+        invoice_id=invoice.id,
+        order_id=order_id if order_id is not None else invoice.order_id,
+        created_by_user_id=created_by_user_id,
+    )
+    db.add(txn)
+    _logger.info(
+        "accounting sync: invoice %s booked as income (%s) amount=%s",
+        invoice.id,
+        account_type,
+        invoice.total_toman,
+    )
+    return txn
 
 
 def settle_verified_payment(
@@ -1243,6 +1365,22 @@ def settle_verified_payment(
         order = _create_legacy_order(db, invoice, provider=attempt.provider)
         invoice.order_id = order.id
 
+    # Task 4 auto-sync: book the invoice's income in the SAME transaction as the
+    # settlement, so the ledger shows revenue exactly when the money is claimed.
+    # Idempotent (the row's UNIQUE ``invoice_id``) and skipped silently when the
+    # deployment has no income category — a missing chart of accounts must never
+    # fail a payment the gateway already confirmed.
+    _sync_invoice_income_transaction(
+        db,
+        invoice,
+        account_type=GATEWAY_ACCOUNT_TYPE,
+        transaction_date=_tehran_today(),
+        reference_code=str(
+            attempt.provider_trans_id or getattr(attempt, "id_get", None) or ""
+        ),
+        order_id=invoice.order_id,
+    )
+
     attempt.state = "verified"
     attempt.tracking_code = tracking_code
     attempt.verified_at = _now()
@@ -1264,6 +1402,108 @@ def settle_verified_payment(
         background_tasks=background_tasks,
     )
     return attempt
+
+
+def record_manual_payment(
+    db: Session,
+    invoice_id: int,
+    payment_method: str,
+    reference_code: str,
+    paid_at: date,
+    note: str = "",
+    user_id: int | None = None,
+) -> tuple[CommerceInvoice, CommercePaymentAttempt]:
+    """Staff — record an off-gateway payment and close the invoice.
+
+    The workshop's normal money is a card-to-card transfer or cash, so this is
+    the authoritative staff action that marks an invoice ``paid``. One commit
+    performs the whole settlement:
+
+    1. ``invoice.state = 'paid'`` (refused when the invoice is already paid —
+       the ledger must never be double-booked);
+    2. a ``CommercePaymentAttempt`` tagged ``provider='manual'`` with the staff
+       reference/tracking code, ``amount_rial`` converted exactly once from
+       Toman, and both timestamps stamped from the staff-supplied ``paid_at``;
+    3. the legacy fulfillment ``Order`` for the production queue (only when the
+       invoice has none yet) — with a note naming the manual method, so the
+       board can never claim an online DigiPay payment that never happened;
+    4. the invoice-linked accounting income row (``account_type`` = ``bank`` for
+       card-to-card, ``cash`` for cash; ``transaction_date = paid_at``).
+
+    A paid-invoice alert is emitted *after* the commit (best-effort, never
+    affecting the transaction). Returns ``(invoice, attempt)``.
+    """
+    invoice = _get_invoice(db, invoice_id)
+
+    if payment_method not in MANUAL_PAYMENT_METHODS:
+        raise CommerceValidationError("روش پرداخت نامعتبر است")
+    if invoice.state == "paid":
+        raise CommerceStateError("فاکتور قبلاً پرداخت شده است")
+    if isinstance(paid_at, datetime) or not isinstance(paid_at, date):
+        raise CommerceValidationError("تاریخ پرداخت نامعتبر است")
+
+    reference_code = (reference_code or "").strip()[:100]
+    note = (note or "").strip()
+    paid_datetime = datetime.combine(paid_at, datetime.min.time(), tzinfo=timezone.utc)
+
+    invoice.state = "paid"
+    invoice.updated_at = _now()
+
+    attempt = CommercePaymentAttempt(
+        invoice_id=invoice.id,
+        provider=MANUAL_PAYMENT_PROVIDER,
+        state="verified",
+        # Unique, gateway-proof merchant reference: a callback can only ever
+        # resolve an attempt through ``provider_id`` matching a stored id, and
+        # this one is never sent to any gateway.
+        provider_id=f"MANUAL-{invoice.id}-{secrets.token_hex(8)}",
+        amount_rial=toman_to_rial(invoice.total_toman),
+        invoice_revision=invoice.revision,
+        payment_method=payment_method,
+        provider_trans_id=reference_code or None,
+        tracking_code=reference_code or None,
+        verified_at=paid_datetime,
+        created_at=paid_datetime,
+        reconciliation_required=False,
+    )
+    db.add(attempt)
+    db.flush()
+
+    if invoice.order_id is None:
+        order = _create_legacy_order(
+            db,
+            invoice,
+            note=(
+                f"پرداخت دستی ({_manual_payment_label(payment_method)}) "
+                f"فاکتور #{invoice.id}"
+            ),
+        )
+        invoice.order_id = order.id
+
+    _sync_invoice_income_transaction(
+        db,
+        invoice,
+        account_type=MANUAL_PAYMENT_ACCOUNT_TYPES[payment_method],
+        transaction_date=paid_at,
+        reference_code=reference_code,
+        description=note or f"ثبت پرداخت دستی ({payment_method})",
+        order_id=invoice.order_id,
+        created_by_user_id=user_id,
+    )
+
+    db.commit()
+    db.refresh(invoice)
+    db.refresh(attempt)
+
+    # After-commit, best-effort: the same «پرداخت موفق فاکتور» alert an online
+    # settlement fires, so staff learn about a hand-recorded payment too.
+    _emit_admin_notification(commerce_notifications.EVENT_PAYMENT_VERIFIED, invoice)
+    return invoice, attempt
+
+
+def _manual_payment_label(payment_method: str) -> str:
+    """Persian label for the manual payment method (order note / UI)."""
+    return "کارت به کارت" if payment_method == "card_to_card" else "نقدی"
 
 
 def _int_or_none(value) -> int | None:
