@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { X, ShoppingBag, Trash2, Plus, Minus, ArrowRight } from 'lucide-react';
 import { getCatalog } from '../lib/api';
 import { readCart, updateQuantity, removeItem, subscribe, cartCount } from '../lib/cart';
+import { formatPrice } from '../lib/utils';
 import { Z_INDEX_SIDEBAR, Z_INDEX_OVERLAY } from '../lib/constants';
 
 /**
@@ -146,6 +147,22 @@ export default function CartDrawer({ open, onClose }) {
   }, [catalog]);
 
   const total = cartCount(items);
+
+  // Indicative (never authoritative) cart total: sums qty × the catalogue's
+  // display price. The server confirms the final amount after staff review, so
+  // lines with no published price are reported as "call for price" rather than
+  // guessed.
+  const estimate = useMemo(() => {
+    let sum = 0;
+    let unpricedCount = 0;
+    for (const item of items) {
+      const product = byId.get(Number(item.id));
+      const unit = Number(product?.final_price || product?.suggested_price || 0);
+      if (unit > 0) sum += unit * item.qty;
+      else unpricedCount += 1;
+    }
+    return { sum, unpricedCount };
+  }, [items, byId]);
 
   const changeQty = useCallback((id, qty) => {
     setItems(updateQuantity(id, qty));
@@ -311,6 +328,25 @@ export default function CartDrawer({ open, onClose }) {
         </div>
 
         <div className="p-4 border-t space-y-2 shrink-0" style={{ borderColor: 'var(--border-color)' }}>
+          {items.length > 0 ? (
+            <div className="flex items-center justify-between gap-2 text-sm pb-1">
+              <span style={{ color: 'var(--text-muted)' }}>تخمین قیمت</span>
+              <span
+                className="font-bold tabular-nums"
+                style={{ color: 'var(--text-primary)' }}
+                data-testid="cart-estimated-total"
+              >
+                {estimate.unpricedCount === items.length
+                  ? 'قیمت تماس بگیرید'
+                  : formatPrice(estimate.sum)}
+              </span>
+            </div>
+          ) : null}
+          {items.length > 0 && estimate.unpricedCount > 0 && estimate.unpricedCount < items.length ? (
+            <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+              قیمت {estimate.unpricedCount} قلم از اقلام شما پس از بررسی اعلام میشود.
+            </p>
+          ) : null}
           <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
             مبلغ نهایی پس از بررسی توسط تیم پشتیبانی اعلام و تأیید میشود.
           </p>

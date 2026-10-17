@@ -1,0 +1,1259 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
+import {
+  AlertTriangle,
+  ArrowRight,
+  Check,
+  Clock,
+  CreditCard,
+  FileText,
+  Inbox,
+  Loader2,
+  LogOut,
+  Mail,
+  MapPin,
+  Package,
+  Phone,
+  Receipt,
+  RotateCcw,
+  Send,
+  ShieldCheck,
+  ShoppingBag,
+  User,
+  X,
+} from 'lucide-react';
+import { formatPrice } from '../lib/utils';
+import { useNoReferrerPolicy } from '../hooks/useNoReferrerPolicy';
+import {
+  getCustomerHistory,
+  getCustomerProfile,
+  payCustomerInvoice,
+  requestHistoryOtp,
+  signOutHistory,
+  verifyHistoryOtp,
+} from '../lib/commerceHistoryApi';
+import {
+  clearHistorySession,
+  readHistorySession,
+  writeHistorySession,
+} from '../lib/commerceHistorySession';
+
+/**
+ * Public one-visit «سفارش‌های من» page.
+ *
+ * A customer proves ownership of a mobile number with an SMS code and sees the
+ * website requests and staff-created invoices tied to *that exact number* — no
+ * account, no password, no persistent login. The verified bearer lives only in
+ * this tab's ``sessionStorage`` (see ``commerceHistorySession``); it is never
+ * put in a URL, a cookie, ``localStorage`` or a service-worker cache, and a
+ * sign-out or an invalid session wipes it *and* the in-memory history before
+ * anything else.
+ *
+ * An approved invoice the customer owns can be paid directly: the card shows a
+ * «پرداخت آنلاین» button that opens a gateway-picker modal and, on success,
+ * hands the browser to the provider's HTTPS portal. Nothing is inferred from a
+ * redirect query parameter; statuses come from the server, and paid/revoked
+ * entries have no action at all.
+ */
+
+const MOBILE_RE = /^09\d{9}$/;
+const PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
+const ARABIC_DIGITS = '٠١٢٣٤٥٦٧٨٩';
+const PAGE_SIZE = 20;
+
+/** Server-owned states → customer-safe Persian labels. */
+export const HISTORY_STATE_LABELS = Object.freeze({
+  pending_review: 'در حال بررسی',
+  converted: 'تبدیل‌شده به فاکتور',
+  draft: 'پیش‌نویس',
+  approved: 'تأییدشده',
+  paid: 'پرداخت‌شده',
+  revoked: 'لغو‌شده',
+});
+
+/** Neutral fallback for any state the client does not recognise. */
+export const UNKNOWN_STATE_LABEL = 'وضعیت نامشخص';
+
+/** Selectable gateways, in the order the modal renders them. */
+export const PAYMENT_GATEWAYS = Object.freeze([
+  {
+    value: 'digipay',
+    label: 'درگاه پرداخت دیجی‌پی (DigiPay)',
+    hint: 'پیش‌فرض — کارت‌های عضو شتاب و اعتباری',
+  },
+  {
+    value: 'bitpay',
+    label: 'درگاه پرداخت بیت‌پی (BitPay)',
+    hint: 'کارت‌های عضو شتاب و ارز دیجیتال',
+  },
+]);
+
+export const DEFAULT_GATEWAY = 'digipay';
+
+export const PAYMENT_START_ERROR =
+  'شروع پرداخت ناموفق بود؛ لطفاً دوباره تلاش کنید.';
+
+export const RATE_LIMIT_MESSAGE =
+  'تعداد درخواست‌ها بیش از حد مجاز است؛ لطفاً کمی بعد دوباره تلاش کنید.';
+
+const KIND_LABELS = { request: 'درخواست از سایت', invoice: 'فاکتور' };
+const KIND_ICONS = { request: Package, invoice: Receipt };
+
+/** Normalise Persian/Arabic-Indic digits to ASCII so ۰۹۱۲… validates. */
+function normalizeDigits(value) {
+  return String(value ?? '').replace(/[۰-۹٠-٩]/g, (ch) => {
+    const fa = PERSIAN_DIGITS.indexOf(ch);
+    if (fa > -1) return String(fa);
+    const ar = ARABIC_DIGITS.indexOf(ch);
+    if (ar > -1) return String(ar);
+    return ch;
+  });
+}
+
+const cleanMobile = (value) => normalizeDigits(value).replace(/\s+/g, '');
+
+/** Display-safe masking of a canonical 09… mobile — never the raw number. */
+export function maskMobile(value) {
+  const clean = cleanMobile(value);
+  return MOBILE_RE.test(clean) ? `${clean.slice(0, 4)}***${clean.slice(-4)}` : '';
+}
+
+/** Fallback label used when no masked form is available; never the raw number. */
+export const GENERIC_MOBILE_LABEL = 'شماره شما';
+
+/** Human-readable message from an Axios/FastAPI error. */
+function extractError(err, fallback) {
+  const data = err?.response?.data;
+  const detail = data?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0];
+    if (typeof first === 'string' && first.trim()) return first;
+    if (first?.msg) return String(first.msg);
+  }
+  if (typeof data?.message === 'string' && data.message.trim()) return data.message;
+  return fallback;
+}
+
+const isCancel = (err) => err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED';
+
+const stateLabel = (state) => HISTORY_STATE_LABELS[state] || UNKNOWN_STATE_LABEL;
+
+const STATE_TONES = {
+  pending_review: { color: '#d97706', bg: 'rgba(245,158,11,0.15)' },
+  converted: { color: '#16a34a', bg: 'rgba(34,197,94,0.15)' },
+  draft: { color: '#64748b', bg: 'rgba(100,116,139,0.15)' },
+  approved: { color: '#16a34a', bg: 'rgba(34,197,94,0.15)' },
+  paid: { color: '#0ea5e9', bg: 'rgba(14,165,233,0.15)' },
+  revoked: { color: '#ef4444', bg: 'rgba(239,68,68,0.12)' },
+};
+const NEUTRAL_TONE = { color: '#64748b', bg: 'rgba(100,116,139,0.15)' };
+
+function formatDate(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleDateString('fa-IR');
+}
+
+function ErrorBox({ children }) {
+  return (
+    <div
+      role="alert"
+      className="p-3 rounded-xl text-xs leading-relaxed border"
+      style={{
+        backgroundColor: 'rgba(239, 68, 68, 0.08)',
+        borderColor: 'rgba(239, 68, 68, 0.35)',
+        color: '#ef4444',
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Gateway picker + price breakdown for one approved invoice.
+ *
+ * The modal is presentation + one call: it never decides whether a payment is
+ * allowed — the server does. On success it hands the browser to the provider's
+ * HTTPS portal with `window.location.href`; a 401 is surfaced to the page as a
+ * lost session instead of a generic error.
+ */
+export function PayInvoiceModal({ entry, token, onClose, onSessionLost }) {
+  const [gateway, setGateway] = useState(DEFAULT_GATEWAY);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const shipping = Number(entry?.shipping_toman) || 0;
+  const total = Number(entry?.total_toman) || 0;
+  const items = Array.isArray(entry?.items) ? entry.items : [];
+  const summedItems = items.reduce(
+    (sum, item) => sum + (Number(item?.line_total_toman) || 0),
+    0
+  );
+  // Prefer the frozen line totals; fall back to total − shipping when a legacy
+  // invoice carries no per-line amount.
+  const itemsTotal = summedItems > 0 ? summedItems : Math.max(total - shipping, 0);
+
+  const close = () => {
+    if (busy) return;
+    onClose?.();
+  };
+
+  const submit = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await payCustomerInvoice(token, entry?.id, gateway);
+      const url = res?.data?.redirect_url;
+      if (typeof url !== 'string' || !url.trim()) {
+        setError(PAYMENT_START_ERROR);
+        return;
+      }
+      // Leave the SPA for the gateway's HTTPS portal.
+      window.location.href = url;
+    } catch (err) {
+      if (err?.response?.status === 401) {
+        onSessionLost?.();
+        return;
+      }
+      setError(extractError(err, PAYMENT_START_ERROR));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6"
+      style={{ backgroundColor: 'rgba(2, 6, 23, 0.6)' }}
+      role="presentation"
+      onClick={close}
+    >
+      <div
+        data-testid="pay-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`پرداخت آنلاین فاکتور #${entry?.id}`}
+        className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-2xl border p-5 space-y-4 animate-fade-in"
+        style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="flex items-start justify-between gap-2">
+          <h2 className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>
+            پرداخت آنلاین فاکتور #{entry?.id}
+          </h2>
+          <button
+            type="button"
+            onClick={close}
+            data-testid="pay-modal-close"
+            aria-label="بستن"
+            disabled={busy}
+            className="shrink-0 p-1 rounded-lg"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <X size={18} />
+          </button>
+        </header>
+
+        <div
+          data-testid="pay-breakdown"
+          className="rounded-xl border p-3 space-y-1.5 text-xs"
+          style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}
+        >
+          <div className="flex items-center justify-between" style={{ color: 'var(--text-secondary)' }}>
+            <span>مبلغ اقلام سفارش</span>
+            <span className="tabular-nums font-semibold">{formatPrice(itemsTotal)}</span>
+          </div>
+          <div className="flex items-center justify-between" style={{ color: 'var(--text-secondary)' }}>
+            <span>هزینه بسته‌بندی و ارسال</span>
+            <span className="tabular-nums font-semibold">{formatPrice(shipping)}</span>
+          </div>
+          <div
+            className="flex items-center justify-between pt-1.5 border-t"
+            style={{ borderColor: 'var(--border-color)', color: 'var(--text-primary)' }}
+          >
+            <span className="font-bold">مبلغ کل قابل پرداخت</span>
+            <span data-testid="pay-total" className="tabular-nums font-black">
+              {formatPrice(total)}
+            </span>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <p className="text-xs font-semibold" style={{ color: 'var(--text-secondary)' }}>
+            انتخاب درگاه پرداخت
+          </p>
+          {PAYMENT_GATEWAYS.map((option) => {
+            const selected = gateway === option.value;
+            return (
+              <label
+                key={option.value}
+                data-testid={`gateway-${option.value}`}
+                className="flex items-start gap-2.5 p-3 rounded-xl border cursor-pointer"
+                style={{
+                  borderColor: selected
+                    ? 'var(--brand-orange, #ff9a3d)'
+                    : 'var(--border-color)',
+                  backgroundColor: selected ? 'rgba(255, 154, 61, 0.07)' : 'var(--bg-secondary)',
+                }}
+              >
+                <input
+                  type="radio"
+                  name="pay-gateway"
+                  value={option.value}
+                  checked={selected}
+                  disabled={busy}
+                  onChange={() => setGateway(option.value)}
+                  className="mt-0.5 accent-[var(--brand-orange,#ff9a3d)]"
+                />
+                <span className="min-w-0">
+                  <span
+                    className="block text-xs font-bold"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    {option.label}
+                  </span>
+                  <span className="block text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                    {option.hint}
+                  </span>
+                </span>
+                {selected ? (
+                  <Check size={15} className="ml-auto shrink-0" style={{ color: 'var(--brand-orange, #ff9a3d)' }} />
+                ) : null}
+              </label>
+            );
+          })}
+        </div>
+
+        {error ? <ErrorBox>{error}</ErrorBox> : null}
+
+        <button
+          type="button"
+          data-testid="pay-submit"
+          onClick={submit}
+          disabled={busy}
+          className="btn-primary w-full inline-flex items-center justify-center gap-2"
+          style={busy ? { opacity: 0.7, pointerEvents: 'none' } : undefined}
+        >
+          {busy ? <Loader2 size={17} className="animate-spin" /> : <CreditCard size={17} />}
+          {busy ? 'در حال انتقال…' : 'انتقال به درگاه بانکی'}
+        </button>
+
+        <button
+          type="button"
+          onClick={close}
+          disabled={busy}
+          className="w-full text-xs font-medium py-1"
+          style={{ color: 'var(--text-secondary)' }}
+        >
+          انصراف
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function HistoryEntryCard({ entry, onPay }) {
+  const kind = entry?.kind === 'invoice' ? 'invoice' : 'request';
+  const state = entry?.state;
+  const label = stateLabel(state);
+  const tone = STATE_TONES[state] || NEUTRAL_TONE;
+  const items = Array.isArray(entry?.items) ? entry.items : [];
+  const KindIcon = KIND_ICONS[kind];
+  // Only an approved/paid invoice exposes frozen money; everything else shows
+  // names and quantities as a snapshot, never as a final price.
+  const showTotals = state === 'approved' || state === 'paid';
+  const created = formatDate(entry?.created_at);
+
+  return (
+    <article
+      data-testid={`entry-${kind}-${entry?.id}`}
+      className="card p-4 rounded-2xl border space-y-3"
+      style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
+    >
+      <header className="flex items-start justify-between gap-2">
+        <div className="flex items-start gap-2.5 min-w-0">
+          <span
+            className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5"
+            style={{ backgroundColor: 'var(--bg-secondary)', color: 'var(--brand-orange, #ff9a3d)' }}
+            aria-hidden="true"
+          >
+            <KindIcon size={16} />
+          </span>
+          <div className="min-w-0">
+            <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>
+              {KIND_LABELS[kind]}
+            </p>
+            {created ? (
+              <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                {created}
+              </p>
+            ) : null}
+          </div>
+        </div>
+        <span
+          className="text-[11px] px-2 py-0.5 rounded-full font-bold shrink-0"
+          style={{ backgroundColor: tone.bg, color: tone.color }}
+        >
+          {label}
+        </span>
+      </header>
+
+      {kind === 'invoice' && entry?.request_id != null ? (
+        <p
+          data-testid={`entry-link-${kind}-${entry?.id}`}
+          className="text-[11px]"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          مرتبط با درخواست #{entry.request_id}
+        </p>
+      ) : null}
+
+      <ul className="space-y-1.5">
+        {items.map((item, index) => (
+          <li
+            key={`${item?.name}-${index}`}
+            className="flex items-center justify-between gap-2 text-xs"
+            style={{ color: 'var(--text-secondary)' }}
+          >
+            <span className="min-w-0 leading-snug">
+              <span className="font-semibold tabular-nums">{item?.qty}×</span>{' '}
+              {item?.name || '—'}
+            </span>
+            {showTotals && item?.line_total_toman != null ? (
+              <span className="tabular-nums shrink-0" style={{ color: 'var(--text-primary)' }}>
+                {formatPrice(item.line_total_toman)}
+              </span>
+            ) : null}
+          </li>
+        ))}
+        {items.length === 0 ? (
+          <li className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            اقلامی ثبت نشده است.
+          </li>
+        ) : null}
+      </ul>
+
+      {showTotals && entry?.total_toman != null ? (
+        <div
+          data-testid={`entry-total-${kind}-${entry?.id}`}
+          className="rounded-xl border p-3 space-y-1.5 text-xs"
+          style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}
+        >
+          <div className="flex items-center justify-between" style={{ color: 'var(--text-secondary)' }}>
+            <span>هزینه بسته‌بندی و ارسال</span>
+            <span className="tabular-nums font-semibold">{formatPrice(entry.shipping_toman || 0)}</span>
+          </div>
+          <div
+            className="flex items-center justify-between pt-1.5 border-t"
+            style={{ borderColor: 'var(--border-color)', color: 'var(--text-primary)' }}
+          >
+            <span className="font-bold">مبلغ کل</span>
+            <span className="tabular-nums font-black">{formatPrice(entry.total_toman)}</span>
+          </div>
+        </div>
+      ) : null}
+
+      {state === 'approved' ? (
+        <div
+          className="rounded-xl border p-3 space-y-2"
+          style={{
+            borderColor: 'color-mix(in srgb, var(--brand-orange, #ff9a3d) 30%, var(--border-color))',
+            backgroundColor: 'rgba(255, 154, 61, 0.05)',
+          }}
+        >
+          <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+            این فاکتور آمادهٔ پرداخت است؛ با انتخاب درگاه، مستقیم به صفحهٔ پرداخت منتقل می‌شوید.
+          </p>
+          <button
+            type="button"
+            data-testid={`pay-online-btn-${entry?.id}`}
+            onClick={() => onPay?.(entry)}
+            className="btn-primary w-full inline-flex items-center justify-center gap-2"
+          >
+            <CreditCard size={16} />
+            پرداخت آنلاین
+          </button>
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+export default function CustomerOrders() {
+  // The page renders a customer's own data; never let a referrer leak it.
+  useNoReferrerPolicy();
+
+  const [phase, setPhase] = useState('verify'); // verify | otp | list
+  const [token, setToken] = useState(null);
+  const [mobile, setMobile] = useState('');
+  const [maskedMobile, setMaskedMobile] = useState('');
+  const [formError, setFormError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const [otp, setOtp] = useState(null);
+  const [code, setCode] = useState('');
+  const [otpError, setOtpError] = useState(null);
+  const [resendIn, setResendIn] = useState(0);
+
+  const [items, setItems] = useState([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [listStatus, setListStatus] = useState('idle'); // idle | loading | ready | error
+  const [listError, setListError] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [activeTab, setActiveTab] = useState('orders'); // orders | profile
+  const [payTarget, setPayTarget] = useState(null);
+
+  const mountedRef = useRef(true);
+  const abortRef = useRef(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  /** Drop everything sensitive and go back to the verification screen. */
+  const resetToVerify = useCallback((message = null) => {
+    abortRef.current?.abort();
+    clearHistorySession();
+    setToken(null);
+    setItems([]);
+    setHasMore(false);
+    setListStatus('idle');
+    setListError(null);
+    setProfile(null);
+    setActiveTab('orders');
+    setPayTarget(null);
+    setOtp(null);
+    setCode('');
+    setMaskedMobile('');
+    setPhase('verify');
+    setFormError(message);
+  }, []);
+
+  const handleSessionLost = useCallback(() => {
+    resetToVerify('نشست شما معتبر نیست؛ لطفاً دوباره شمارهٔ خود را تأیید کنید.');
+  }, [resetToVerify]);
+
+  const loadFirstPage = useCallback(
+    (bearer) => {
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setListStatus('loading');
+      setListError(null);
+
+      // Fetch profile identity and addresses
+      getCustomerProfile(bearer, { signal: controller.signal })
+        .then((res) => {
+          if (!mountedRef.current || controller.signal.aborted) return;
+          setProfile(res?.data || null);
+        })
+        .catch(() => {});
+
+      return getCustomerHistory(bearer, { limit: PAGE_SIZE, offset: 0 }, { signal: controller.signal })
+        .then((res) => {
+          if (!mountedRef.current || controller.signal.aborted) return;
+          const data = res?.data || {};
+          setItems(Array.isArray(data.items) ? data.items : []);
+          setHasMore(Boolean(data.has_more));
+          setListStatus('ready');
+        })
+        .catch((err) => {
+          if (controller.signal.aborted || isCancel(err) || !mountedRef.current) return;
+          if (err?.response?.status === 401) {
+            handleSessionLost();
+            return;
+          }
+          setListError(extractError(err, 'بارگذاری سفارش‌ها ناموفق بود؛ لطفاً دوباره تلاش کنید.'));
+          setListStatus('error');
+        });
+    },
+    [handleSessionLost]
+  );
+
+  // On mount: a live tab session jumps straight to the list; anything else
+  // (absent, malformed or expired) falls back to the OTP screen.
+  useEffect(() => {
+    const session = readHistorySession();
+    if (session) {
+      setToken(session.token);
+      setPhase('list');
+      loadFirstPage(session.token);
+    }
+  }, [loadFirstPage]);
+
+  // Resend countdown, cleaned up on unmount or when the challenge changes.
+  useEffect(() => {
+    if (phase !== 'otp') return undefined;
+    setResendIn(otp?.resendAfter > 0 ? otp.resendAfter : 0);
+    if (!otp?.resendAfter) return undefined;
+    const timer = setInterval(() => setResendIn((seconds) => (seconds > 0 ? seconds - 1 : 0)), 1000);
+    return () => clearInterval(timer);
+  }, [phase, otp]);
+
+  const startOtp = useCallback(async (clean) => {
+    setBusy(true);
+    try {
+      const res = await requestHistoryOtp({ mobile: clean });
+      if (!mountedRef.current) return;
+      const data = res?.data || {};
+      const serverMasked =
+        typeof data.masked_mobile === 'string' ? data.masked_mobile.trim() : '';
+      // Fail closed: if the server omits masked_mobile, derive a mask from the
+      // already-validated number — never fall back to rendering it in full.
+      const safeMask = serverMasked || maskMobile(clean);
+      setOtp({
+        challengeId: data.challenge_id,
+        maskedMobile: safeMask,
+        resendAfter: Number(data.resend_after) || 0,
+      });
+      setMaskedMobile(safeMask);
+      setResendIn(Number(data.resend_after) || 0);
+      setCode('');
+      setOtpError(null);
+      setFormError(null);
+      setPhase('otp');
+    } catch (err) {
+      if (isCancel(err) || !mountedRef.current) return;
+      const fallback = 'ارسال کد تأیید ناموفق بود؛ لطفاً دوباره تلاش کنید.';
+      setFormError(
+        err?.response?.status === 429 ? RATE_LIMIT_MESSAGE : extractError(err, fallback)
+      );
+    } finally {
+      if (mountedRef.current) setBusy(false);
+    }
+  }, []);
+
+  const submitMobile = (event) => {
+    event?.preventDefault?.();
+    if (busy) return;
+    setFormError(null);
+    const clean = cleanMobile(mobile);
+    if (!MOBILE_RE.test(clean)) {
+      setFormError('شماره موبایل باید با ۰۹ شروع شود و ۱۱ رقم باشد.');
+      return;
+    }
+    startOtp(clean);
+  };
+
+  const resendCode = () => {
+    if (busy || resendIn > 0) return;
+    setOtpError(null);
+    setFormError(null);
+    startOtp(cleanMobile(mobile));
+  };
+
+  const editMobile = () => {
+    setOtp(null);
+    setCode('');
+    setOtpError(null);
+    setFormError(null);
+    setPhase('verify');
+  };
+
+  const confirmCode = async () => {
+    if (busy || !otp) return;
+    const cleanCode = normalizeDigits(code).replace(/\D/g, '');
+    if (!/^\d{5}$/.test(cleanCode)) {
+      setOtpError('کد تأیید ۵ رقمی را وارد کنید.');
+      return;
+    }
+    setOtpError(null);
+    setBusy(true);
+    try {
+      const res = await verifyHistoryOtp({
+        mobile: cleanMobile(mobile),
+        challenge_id: otp.challengeId,
+        code: cleanCode,
+      });
+      const data = res?.data || {};
+      const bearer = typeof data.token === 'string' ? data.token : '';
+      if (!bearer) {
+        if (mountedRef.current) setOtpError('تأیید کد ناموفق بود؛ لطفاً دوباره تلاش کنید.');
+        return;
+      }
+      // Best effort: keep the bearer in this tab only. If storage is blocked the
+      // visit still works in memory and simply does not survive a reload.
+      writeHistorySession(bearer, data.expires_at);
+      if (!mountedRef.current) return;
+      setToken(bearer);
+      setOtp(null);
+      setCode('');
+      setPhase('list');
+      loadFirstPage(bearer);
+    } catch (err) {
+      if (isCancel(err) || !mountedRef.current) return;
+      setOtpError(extractError(err, 'کد تأیید نادرست است؛ لطفاً دوباره تلاش کنید.'));
+    } finally {
+      if (mountedRef.current) setBusy(false);
+    }
+  };
+
+  const loadMore = () => {
+    if (!token || listStatus === 'loading' || !hasMore) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setListStatus('loading');
+    setListError(null);
+    getCustomerHistory(
+      token,
+      { limit: PAGE_SIZE, offset: items.length },
+      { signal: controller.signal }
+    )
+      .then((res) => {
+        if (!mountedRef.current || controller.signal.aborted) return;
+        const data = res?.data || {};
+        const next = Array.isArray(data.items) ? data.items : [];
+        setItems((prev) => [...prev, ...next]);
+        setHasMore(Boolean(data.has_more));
+        setListStatus('ready');
+      })
+      .catch((err) => {
+        if (controller.signal.aborted || isCancel(err) || !mountedRef.current) return;
+        if (err?.response?.status === 401) {
+          handleSessionLost();
+          return;
+        }
+        setListError(extractError(err, 'بارگذاری ادامهٔ سفارش‌ها ناموفق بود.'));
+        setListStatus('error');
+      });
+  };
+
+  const handleSignOut = () => {
+    const bearer = token;
+    // Wipe locally FIRST: no personal data may survive even if the revoke call
+    // never reaches the server.
+    resetToVerify(null);
+    if (bearer) {
+      signOutHistory(bearer).catch(() => {});
+    }
+  };
+
+  // ── Verification / OTP ──────────────────────────────────────────────
+  if (phase !== 'list') {
+    const onOtp = phase === 'otp';
+    return (
+      <div dir="rtl" className="max-w-xl mx-auto animate-fade-in">
+        <div
+          className="rounded-2xl border p-5 sm:p-6 mb-6"
+          style={{
+            background: 'var(--brand-header-gradient)',
+            borderColor: 'var(--brand-header-border)',
+            boxShadow: 'var(--brand-header-shadow)',
+            color: 'var(--brand-header-fg)',
+          }}
+        >
+          <Link
+            to="/"
+            className="inline-flex items-center gap-1.5 text-sm font-medium mb-3 hover:opacity-80 transition-opacity"
+            style={{ color: 'var(--brand-header-fg)' }}
+          >
+            <ArrowRight size={16} />
+            بازگشت به کاتالوگ
+          </Link>
+          <h1 className="text-xl sm:text-2xl font-bold mb-1">سفارش‌های من</h1>
+          <p className="text-xs sm:text-sm" style={{ color: 'color-mix(in srgb, #fff 82%, transparent)' }}>
+            برای مشاهدهٔ سفارش‌های ثبت‌شده با شمارهٔ موبایل خود، شماره را وارد و کد پیامکی را تأیید کنید.
+          </p>
+        </div>
+
+        <form
+          data-testid={onOtp ? 'my-orders-otp-step' : 'my-orders-verify'}
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (onOtp) {
+              confirmCode();
+            } else {
+              submitMobile();
+            }
+          }}
+          className="card p-5 sm:p-6 rounded-2xl border space-y-4"
+          style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
+          noValidate
+        >
+          {!onOtp ? (
+            <>
+              <div>
+                <label
+                  htmlFor="history-mobile"
+                  className="block text-xs font-semibold mb-1.5"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  شماره موبایل
+                </label>
+                <input
+                  id="history-mobile"
+                  name="mobile"
+                  type="tel"
+                  inputMode="numeric"
+                  className="input-field w-full text-sm"
+                  style={{ direction: 'ltr' }}
+                  value={mobile}
+                  onChange={(event) => setMobile(event.target.value)}
+                  placeholder="09xxxxxxxxx"
+                  maxLength={11}
+                  autoComplete="tel"
+                  required
+                />
+              </div>
+
+              {formError ? <ErrorBox>{formError}</ErrorBox> : null}
+
+              <button
+                type="submit"
+                className="btn-primary w-full inline-flex items-center justify-center gap-2"
+                disabled={busy}
+                style={busy ? { opacity: 0.7, pointerEvents: 'none' } : undefined}
+              >
+                {busy ? <Loader2 size={17} className="animate-spin" /> : <ShieldCheck size={17} />}
+                {busy ? 'در حال ارسال...' : 'دریافت کد تأیید'}
+              </button>
+            </>
+          ) : (
+            <>
+              <h2 className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>
+                کد تأیید را وارد کنید
+              </h2>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                {maskedMobile ? (
+                  <>
+                    کد ۵ رقمی ارسال‌شده به شماره{' '}
+                    <bdi dir="ltr" style={{ display: 'inline-block', fontFamily: 'monospace', fontWeight: 600 }}>{maskedMobile}</bdi>{' '}
+                    را وارد کنید.
+                  </>
+                ) : (
+                  `کد ۵ رقمی ارسال‌شده به ${GENERIC_MOBILE_LABEL} را وارد کنید.`
+                )}
+              </p>
+              <input
+                id="history-otp-code"
+                name="otp_code"
+                data-testid="my-orders-otp-input"
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                className="input-field w-full text-sm"
+                style={{ direction: 'ltr', textAlign: 'center', letterSpacing: '0.4em' }}
+                value={code}
+                onChange={(event) =>
+                  setCode(normalizeDigits(event.target.value).replace(/\D/g, '').slice(0, 5))
+                }
+                maxLength={5}
+                autoFocus
+                aria-label="کد تأیید"
+                required
+              />
+
+              {otpError ? <ErrorBox>{otpError}</ErrorBox> : null}
+              {formError ? <ErrorBox>{formError}</ErrorBox> : null}
+
+              <button
+                type="submit"
+                className="btn-primary w-full inline-flex items-center justify-center gap-2"
+                disabled={busy || code.trim().length < 5}
+                style={busy || code.trim().length < 5 ? { opacity: 0.7 } : undefined}
+              >
+                {busy ? <Loader2 size={17} className="animate-spin" /> : <ShieldCheck size={17} />}
+                {busy ? 'در حال بررسی...' : 'تأیید و مشاهده سفارش‌ها'}
+              </button>
+
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={resendCode}
+                  disabled={resendIn > 0 || busy}
+                  className="text-xs font-medium disabled:cursor-not-allowed"
+                  style={{ color: resendIn > 0 ? 'var(--text-muted)' : 'var(--accent)' }}
+                >
+                  {resendIn > 0 ? `ارسال مجدد کد تا ${resendIn} ثانیه` : 'ارسال مجدد کد'}
+                </button>
+                <button
+                  type="button"
+                  onClick={editMobile}
+                  className="text-xs font-medium"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  ویرایش شماره موبایل
+                </button>
+              </div>
+            </>
+          )}
+
+          <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+            این صفحه فقط برای همین تب است؛ با بستن تب، دسترسی شما پایان می‌یابد. شمارهٔ شما در آدرس
+            صفحه یا حافظهٔ دائمی مرورگر ذخیره نمی‌شود.
+          </p>
+        </form>
+      </div>
+    );
+  }
+
+  // ── List ────────────────────────────────────────────────────────────
+  const loading = listStatus === 'loading';
+  const showEmpty = listStatus === 'ready' && items.length === 0;
+
+  return (
+    <div dir="rtl" className="max-w-3xl mx-auto animate-fade-in" data-testid="my-orders-list">
+      {/* ── Profile Header ── */}
+      <div
+        className="rounded-2xl border p-5 sm:p-6 mb-6"
+        style={{
+          background: 'var(--brand-header-gradient)',
+          borderColor: 'var(--brand-header-border)',
+          boxShadow: 'var(--brand-header-shadow)',
+          color: 'var(--brand-header-fg)',
+        }}
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-xl sm:text-2xl font-bold mb-2">
+              {profile?.customer_name ? `سلام، ${profile.customer_name} عزیز 👋` : 'سفارش‌های من'}
+            </h1>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
+                style={{
+                  background: 'color-mix(in srgb, #fff 14%, transparent)',
+                  border: '1px solid color-mix(in srgb, #fff 24%, transparent)',
+                }}
+              >
+                <Phone size={13} />
+                <bdi dir="ltr" style={{ fontFamily: 'monospace', fontWeight: 600 }}>
+                  {maskedMobile || profile?.masked_mobile || '—'}
+                </bdi>
+              </span>
+
+              {profile?.email ? (
+                <span
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
+                  style={{
+                    background: 'color-mix(in srgb, #fff 14%, transparent)',
+                    border: '1px solid color-mix(in srgb, #fff 24%, transparent)',
+                  }}
+                >
+                  <Mail size={13} />
+                  <span style={{ direction: 'ltr' }}>{profile.email}</span>
+                </span>
+              ) : null}
+
+              {profile?.messenger_handle ? (
+                <span
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
+                  style={{
+                    background: 'color-mix(in srgb, #fff 14%, transparent)',
+                    border: '1px solid color-mix(in srgb, #fff 24%, transparent)',
+                  }}
+                >
+                  <Send size={13} />
+                  <span style={{ direction: 'ltr' }}>
+                    {profile.messenger === 'bale' ? 'بله: ' : 'تلگرام: '}
+                    {profile.messenger_handle}
+                  </span>
+                </span>
+              ) : null}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            data-testid="sign-out"
+            onClick={handleSignOut}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold shrink-0 self-start sm:self-auto"
+            style={{
+              border: '1px solid color-mix(in srgb, #fff 40%, transparent)',
+              background: 'color-mix(in srgb, #fff 16%, transparent)',
+              color: '#ffffff',
+              cursor: 'pointer',
+            }}
+          >
+            <LogOut size={15} />
+            خروج از حساب
+          </button>
+        </div>
+
+        {/* ── Quick Stats ── */}
+        <div
+          className="grid grid-cols-3 gap-2 mt-5 pt-4 border-t"
+          style={{ borderColor: 'color-mix(in srgb, #fff 20%, transparent)' }}
+        >
+          <div className="text-center sm:text-right">
+            <div className="text-[11px] opacity-80">کل سفارش‌ها</div>
+            <div className="text-base sm:text-lg font-black mt-0.5">
+              {profile?.stats?.total_orders ?? items.length}
+            </div>
+          </div>
+          <div className="text-center sm:text-right">
+            <div className="text-[11px] opacity-80">در انتظار پرداخت</div>
+            <div
+              className="text-base sm:text-lg font-black mt-0.5"
+              style={profile?.stats?.pending_payment ? { color: '#ffedd5' } : undefined}
+            >
+              {profile?.stats?.pending_payment ?? 0}
+            </div>
+          </div>
+          <div className="text-center sm:text-right">
+            <div className="text-[11px] opacity-80">تکمیل و پرداخت‌شده</div>
+            <div className="text-base sm:text-lg font-black mt-0.5">
+              {profile?.stats?.paid ?? 0}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Tabs ── */}
+      <div className="flex items-center gap-2 mb-6 border-b pb-1" style={{ borderColor: 'var(--border-color)' }}>
+        <button
+          type="button"
+          onClick={() => setActiveTab('orders')}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all ${
+            activeTab === 'orders'
+              ? 'btn-primary'
+              : 'text-[var(--text-secondary)] hover:bg-[var(--bg-card)]'
+          }`}
+        >
+          <ShoppingBag size={15} />
+          سفارش‌ها و فاکتورها ({profile?.stats?.total_orders ?? items.length})
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('profile')}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all ${
+            activeTab === 'profile'
+              ? 'btn-primary'
+              : 'text-[var(--text-secondary)] hover:bg-[var(--bg-card)]'
+          }`}
+        >
+          <MapPin size={15} />
+          نشانی‌ها و مشخصات
+        </button>
+      </div>
+
+      {activeTab === 'profile' ? (
+        <div className="space-y-5 animate-fade-in mb-6">
+          <div
+            className="card p-5 sm:p-6 rounded-2xl border space-y-4"
+            style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
+          >
+            <h2 className="text-sm font-bold flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>
+              <User size={16} style={{ color: 'var(--brand-orange, #ff9a3d)' }} />
+              اطلاعات حساب کاربری
+            </h2>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div className="p-3 rounded-xl border" style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}>
+                <span className="block mb-1 font-medium" style={{ color: 'var(--text-secondary)' }}>نام و نام خانوادگی</span>
+                <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                  {profile?.customer_name || '—'}
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl border" style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}>
+                <span className="block mb-1 font-medium" style={{ color: 'var(--text-secondary)' }}>شماره تماس تأییدشده</span>
+                <bdi dir="ltr" className="text-sm font-semibold block text-right font-mono" style={{ color: 'var(--text-primary)' }}>
+                  {profile?.mobile || maskedMobile || '—'}
+                </bdi>
+              </div>
+
+              <div className="p-3 rounded-xl border" style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}>
+                <span className="block mb-1 font-medium" style={{ color: 'var(--text-secondary)' }}>آدرس ایمیل</span>
+                <span className="text-sm font-semibold block text-left font-mono" style={{ color: 'var(--text-primary)', direction: 'ltr' }}>
+                  {profile?.email || '—'}
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl border" style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}>
+                <span className="block mb-1 font-medium" style={{ color: 'var(--text-secondary)' }}>کانال ارتباطی ترجیحی</span>
+                <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                  {profile?.messenger_handle
+                    ? `${profile.messenger === 'bale' ? 'بله' : 'تلگرام'}: ${profile.messenger_handle}`
+                    : '—'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div
+            className="card p-5 sm:p-6 rounded-2xl border space-y-4"
+            style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
+          >
+            <h2 className="text-sm font-bold flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>
+              <MapPin size={16} style={{ color: 'var(--brand-orange, #ff9a3d)' }} />
+              نشانی‌های ثبت‌شده تحویل
+            </h2>
+
+            {profile?.addresses && profile.addresses.length > 0 ? (
+              <div className="space-y-2.5">
+                {profile.addresses.map((addr, idx) => (
+                  <div
+                    key={idx}
+                    className="p-3.5 rounded-xl border flex items-start gap-3"
+                    style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}
+                  >
+                    <div
+                      className="w-6 h-6 rounded-lg shrink-0 flex items-center justify-center font-bold text-xs"
+                      style={{ background: 'var(--accent-light)', color: 'var(--brand-orange, #ff9a3d)' }}
+                    >
+                      {idx + 1}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs leading-relaxed" style={{ color: 'var(--text-primary)' }}>
+                        {addr}
+                      </p>
+                      {idx === 0 && (
+                        <span className="inline-block mt-1 text-[10px] font-semibold text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded-md">
+                          آخرین نشانی استفاده‌شده
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs py-4 text-center" style={{ color: 'var(--text-secondary)' }}>
+                هنوز نشانی تحویلی برای این شماره ثبت نشده است.
+              </p>
+            )}
+
+            <p className="text-[11px] leading-relaxed border-t pt-3" style={{ borderColor: 'var(--border-color)', color: 'var(--text-muted)' }}>
+              💡 نشانی‌های فوق از سفارش‌های قبلی شما به‌صورت خودکار ذخیره شده‌اند تا در خریدهای بعدی نیاز به ورود مجدد اطلاعات نداشته باشید.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      {activeTab === 'orders' ? (
+        <>
+
+      {loading && items.length === 0 ? (
+        <div className="text-center py-16" role="status" aria-busy="true">
+          <Loader2
+            size={30}
+            className="animate-spin mx-auto mb-3"
+            style={{ color: 'var(--brand-orange, #ff9a3d)' }}
+          />
+          <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+            در حال بارگذاری سفارش‌ها…
+          </p>
+        </div>
+      ) : null}
+
+      {listStatus === 'error' && items.length === 0 ? (
+        <div data-testid="my-orders-error" className="card p-5 rounded-2xl border space-y-3 text-center">
+          <AlertTriangle size={26} className="mx-auto" style={{ color: '#f59e0b' }} />
+          <ErrorBox>{listError}</ErrorBox>
+          <button
+            type="button"
+            onClick={() => loadFirstPage(token)}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold text-white"
+            style={{ background: 'var(--brand-orange, #ff9a3d)' }}
+          >
+            <RotateCcw size={15} />
+            تلاش دوباره
+          </button>
+        </div>
+      ) : null}
+
+      {showEmpty ? (
+        <div data-testid="my-orders-empty" className="card p-8 rounded-2xl border text-center space-y-3">
+          <Inbox size={30} className="mx-auto" style={{ color: 'var(--brand-orange, #ff9a3d)' }} />
+          <h2 className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>
+            هنوز سفارشی ثبت نشده است
+          </h2>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            برای این شماره هیچ درخواست یا فاکتوری ثبت نشده است.
+          </p>
+        </div>
+      ) : null}
+
+      {items.length > 0 ? (
+        <div className="space-y-3">
+          {items.map((entry) => (
+            <HistoryEntryCard
+              key={`${entry?.kind}-${entry?.id}`}
+              entry={entry}
+              onPay={setPayTarget}
+            />
+          ))}
+        </div>
+      ) : null}
+
+      {listStatus === 'error' && listError && items.length > 0 ? (
+        <div data-testid="my-orders-page-error" className="mt-3 space-y-2">
+          <ErrorBox>{listError}</ErrorBox>
+          <div className="text-center">
+            <button
+              type="button"
+              onClick={loadMore}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold text-white"
+              style={{ background: 'var(--brand-orange, #ff9a3d)' }}
+            >
+              <RotateCcw size={15} />
+              تلاش دوباره
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {hasMore ? (
+        <div className="mt-4 text-center">
+          <button
+            type="button"
+            data-testid="load-more"
+            onClick={loadMore}
+            disabled={loading}
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold border"
+            style={{
+              borderColor: 'var(--border-color)',
+              color: 'var(--text-primary)',
+              backgroundColor: 'var(--bg-card)',
+              opacity: loading ? 0.7 : 1,
+            }}
+          >
+            {loading ? <Loader2 size={15} className="animate-spin" /> : <Clock size={15} />}
+            نمایش سفارش‌های بیشتر
+          </button>
+        </div>
+      ) : null}
+
+      <div
+        className="mt-6 flex items-start gap-2 p-3 rounded-xl border text-[11px] leading-relaxed"
+        style={{ borderColor: 'var(--border-color)', color: 'var(--text-muted)' }}
+      >
+        <FileText size={15} className="shrink-0 mt-0.5 text-[var(--brand-orange)]" />
+        <span>
+          فاکتورهای تأییدشده را می‌توانید همین‌جا به‌صورت آنلاین پرداخت کنید. وضعیت پرداخت پس از
+          بازگشت از درگاه از سرور خوانده می‌شود و تنها فاکتورهای تأییدشده و منقضی‌نشده قابل پرداخت‌اند.
+        </span>
+      </div>
+        </>
+      ) : null}
+
+      {payTarget ? (
+        <PayInvoiceModal
+          entry={payTarget}
+          token={token}
+          onClose={() => setPayTarget(null)}
+          onSessionLost={handleSessionLost}
+        />
+      ) : null}
+
+      <div className="mt-3 flex items-center justify-center">
+        <Link
+          to="/"
+          className="inline-flex items-center gap-1.5 text-xs font-medium"
+          style={{ color: 'var(--text-secondary)' }}
+        >
+          <ArrowRight size={14} />
+          بازگشت به کاتالوگ
+        </Link>
+      </div>
+    </div>
+  );
+}

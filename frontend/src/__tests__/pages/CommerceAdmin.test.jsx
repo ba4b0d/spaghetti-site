@@ -16,6 +16,7 @@ const commerceApiMock = vi.hoisted(() => ({
   updateStaffInvoice: vi.fn(),
   approveStaffInvoice: vi.fn(),
   revokeStaffInvoice: vi.fn(),
+  getStaffInvoicePdfUrl: vi.fn((id) => `/api/v1/commerce/staff/invoices/${id}/pdf`),
 }));
 const apiMock = vi.hoisted(() => ({ getProductsAll: vi.fn() }));
 
@@ -207,6 +208,9 @@ describe('CommerceAdmin approval and link lifecycle', () => {
 
     const user = userEvent.setup();
     renderPage();
+
+    const pdfLink = await screen.findByRole('link', { name: /PDF/i });
+    expect(pdfLink).toHaveAttribute('href', '/api/v1/commerce/staff/invoices/9/pdf');
 
     await user.click(await screen.findByRole('button', { name: /تأیید و صدور لینک/ }));
 

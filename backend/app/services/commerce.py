@@ -14,18 +14,24 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, object_session, selectinload
 
 from app.models import (
     COMMERCE_INVOICE_STATES,
     INVOICE_LINK_TTL_DAYS,
     MAX_INVOICE_TOTAL_TOMAN,
+    SYSTEM_SALES_INCOME_CATEGORY_NAME,
+    AccountingCategory,
+    AccountingTransaction,
+    AuditLog,
     CommerceInvoice,
     CommerceInvoiceItem,
     CommercePaymentAttempt,
@@ -85,25 +91,38 @@ def _indicative_price_toman(product: Product) -> int | None:
     return price_int if price_int > 0 else None
 
 
-def create_website_request(
+def prepare_website_request(
     db: Session,
     *,
     customer_name: str,
     mobile: str,
+    email: str = "",
     messenger: str,
     messenger_handle: str = "",
     address: str = "",
     note: str = "",
     items: list[dict],
-    background_tasks=None,
 ) -> CommerceRequest:
-    """Persist a pending-review website request with server-side item snapshots.
+    """Validate + build a pending-review website request and flush it.
+
+    Same validation as ``create_website_request`` but deliberately does **not**
+    commit: the caller owns the transaction boundary so the request can be
+    committed atomically alongside another change (e.g. consuming the cart
+    OTP), making a rejected creation roll both back together. Returns the
+    request with ``id``/``items`` populated via ``flush()``.
 
     ``items`` is a list of ``{"product_id": int, "qty": int}``. Any other keys
     (including client-supplied prices) are deliberately ignored.
     """
     if not items:
         raise CommerceValidationError("سبد خرید خالی است")
+
+    if not address or len(address.strip()) < 5:
+        raise CommerceValidationError("نشانی تحویل الزامی است")
+
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise CommerceValidationError("ایمیل معتبر الزامی است")
 
     # Normalise + collapse to distinct product IDs.
     normalized: list[tuple[int, int]] = []
@@ -139,6 +158,7 @@ def create_website_request(
         receipt_id=generate_receipt_id(),
         customer_name=customer_name.strip(),
         mobile=mobile.strip(),
+        email=email,
         messenger=messenger,
         messenger_handle=(messenger_handle or "").strip(),
         address=(address or "").strip(),
@@ -157,16 +177,57 @@ def create_website_request(
         )
 
     db.add(request)
-    db.commit()
-    db.refresh(request)
+    db.flush()  # assign request.id / item rows without ending the transaction
+    return request
 
-    # After-commit: alert staff that a website request arrived. Delivery is
-    # deferred to a background task (payload snapshotted now) so the public
-    # response is never gated by the transport. Never raises.
+
+def notify_request_created(request: CommerceRequest, *, background_tasks=None) -> None:
+    """After-commit admin alert that a website request arrived. Never raises.
+
+    Public wrapper around ``_emit_admin_notification`` so a caller that commits
+    the request itself (rather than via ``create_website_request``) can still
+    fire the alert once the transaction is durable.
+    """
     _emit_admin_notification(
         commerce_notifications.EVENT_REQUEST_CREATED, request,
         background_tasks=background_tasks,
     )
+
+
+def create_website_request(
+    db: Session,
+    *,
+    customer_name: str,
+    mobile: str,
+    email: str = "",
+    messenger: str,
+    messenger_handle: str = "",
+    address: str = "",
+    note: str = "",
+    items: list[dict],
+    background_tasks=None,
+) -> CommerceRequest:
+    """Persist a pending-review website request with server-side item snapshots.
+
+    Commits the request then, after commit, alerts staff (delivery deferred to
+    ``background_tasks`` when provided). ``items`` is a list of
+    ``{"product_id": int, "qty": int}``; any other keys (including
+    client-supplied prices) are deliberately ignored.
+    """
+    request = prepare_website_request(
+        db,
+        customer_name=customer_name,
+        mobile=mobile,
+        email=email,
+        messenger=messenger,
+        messenger_handle=messenger_handle,
+        address=address,
+        note=note,
+        items=items,
+    )
+    db.commit()
+    db.refresh(request)
+    notify_request_created(request, background_tasks=background_tasks)
     return request
 
 
@@ -195,6 +256,7 @@ def serialize_staff_request(request: CommerceRequest) -> dict:
         "id": request.id,
         "receipt_id": request.receipt_id,
         "customer_name": request.customer_name,
+        "email": getattr(request, "email", "") or "",
         "mobile": request.mobile,
         "messenger": request.messenger,
         "messenger_handle": request.messenger_handle,
@@ -507,6 +569,7 @@ def create_staff_invoice(
     *,
     customer_name: str,
     mobile: str,
+    email: str = "",
     items: list[dict],
     request_id: int | None = None,
     messenger: str = "telegram",
@@ -534,10 +597,15 @@ def create_staff_invoice(
         if linked_request.state != "pending_review":
             raise CommerceStateError("این درخواست قبلاً بررسی شده است")
 
+    inv_email = (email or "").strip().lower()
+    if not inv_email and linked_request:
+        inv_email = (getattr(linked_request, "email", "") or "").strip().lower()
+
     invoice = CommerceInvoice(
         request_id=linked_request.id if linked_request else None,
         customer_name=customer_name.strip(),
         mobile=mobile.strip(),
+        email=inv_email,
         messenger=messenger,
         messenger_handle=(messenger_handle or "").strip(),
         address=(address or "").strip(),
@@ -563,6 +631,7 @@ def update_staff_invoice(
     *,
     customer_name: str,
     mobile: str,
+    email: str = "",
     items: list[dict],
     messenger: str = "telegram",
     messenger_handle: str = "",
@@ -592,6 +661,8 @@ def update_staff_invoice(
 
     invoice.customer_name = customer_name.strip()
     invoice.mobile = mobile.strip()
+    if email:
+        invoice.email = email.strip().lower()
     invoice.messenger = messenger
     invoice.messenger_handle = (messenger_handle or "").strip()
     invoice.address = (address or "").strip()
@@ -729,10 +800,11 @@ def serialize_invoice_item(item: CommerceInvoiceItem) -> dict:
 
 def serialize_staff_invoice(invoice: CommerceInvoice) -> dict:
     """Staff view — full detail, but never the raw or hashed token."""
-    return {
+    out = {
         "id": invoice.id,
         "request_id": invoice.request_id,
         "customer_name": invoice.customer_name,
+        "email": getattr(invoice, "email", "") or "",
         "mobile": invoice.mobile,
         "messenger": invoice.messenger,
         "messenger_handle": invoice.messenger_handle,
@@ -754,6 +826,36 @@ def serialize_staff_invoice(invoice: CommerceInvoice) -> dict:
         "updated_at": invoice.updated_at.isoformat() if invoice.updated_at else None,
         "items": [serialize_invoice_item(i) for i in invoice.items],
     }
+
+    # Settled-payment metadata for the staff badges. A paid invoice loaded from
+    # the queue must render its «how did it get paid» pill (method + reference)
+    # without a second request — but the invoice table itself carries no payment
+    # columns, so the durable evidence lives on its *verified* attempt: the
+    # manual provider keeps the staff-chosen method + reference, a gateway one
+    # keeps its DigiPay/BitPay method code and tracking/provider transaction id.
+    if invoice.state == "paid":
+        session = object_session(invoice)
+        attempt = None
+        if session is not None:
+            attempt = (
+                session.query(CommercePaymentAttempt)
+                .filter(
+                    CommercePaymentAttempt.invoice_id == invoice.id,
+                    CommercePaymentAttempt.state == "verified",
+                )
+                .order_by(CommercePaymentAttempt.id.desc())
+                .first()
+            )
+        if attempt is not None:
+            out["payment_method"] = attempt.payment_method
+            out["reference_code"] = (
+                attempt.provider_trans_id or attempt.tracking_code or ""
+            )
+            out["paid_at"] = (
+                attempt.verified_at.isoformat() if attempt.verified_at else None
+            )
+
+    return out
 
 
 def serialize_public_invoice(invoice: CommerceInvoice) -> dict:
@@ -791,6 +893,10 @@ def serialize_public_invoice(invoice: CommerceInvoice) -> dict:
 
 TOMAN_TO_RIAL = 10
 PAYMENT_PROVIDER_DIGIPAY = "digipay"
+# Task 2 — the BitPay gateway is a second provider on the same attempt table;
+# shared settlement code must read ``attempt.provider`` rather than assume
+# DigiPay. Kept local to mirror the existing constant's placement.
+PAYMENT_PROVIDER_BITPAY = "bitpay"
 # UPG ticket type requested at initiation (docs: 11 = all UPG features).
 DIGIPAY_TICKET_TYPE = 11
 # Payment methods reported by the DigiPay callback ``type`` and echoed to
@@ -818,6 +924,23 @@ PROVIDER_ID_PREFIX = "INV"
 # so a gateway callback cannot rebuild the `/pay/{token}` URL — and must not,
 # since that would leak the token into the redirect/logs.
 PAYMENT_RESULT_PATH = "/pay/result"
+
+# ── Task 4: manual payments + invoice→accounting auto-sync ───────────
+# The workshop takes most of its money off-gateway (card-to-card transfers and
+# cash), so a staff member must be able to close an invoice by hand. Such an
+# attempt is tagged ``manual`` on the shared attempt table (never resolvable by
+# a gateway callback) and is booked against the matching account type.
+MANUAL_PAYMENT_PROVIDER = "manual"
+MANUAL_PAYMENT_METHODS = ("card_to_card", "cash")
+# Where the money actually landed, per the accounting module's ``account_type``
+# vocabulary (bank | cash | gateway | other).
+MANUAL_PAYMENT_ACCOUNT_TYPES = {"card_to_card": "bank", "cash": "cash"}
+# Online (gateway) settlements book against the gateway pocket.
+GATEWAY_ACCOUNT_TYPE = "gateway"
+# Transaction dates for gateway settlements are the *Tehran* calendar day, not
+# the UTC one: a payment at 02:00 Tehran is 22:30 UTC the previous day, and the
+# ledger must not file it under yesterday.
+TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 
 
 class CommercePaymentError(Exception):
@@ -874,7 +997,14 @@ def find_payment_attempt_by_provider_id(db: Session, provider_id: str | None) ->
         return None
     return (
         db.query(CommercePaymentAttempt)
-        .filter(CommercePaymentAttempt.provider_id == provider_id)
+        # DigiPay-only: its alnum merchant reference is the callback identity.
+        # A BitPay attempt now stores a short *numeric* ``provider_id`` (the
+        # factorId), so without this filter a forged DigiPay callback carrying
+        # that number could resolve a BitPay row.
+        .filter(
+            CommercePaymentAttempt.provider == PAYMENT_PROVIDER_DIGIPAY,
+            CommercePaymentAttempt.provider_id == provider_id,
+        )
         .first()
     )
 
@@ -908,6 +1038,11 @@ def start_payment(
     amount_rial = toman_to_rial(invoice.total_toman)
 
     attempt = find_active_payment_attempt(db, invoice)
+    if attempt is not None and attempt.provider != PAYMENT_PROVIDER_DIGIPAY:
+        # Another provider (BitPay) already holds this invoice's shared lock;
+        # a cross-provider click is a conflict, never a resume that reflects the
+        # other gateway's portal through the DigiPay endpoint.
+        raise CommerceStateError("پرداخت از درگاه دیگری برای این فاکتور در حال انجام است")
     if attempt is not None and attempt.redirect_url:
         return attempt
 
@@ -934,7 +1069,11 @@ def start_payment(
         # Lost a race against a concurrent initiation (partial unique index).
         db.rollback()
         existing = find_active_payment_attempt(db, invoice)
-        if existing is not None and existing.redirect_url:
+        if (
+            existing is not None
+            and existing.provider == PAYMENT_PROVIDER_DIGIPAY
+            and existing.redirect_url
+        ):
             return existing
         raise CommerceStateError("پرداخت دیگری برای این فاکتور در حال انجام است")
 
@@ -960,12 +1099,34 @@ def start_payment(
     return attempt
 
 
-def _create_legacy_order(db: Session, invoice: CommerceInvoice) -> Order:
+def _provider_label(provider: str | None) -> str:
+    """Human (Persian) provider name for the order note, defaulting to DigiPay.
+
+    The legacy order note used to hardcode "دیجیپی"; keeping the DigiPay label as
+    the default preserves every existing note byte-for-byte while letting a
+    BitPay-settled invoice record its own provider identity.
+    """
+    if provider == PAYMENT_PROVIDER_BITPAY:
+        return "بیت‌پی"
+    return "دیجی‌پی"
+
+
+def _create_legacy_order(
+    db: Session,
+    invoice: CommerceInvoice,
+    *,
+    provider: str | None = PAYMENT_PROVIDER_DIGIPAY,
+    note: str | None = None,
+) -> Order:
     """One legacy Order (+items) mirroring the paid invoice, paid in full.
 
     A synthetic shipping line keeps ``sum(items) == paid_amount == total_toman``
     so the existing order board's accounting stays consistent. Status stays
     ``new``: fulfillment remains a staff decision, never auto-set to printing.
+    ``provider`` selects the gateway named in the order note so a BitPay payment
+    is never mislabelled as DigiPay. ``note`` overrides that generated note
+    entirely — a hand-recorded (card-to-card / cash) payment must never reach the
+    production queue claiming it was an online DigiPay payment.
     """
     items = list(invoice.items)
     qty = sum(i.qty for i in items) or 1
@@ -977,7 +1138,8 @@ def _create_legacy_order(db: Session, invoice: CommerceInvoice) -> Order:
         quoted_price=float(invoice.total_toman) / qty,
         paid_amount=float(invoice.total_toman),
         status="new",
-        notes=f"پرداخت آنلاین فاکتور #{invoice.id} از طریق دیجی‌پی",
+        notes=note
+        or f"پرداخت آنلاین فاکتور #{invoice.id} از طریق {_provider_label(provider)}",
         is_active=True,
     )
     db.add(order)
@@ -1053,9 +1215,103 @@ def _mark_verified_needs_reconciliation(
     db.refresh(attempt)
 
 
+def _tehran_today() -> date:
+    """Today's *Tehran* calendar date (the ledger's booking day)."""
+    return datetime.now(TEHRAN_TZ).date()
+
+
+def _resolve_sales_income_category(db: Session) -> AccountingCategory | None:
+    """The system income «سرفصل» every invoice income is booked against.
+
+    Prefers the seeded system category (``SYSTEM_SALES_INCOME_CATEGORY_NAME``);
+    if a deployment's chart of accounts lacks it, any *active* income category is
+    used so revenue is still recorded rather than silently dropped. Returns
+    ``None`` only when no income category exists at all — the caller must then
+    skip the booking instead of failing the payment it just took.
+    """
+    category = (
+        db.query(AccountingCategory)
+        .filter(
+            AccountingCategory.name == SYSTEM_SALES_INCOME_CATEGORY_NAME,
+            AccountingCategory.type == "income",
+        )
+        .order_by(AccountingCategory.id)
+        .first()
+    )
+    if category is not None:
+        return category
+    return (
+        db.query(AccountingCategory)
+        .filter(
+            AccountingCategory.type == "income",
+            AccountingCategory.is_active.is_(True),
+        )
+        .order_by(AccountingCategory.id)
+        .first()
+    )
+
+
+def _sync_invoice_income_transaction(
+    db: Session,
+    invoice: CommerceInvoice,
+    *,
+    account_type: str,
+    transaction_date: date,
+    reference_code: str = "",
+    description: str = "",
+    order_id: int | None = None,
+    created_by_user_id: int | None = None,
+) -> AccountingTransaction | None:
+    """Book the invoice→income ledger row exactly once (idempotent), or skip.
+
+    The pre-check reads the existing row for ``invoice_id``; the table's UNIQUE
+    ``invoice_id`` constraint is the real backstop, so a replayed callback or a
+    second manual confirmation can never double-book the same invoice. Adds the
+    row to the caller's session *without committing*: the booking is committed
+    atomically with the payment it belongs to, so the ledger can never show
+    income for a settlement that rolled back.
+    """
+    existing = (
+        db.query(AccountingTransaction)
+        .filter(AccountingTransaction.invoice_id == invoice.id)
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    category = _resolve_sales_income_category(db)
+    if category is None:  # pragma: no cover - defensive: chart of accounts empty
+        _logger.warning(
+            "accounting sync skipped: no income category for invoice %s", invoice.id
+        )
+        return None
+
+    txn = AccountingTransaction(
+        title=f"فروش فاکتور #{invoice.id} - {invoice.customer_name}",
+        category_id=category.id,
+        type="income",
+        amount_toman=invoice.total_toman,
+        transaction_date=transaction_date,
+        account_type=account_type,
+        reference_code=(reference_code or "")[:100],
+        description=(description or "")[:1000],
+        invoice_id=invoice.id,
+        order_id=order_id if order_id is not None else invoice.order_id,
+        created_by_user_id=created_by_user_id,
+    )
+    db.add(txn)
+    _logger.info(
+        "accounting sync: invoice %s booked as income (%s) amount=%s",
+        invoice.id,
+        account_type,
+        invoice.total_toman,
+    )
+    return txn
+
+
 def settle_verified_payment(
     db: Session, attempt: CommercePaymentAttempt, *, tracking_code: str,
-    background_tasks=None,
+    background_tasks=None, on_success=None,
 ) -> CommercePaymentAttempt:
     """Atomically mark the attempt verified, the invoice paid and link ONE order.
 
@@ -1068,6 +1324,13 @@ def settle_verified_payment(
     an earlier revision, or a session against an invoice that was since
     revoked/revised) never settles: it is flagged for staff reconciliation and
     ``CommerceReconciliationRequiredError`` is raised.
+
+    ``on_success`` is an optional ``callback(db, invoice, attempt)`` invoked
+    immediately before the single successful commit, so any rows it adds (e.g.
+    an audit entry) are committed *atomically with the settlement* — and are
+    never written on the reconciliation / already-paid no-op branches, where no
+    settlement actually happened. A caller that passes it must add only, never
+    commit or roll back.
     """
     invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
     if invoice is None:
@@ -1129,13 +1392,34 @@ def settle_verified_payment(
     db.expire_all()
     invoice = db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
     if invoice.order_id is None:
-        order = _create_legacy_order(db, invoice)
+        order = _create_legacy_order(db, invoice, provider=attempt.provider)
         invoice.order_id = order.id
+
+    # Task 4 auto-sync: book the invoice's income in the SAME transaction as the
+    # settlement, so the ledger shows revenue exactly when the money is claimed.
+    # Idempotent (the row's UNIQUE ``invoice_id``) and skipped silently when the
+    # deployment has no income category — a missing chart of accounts must never
+    # fail a payment the gateway already confirmed.
+    _sync_invoice_income_transaction(
+        db,
+        invoice,
+        account_type=GATEWAY_ACCOUNT_TYPE,
+        transaction_date=_tehran_today(),
+        reference_code=str(
+            attempt.provider_trans_id or getattr(attempt, "id_get", None) or ""
+        ),
+        order_id=invoice.order_id,
+    )
 
     attempt.state = "verified"
     attempt.tracking_code = tracking_code
     attempt.verified_at = _now()
     attempt.last_error = None
+    # Commit any caller-supplied rows (e.g. an audit entry) atomically with the
+    # settlement: they exist only when this branch — the one real settlement —
+    # is taken.
+    if on_success is not None:
+        on_success(db, invoice, attempt)
     db.commit()
     db.refresh(attempt)
     # After-commit: this is the single claimed `approved -> paid` transition, so
@@ -1148,6 +1432,108 @@ def settle_verified_payment(
         background_tasks=background_tasks,
     )
     return attempt
+
+
+def record_manual_payment(
+    db: Session,
+    invoice_id: int,
+    payment_method: str,
+    reference_code: str,
+    paid_at: date,
+    note: str = "",
+    user_id: int | None = None,
+) -> tuple[CommerceInvoice, CommercePaymentAttempt]:
+    """Staff — record an off-gateway payment and close the invoice.
+
+    The workshop's normal money is a card-to-card transfer or cash, so this is
+    the authoritative staff action that marks an invoice ``paid``. One commit
+    performs the whole settlement:
+
+    1. ``invoice.state = 'paid'`` (refused when the invoice is already paid —
+       the ledger must never be double-booked);
+    2. a ``CommercePaymentAttempt`` tagged ``provider='manual'`` with the staff
+       reference/tracking code, ``amount_rial`` converted exactly once from
+       Toman, and both timestamps stamped from the staff-supplied ``paid_at``;
+    3. the legacy fulfillment ``Order`` for the production queue (only when the
+       invoice has none yet) — with a note naming the manual method, so the
+       board can never claim an online DigiPay payment that never happened;
+    4. the invoice-linked accounting income row (``account_type`` = ``bank`` for
+       card-to-card, ``cash`` for cash; ``transaction_date = paid_at``).
+
+    A paid-invoice alert is emitted *after* the commit (best-effort, never
+    affecting the transaction). Returns ``(invoice, attempt)``.
+    """
+    invoice = _get_invoice(db, invoice_id)
+
+    if payment_method not in MANUAL_PAYMENT_METHODS:
+        raise CommerceValidationError("روش پرداخت نامعتبر است")
+    if invoice.state == "paid":
+        raise CommerceStateError("فاکتور قبلاً پرداخت شده است")
+    if isinstance(paid_at, datetime) or not isinstance(paid_at, date):
+        raise CommerceValidationError("تاریخ پرداخت نامعتبر است")
+
+    reference_code = (reference_code or "").strip()[:100]
+    note = (note or "").strip()
+    paid_datetime = datetime.combine(paid_at, datetime.min.time(), tzinfo=timezone.utc)
+
+    invoice.state = "paid"
+    invoice.updated_at = _now()
+
+    attempt = CommercePaymentAttempt(
+        invoice_id=invoice.id,
+        provider=MANUAL_PAYMENT_PROVIDER,
+        state="verified",
+        # Unique, gateway-proof merchant reference: a callback can only ever
+        # resolve an attempt through ``provider_id`` matching a stored id, and
+        # this one is never sent to any gateway.
+        provider_id=f"MANUAL-{invoice.id}-{secrets.token_hex(8)}",
+        amount_rial=toman_to_rial(invoice.total_toman),
+        invoice_revision=invoice.revision,
+        payment_method=payment_method,
+        provider_trans_id=reference_code or None,
+        tracking_code=reference_code or None,
+        verified_at=paid_datetime,
+        created_at=paid_datetime,
+        reconciliation_required=False,
+    )
+    db.add(attempt)
+    db.flush()
+
+    if invoice.order_id is None:
+        order = _create_legacy_order(
+            db,
+            invoice,
+            note=(
+                f"پرداخت دستی ({_manual_payment_label(payment_method)}) "
+                f"فاکتور #{invoice.id}"
+            ),
+        )
+        invoice.order_id = order.id
+
+    _sync_invoice_income_transaction(
+        db,
+        invoice,
+        account_type=MANUAL_PAYMENT_ACCOUNT_TYPES[payment_method],
+        transaction_date=paid_at,
+        reference_code=reference_code,
+        description=note or f"ثبت پرداخت دستی ({payment_method})",
+        order_id=invoice.order_id,
+        created_by_user_id=user_id,
+    )
+
+    db.commit()
+    db.refresh(invoice)
+    db.refresh(attempt)
+
+    # After-commit, best-effort: the same «پرداخت موفق فاکتور» alert an online
+    # settlement fires, so staff learn about a hand-recorded payment too.
+    _emit_admin_notification(commerce_notifications.EVENT_PAYMENT_VERIFIED, invoice)
+    return invoice, attempt
+
+
+def _manual_payment_label(payment_method: str) -> str:
+    """Persian label for the manual payment method (order note / UI)."""
+    return "کارت به کارت" if payment_method == "card_to_card" else "نقدی"
 
 
 def _int_or_none(value) -> int | None:
@@ -1434,6 +1820,9 @@ def serialize_staff_payment_attempt(attempt: CommercePaymentAttempt) -> dict:
         "type": attempt.type,
         "payment_method": attempt.payment_method,
         "tracking_code": attempt.tracking_code,
+        # BitPay's ``id_get`` lives in ``tracking_code``; the callback-supplied
+        # ``trans_id`` is exposed here so staff can see what a reconcile queries.
+        "provider_trans_id": attempt.provider_trans_id,
         "has_redirect": bool(attempt.redirect_url),
         "last_error": attempt.last_error,
         # A genuine provider-verified payment that could not be settled against
@@ -1538,6 +1927,11 @@ def reconcile_payment_attempt(
         db.refresh(attempt)
         return attempt
 
+    if attempt.provider == PAYMENT_PROVIDER_BITPAY:
+        return _reconcile_bitpay_attempt(
+            db, attempt, client, background_tasks=background_tasks
+        )
+
     method = attempt.payment_method
     tracking = (attempt.tracking_code or "").strip()
     if method not in ALLOWED_PAYMENT_METHODS or not tracking:
@@ -1598,5 +1992,637 @@ def reconcile_payment_attempt(
     # released — a forged callback must not be able to unlock a payment.
     attempt.last_error = _short(f"reconcile: provider did not confirm (status={status})")
     db.commit()
+    db.refresh(attempt)
+    return attempt
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Task 2 — BitPay gateway v2.2 attempts + GET callback
+# ══════════════════════════════════════════════════════════════════════
+#
+# BitPay's documented flow (gateway-help v2.2) differs from DigiPay in two ways
+# this section encodes:
+#
+#   * The GET callback carries only ``trans_id`` and ``id_get`` (documented
+#     sample ``.../payment/gateway-1200-get`` → ``?trans_id=123&id_get=321``),
+#     NOT the ``factorId`` we sent. So the durable link from an untrusted
+#     callback back to its attempt is the ``id_get`` returned by
+#     ``gateway-send`` at initiation, persisted in ``tracking_code`` and matched
+#     exactly.
+#   * ``gateway-result-second`` verification needs BOTH ``trans_id`` (from the
+#     callback) and ``id_get`` (persisted at initiation), and its success body
+#     echoes the paid ``amount`` and the ``factorId`` — both are matched against
+#     the stored attempt before any settlement.
+#
+# Everything above (DigiPay) is untouched. Settlement is reused: the generic
+# ``settle_verified_payment`` binds on ``invoice_revision`` + amount, so a
+# late/foreign success is preserved for staff rather than applied.
+
+# BitPay has no UPG "ticket type"; the NOT NULL ``type`` column stores this
+# sentinel so staff tooling can distinguish a BitPay attempt from a DigiPay one.
+BITPAY_TICKET_TYPE = 0
+
+# The documented gateway ``factorId`` is a Latin integer only. For a BitPay
+# attempt we send the attempt's own integer id and persist it (as a string) in
+# ``provider_id`` — the one existing, unique merchant-reference column — so the
+# verify echo can be matched exactly. ``[0-9]`` (not ``\d``) on purpose: a
+# non-Latin decimal (e.g. Arabic-Indic digits) is likewise coerced to ``0`` by
+# the gateway, so it must be treated as unreferenceable too.
+_LATIN_DECIMAL_RE = re.compile(r"[0-9]+")
+
+
+def _pending_bitpay_provider_id() -> str:
+    """A temporary unique ``provider_id`` so a new row can be flushed for its id.
+
+    The column is NOT NULL + UNIQUE, so the row cannot be inserted blank; this
+    placeholder lives only across the flush and is overwritten with the attempt's
+    Latin-decimal id before commit.
+    """
+    return f"pending-{secrets.token_hex(12)}"
+
+
+def bitpay_factor_reference(attempt: CommercePaymentAttempt) -> str | None:
+    """The exact numeric ``factorId`` a BitPay attempt was issued with, if any.
+
+    A *new* attempt persists the Latin-decimal ``attempt.id`` in ``provider_id``
+    and sends it as ``factorId``. A row created before the numeric-factor fix
+    holds the historical alnum ``INV<id>-R<rev>-<hex>`` reference, whose factorId
+    the gateway silently coerced to ``0`` on verify: it has no provable numeric
+    reference and MUST NOT be settled by an ordinary callback or a regular staff
+    reconcile. Returns ``None`` for such a legacy row (fail closed).
+    """
+    raw = getattr(attempt, "provider_id", None)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not _LATIN_DECIMAL_RE.fullmatch(text):
+        return None
+    return text
+
+
+def find_bitpay_attempt_by_id_get(db: Session, id_get) -> CommercePaymentAttempt | None:
+    """Resolve the attempt whose persisted ``id_get`` matches a callback hint.
+
+    Matching is strictly by ``provider == bitpay`` and the ``id_get`` we
+    received from ``gateway-send`` (stored as ``tracking_code``) — never by any
+    other, callback-supplied value.
+    """
+    parsed = _int_or_none(id_get)
+    if parsed is None or parsed <= 0:
+        return None
+    return (
+        db.query(CommercePaymentAttempt)
+        .filter(
+            CommercePaymentAttempt.provider == PAYMENT_PROVIDER_BITPAY,
+            CommercePaymentAttempt.tracking_code == str(parsed),
+        )
+        .order_by(CommercePaymentAttempt.id.desc())
+        .first()
+    )
+
+
+def start_bitpay_payment(
+    db: Session, invoice: CommerceInvoice, client, *, callback_url: str
+) -> CommercePaymentAttempt:
+    """Create (or resume) the durable attempt and start a BitPay transaction.
+
+    Mirrors ``start_payment`` (DigiPay): the row is committed *before* the
+    network call so a crash/timeout still leaves a reconcilable attempt, and a
+    repeated click while an attempt is in flight returns the existing redirect
+    instead of minting a second session.
+    """
+    assert_payment_allowed(invoice)
+    amount_rial = toman_to_rial(invoice.total_toman)
+
+    attempt = find_active_payment_attempt(db, invoice)
+    if attempt is not None and attempt.provider != PAYMENT_PROVIDER_BITPAY:
+        # A DigiPay attempt already holds this invoice's shared lock; a
+        # cross-provider click is a conflict, never a resume that reflects the
+        # other gateway's portal through the BitPay endpoint.
+        raise CommerceStateError("پرداخت از درگاه دیگری برای این فاکتور در حال انجام است")
+    if attempt is not None and attempt.redirect_url:
+        return attempt
+
+    if attempt is None:
+        attempt = CommercePaymentAttempt(
+            invoice_id=invoice.id,
+            provider=PAYMENT_PROVIDER_BITPAY,
+            state="initiating",
+            # A NOT NULL + UNIQUE column: a placeholder is required so the row
+            # can be flushed to obtain its id, which becomes the factorId.
+            provider_id=_pending_bitpay_provider_id(),
+            amount_rial=amount_rial,
+            invoice_revision=invoice.revision,
+            type=BITPAY_TICKET_TYPE,
+        )
+        db.add(attempt)
+    else:
+        attempt.provider = PAYMENT_PROVIDER_BITPAY
+        attempt.amount_rial = amount_rial
+        attempt.invoice_revision = invoice.revision
+        attempt.type = BITPAY_TICKET_TYPE
+        attempt.state = "initiating"
+
+    try:
+        # Flush first so the row has its id; the documented gateway ``factorId``
+        # must be a Latin integer, so we send the attempt's own id and persist it
+        # as the expected reference (``provider_id``). A reused in-flight row is
+        # migrated the same way, so it too is issued/expected numerically.
+        db.flush()
+        attempt.provider_id = str(attempt.id)
+        db.commit()
+    except IntegrityError:
+        # Lost a race against a concurrent initiation (partial unique index).
+        db.rollback()
+        existing = find_active_payment_attempt(db, invoice)
+        if (
+            existing is not None
+            and existing.provider == PAYMENT_PROVIDER_BITPAY
+            and existing.redirect_url
+        ):
+            return existing
+        raise CommerceStateError("پرداخت دیگری برای این فاکتور در حال انجام است")
+
+    db.refresh(attempt)
+    try:
+        session = client.create_payment(
+            amount_rial=amount_rial,
+            redirect_url=callback_url,
+            factor_id=attempt.provider_id,
+            name=(invoice.customer_name or None),
+            mobile=(invoice.mobile or None),
+            description=f"فاکتور #{invoice.id}",
+        )
+    except Exception as exc:  # noqa: BLE001 - gateway boundary → recoverable
+        attempt.state = "unknown"
+        attempt.last_error = _short(exc)
+        db.commit()
+        raise CommercePaymentError("ارتباط با درگاه پرداخت ناموفق بود") from exc
+
+    # The id_get is the only durable key that can link the (factorId-less) GET
+    # callback back to this attempt; persist it the moment the gateway returns.
+    attempt.tracking_code = str(session.id_get)
+    attempt.redirect_url = session.redirect_url
+    attempt.state = "pending"
+    attempt.last_error = None
+    db.commit()
+    db.refresh(attempt)
+    return attempt
+
+
+def _bitpay_verification_confirms(verified, attempt: CommercePaymentAttempt) -> bool:
+    """True only when a BitPay verify proves the *exact* amount and factorId.
+
+    The provider reply must report success AND carry an ``amount`` equal to the
+    issued ``amount_rial`` AND a ``factorId`` equal to the Latin-decimal
+    reference we sent (persisted in ``provider_id``). A success missing either
+    identity field is not a confirmation — matching both is what stops a
+    self-consistent forgery (or a genuine payment for a different invoice) from
+    settling this attempt.
+
+    Both sides must be Latin integers. A legacy alnum reference has no numeric
+    value to compare (the gateway coerced it to ``0``) and a non-integer echo is
+    likewise coerced, so neither can ever confirm — that is what keeps a pre-fix
+    paid attempt from auto-settling.
+    """
+    if not getattr(verified, "is_success", False):
+        return False
+    if _int_or_none(getattr(verified, "amount_rial", None)) != attempt.amount_rial:
+        return False
+    expected = bitpay_factor_reference(attempt)
+    if expected is None:
+        return False
+    echoed = getattr(verified, "factor_id", None)
+    if echoed is None:
+        return False
+    echoed_text = str(echoed).strip()
+    if not _LATIN_DECIMAL_RE.fullmatch(echoed_text):
+        return False
+    if echoed_text != expected:
+        return False
+    return True
+
+
+def _hold_bitpay_attempt(db: Session, attempt: CommercePaymentAttempt, reason) -> None:
+    """Keep an attempt open (still locking the invoice) on an unproven signal.
+
+    Never terminally fails: a BitPay non-success rests on a callback-supplied
+    ``trans_id`` (untrusted) and cannot prove OUR transaction failed, so it must
+    not release the invoice lock. ``unknown`` is an active state, so the lock is
+    retained and the row stays visible in the staff reconciliation queue.
+    """
+    if attempt.state in ACTIVE_ATTEMPT_STATES:
+        attempt.state = "unknown"
+        attempt.last_error = _short(reason)
+        db.commit()
+
+
+def handle_bitpay_callback(
+    db: Session,
+    client,
+    *,
+    trans_id,
+    id_get,
+    factor_id=None,
+    background_tasks=None,
+) -> str:
+    """Process an untrusted BitPay GET callback; returns success|failed|pending.
+
+    The query is a hint only: the invoice is settled solely after a
+    server-to-server ``gateway-result-second`` verify confirms success with a
+    matching amount + factorId, and after ``settle_verified_payment`` re-binds
+    the attempt to the invoice's *current* revision + amount. ``factor_id`` is
+    accepted as an optional callback hint but never trusted or required (BitPay
+    does not echo it on the GET callback).
+    """
+    attempt = find_bitpay_attempt_by_id_get(db, id_get)
+    if attempt is None:
+        return "failed"
+    if attempt.state == "verified":
+        # Replay of an already-verified attempt: report the SAME outcome the
+        # first callback produced — a flagged (unsettled) attempt must never
+        # replay as a contradictory "success".
+        if attempt.reconciliation_required:
+            return "pending"
+        return "success"
+
+    # A legacy attempt carries the historical alnum ``provider_id``, whose
+    # factorId the gateway coerced to ``0`` — the verify reply can never be
+    # matched to it. Refuse to auto-settle here: keep the lock (the row stays
+    # active and in the staff queue) for an explicit, audited manual settlement.
+    if bitpay_factor_reference(attempt) is None:
+        _hold_bitpay_attempt(
+            db,
+            attempt,
+            "legacy alnum factorId reference; cannot auto-settle — "
+            "needs audited manual settlement",
+        )
+        return "failed"
+
+    parsed_trans = _int_or_none(trans_id)
+    if parsed_trans is None or parsed_trans <= 0:
+        _hold_bitpay_attempt(db, attempt, "callback trans_id invalid (unverified)")
+        return "failed"
+
+    # Provisional, staff-visible trans_id for a later reconcile; it is NOT
+    # authoritative and is overwritten by the confirmed value only on success.
+    if attempt.provider_trans_id is None:
+        attempt.provider_trans_id = parsed_trans
+        db.commit()
+
+    try:
+        verified = client.verify(trans_id=parsed_trans, id_get=_int_or_none(id_get))
+    except Exception as exc:  # noqa: BLE001 - transient → recoverable unknown
+        _hold_bitpay_attempt(db, attempt, exc)
+        return "pending"
+
+    if not _bitpay_verification_confirms(verified, attempt):
+        # Non-success, or a success whose amount/factorId does not match the
+        # attempt we issued: never settle, never release the lock.
+        _hold_bitpay_attempt(
+            db,
+            attempt,
+            f"provider verify did not confirm (status={getattr(verified, 'status', None)})",
+        )
+        return "failed"
+
+    # Confirmed. Pin the confirmed trans_id, then settle — which re-checks the
+    # attempt's revision + amount against the CURRENT invoice, so a success for
+    # a stale/revoked invoice is preserved for staff instead of applied.
+    attempt.provider_trans_id = parsed_trans
+    db.commit()
+    try:
+        settle_verified_payment(
+            db,
+            attempt,
+            tracking_code=str(_int_or_none(id_get)),
+            background_tasks=background_tasks,
+        )
+    except CommerceReconciliationRequiredError:
+        return "pending"
+    return "success"
+
+
+def _reconcile_bitpay_attempt(
+    db: Session, attempt: CommercePaymentAttempt, client, *, background_tasks=None
+) -> CommercePaymentAttempt:
+    """Staff reconcile of a BitPay attempt: re-verify, else keep it open.
+
+    Requires both the persisted ``id_get`` (``tracking_code``) and the
+    ``trans_id`` captured from the callback; without either there is nothing to
+    query, so the attempt is left open for an explicit, audited staff abandon.
+    A reply that does not prove the exact amount + factorId keeps the lock held.
+    """
+    id_get = _int_or_none(attempt.tracking_code)
+    trans_id = attempt.provider_trans_id
+    if id_get is None or id_get <= 0 or not trans_id:
+        return attempt
+    if bitpay_factor_reference(attempt) is None:
+        # Legacy alnum reference (factorId coerced to ``0``): never auto-settle
+        # through a routine staff reconcile. Keep the lock and leave the row in
+        # the queue for an explicit, audited manual settlement (or a staff
+        # abandon).
+        attempt.last_error = _short(
+            "legacy alnum factorId reference; cannot auto-settle — "
+            "needs audited manual settlement"
+        )
+        db.commit()
+        db.refresh(attempt)
+        return attempt
+    if client is None:
+        raise CommerceGatewayUnavailableError("درگاه پرداخت پیکربندی نشده است")
+
+    try:
+        verified = client.verify(trans_id=trans_id, id_get=id_get)
+    except Exception as exc:  # noqa: BLE001 - transient; keep unknown
+        attempt.last_error = _short(exc)
+        db.commit()
+        db.refresh(attempt)
+        return attempt
+
+    if _bitpay_verification_confirms(verified, attempt):
+        try:
+            settle_verified_payment(
+                db, attempt, tracking_code=str(id_get), background_tasks=background_tasks
+            )
+        except CommerceReconciliationRequiredError:
+            db.refresh(attempt)
+        return attempt
+
+    attempt.last_error = _short(
+        f"reconcile: provider did not confirm (status={getattr(verified, 'status', None)})"
+    )
+    db.commit()
+    db.refresh(attempt)
+    return attempt
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Audited, admin-only recovery of an already-paid *legacy* BitPay attempt
+# ══════════════════════════════════════════════════════════════════════
+#
+# A pre-fix BitPay attempt persisted the historical alnum merchant reference
+# ``INV<id>-R<rev>-<hex>`` as ``provider_id`` and sent it as ``factorId``. The
+# documented gateway coerces any non-Integer factor to ``0`` on the verify
+# reply, so such a row can NEVER be matched by the ordinary callback or a
+# routine staff ``verify`` reconcile — both correctly fail closed and hold the
+# lock (see ``handle_bitpay_callback`` / ``_reconcile_bitpay_attempt``).
+#
+# When the customer really did pay, an admin needs one explicit, audited way to
+# close that gap. This is it — and it is deliberately the *narrowest* possible
+# path. It re-verifies server-to-server and accepts ONLY the documented
+# ``factorId == 0`` coercion artifact, together with an exact amount match and
+# the attempt's OWN persisted ``id_get`` + ``trans_id`` (never a request value).
+#
+# It refuses, without exception:
+#   * any non-BitPay attempt;
+#   * any modern, numeric-factor attempt (``provider_id`` is a Latin decimal) —
+#     that must settle through the ordinary callback/reconcile, so a genuine
+#     numeric match can never be smuggled through a weaker zero-factor check;
+#   * any attempt whose state is not the strict ``unknown`` one (an already
+#     ``verified`` replay is returned as-is; anything else is a conflict);
+#   * a missing/unpersisted ``id_get`` or ``trans_id`` (nothing to bind to);
+#   * an invoice that is not the attempt's current revision+amount, or is not
+#     payable (paid / revoked / revised);
+#   * a verify that is not documented success ``1``/``11`` with the exact amount
+#     AND the ``factorId`` coercion artifact ``0``.
+#
+# Nothing here is ever automatic: it runs only behind the admin-only route and
+# requires an explicit attempt id + affirmation + reason.
+
+# Documented ``gateway-result-second`` success statuses: ``1`` = fresh success,
+# ``11`` = already verified. Both are genuine success.
+BITPAY_VERIFY_SUCCESS_CODES = (1, 11)
+# The exact ``factorId`` the gateway echoes after coercing a non-Integer factor
+# reference (the historical alnum ``INV<id>-R<rev>-<hex>``) to an integer. It is
+# the documented artifact that lets a legacy payment be recognised at all.
+BITPAY_LEGACY_FACTOR_ECHO = "0"
+# Audit action label; also the stable key the tests assert on.
+LEGACY_RECOVERY_ACTION = "recover_legacy_bitpay"
+
+
+def _bitpay_legacy_recovery_confirms(verified, attempt: CommercePaymentAttempt) -> bool:
+    """True only for the documented legacy success: amount exact + factorId ``0``.
+
+    Distinct from :func:`_bitpay_verification_confirms`, which *requires a
+    numeric match* and therefore can never confirm a legacy row. Here the echo
+    must be the coercion artifact ``0`` and the attempt must genuinely be a
+    legacy (non-numeric) reference — a numeric attempt is refused so this weaker
+    check can never be used to settle a modern payment.
+    """
+    if not getattr(verified, "is_success", False):
+        return False
+    if getattr(verified, "status", None) not in BITPAY_VERIFY_SUCCESS_CODES:
+        return False
+    if _int_or_none(getattr(verified, "amount_rial", None)) != attempt.amount_rial:
+        return False
+    # Only a legacy (non-numeric) reference may use this path.
+    if bitpay_factor_reference(attempt) is not None:
+        return False
+    echoed = getattr(verified, "factor_id", None)
+    if echoed is None:
+        return False
+    echoed_text = str(echoed).strip()
+    if not _LATIN_DECIMAL_RE.fullmatch(echoed_text):
+        return False
+    return echoed_text == BITPAY_LEGACY_FACTOR_ECHO
+
+
+def _legacy_bitpay_recovery_target(
+    db: Session, attempt: CommercePaymentAttempt | None
+) -> tuple[CommerceInvoice, int, int]:
+    """Validate eligibility and return ``(invoice, id_get, trans_id)``.
+
+    Every rejection raises (never silently proceeds) so the caller can only ever
+    settle the exact, payable invoice an eligible legacy attempt binds to.
+    """
+    if attempt is None:
+        raise CommerceNotFoundError("تراکنش یافت نشد")
+    if attempt.provider != PAYMENT_PROVIDER_BITPAY:
+        raise CommerceStateError("این تراکنش مربوط به درگاه بیت‌پی نیست")
+    if bitpay_factor_reference(attempt) is not None:
+        raise CommerceStateError(
+            "این مسیر فقط برای تراکنش‌های قدیمی (ارجاع غیرعددی) است"
+        )
+    if attempt.state != "unknown":
+        raise CommerceStateError("وضعیت این تراکنش برای بازیابی دستی مناسب نیست")
+
+    # Bind to the evidence we durably hold — never to anything the caller sends.
+    id_get = _int_or_none(attempt.tracking_code)
+    if id_get is None or id_get <= 0:
+        raise CommerceStateError("شناسه id_get این تراکنش ثبت نشده است")
+    trans_id = _int_or_none(attempt.provider_trans_id)
+    if trans_id is None or trans_id <= 0:
+        raise CommerceStateError("شناسه trans_id این تراکنش ثبت نشده است")
+
+    invoice = (
+        db.query(CommerceInvoice).filter(CommerceInvoice.id == attempt.invoice_id).first()
+    )
+    if invoice is None:
+        raise CommerceNotFoundError("فاکتور یافت نشد")
+    if invoice.state != "approved" or invoice.order_id is not None:
+        raise CommerceStateError("فاکتور در وضعیت قابل تسویه نیست")
+    if attempt.invoice_revision != invoice.revision:
+        raise CommerceStateError("نسخه فاکتور با این تراکنش مطابقت ندارد")
+    expected = _expected_amount_rial(invoice)
+    if expected is None or attempt.amount_rial != expected:
+        raise CommerceStateError("مبلغ تراکنش با فاکتور مطابقت ندارد")
+    return invoice, id_get, trans_id
+
+
+def _rebind_invoice_after_verify(
+    db: Session, attempt: CommercePaymentAttempt
+) -> CommerceInvoice | None:
+    """Re-read the attempt's invoice from committed state after a provider call.
+
+    The eligibility precheck runs *before* the server-to-server verify, which is
+    slow enough for a concurrent revise/revoke to commit behind an
+    already-loaded, identity-mapped invoice. Expiring forces the next read to
+    hit the database rather than hand back the stale copy.
+    """
+    db.expire_all()
+    return (
+        db.query(CommerceInvoice)
+        .filter(CommerceInvoice.id == attempt.invoice_id)
+        .first()
+    )
+
+
+def _settlement_invoice_is_current(
+    attempt: CommercePaymentAttempt, invoice: CommerceInvoice
+) -> bool:
+    """True only when a freshly-read invoice may still take this settlement.
+
+    Mirrors the caller's eligibility check (payable state, no order yet) plus
+    the shared ``_attempt_binds_invoice`` revision/amount bind, so a concurrent
+    change detected after the verify can never mark the wrong invoice paid.
+    """
+    return (
+        invoice.state == "approved"
+        and invoice.order_id is None
+        and _attempt_binds_invoice(attempt, invoice)
+    )
+
+
+def recover_legacy_bitpay_attempt(
+    db: Session,
+    attempt: CommercePaymentAttempt | None,
+    client,
+    *,
+    reason: str,
+    actor: str = "",
+    background_tasks=None,
+) -> CommercePaymentAttempt:
+    """Admin-only, audited settlement of a genuine *legacy* BitPay payment.
+
+    Re-verifies server-to-server (through the injected provider) using the
+    attempt's own persisted ``trans_id`` + ``id_get``, requires the documented
+    success ``1``/``11`` with the exact amount and the ``factorId == 0``
+    coercion artifact, then settles through the shared
+    :func:`settle_verified_payment` — which claims the ``approved → paid``
+    transition with a single conditional UPDATE, so exactly one order is created
+    even under concurrency or replay.
+
+    The audit entry is added to the *same* session as the settlement, so the
+    single commit inside ``settle_verified_payment`` persists both together —
+    never the best-effort, separately-committed ``audit.log`` helper.
+
+    A refused recovery is never an unsafe abandon: the attempt is left
+    ``unknown`` (lock held, visible in the staff queue) and the invoice stays
+    ``approved``. Nothing is read from or written to the card/PII fields, and no
+    provider secret is logged.
+    """
+    if attempt is None:
+        raise CommerceNotFoundError("تراکنش یافت نشد")
+
+    reason = (reason or "").strip()
+    if not reason:
+        # An explicit, recorded reason is what makes the settlement an
+        # authorized staff decision rather than an accidental one.
+        raise CommerceValidationError("ثبت دلیل برای بازیابی پرداخت الزامی است")
+
+    # Idempotent replay: an already-settled legacy recovery returns as-is and
+    # must never create a second order. (Anything else — e.g. a flagged
+    # reconciliation row — falls through to the strict eligibility check.)
+    if attempt.state == "verified" and not attempt.reconciliation_required:
+        return attempt
+
+    invoice, id_get, trans_id = _legacy_bitpay_recovery_target(db, attempt)
+
+    if client is None:
+        raise CommerceGatewayUnavailableError("درگاه پرداخت پیکربندی نشده است")
+
+    try:
+        verified = client.verify(trans_id=trans_id, id_get=id_get)
+    except Exception as exc:  # noqa: BLE001 - transient → keep the lock, surface it
+        attempt.last_error = _short(f"legacy recovery verify failed: {exc}")
+        db.commit()
+        db.refresh(attempt)
+        raise CommercePaymentError("ارتباط با درگاه پرداخت ناموفق بود") from exc
+
+    if not _bitpay_legacy_recovery_confirms(verified, attempt):
+        # Never settle and never release the lock: keep the attempt open for a
+        # further staff decision. Record the status only — never the card/PII.
+        attempt.last_error = _short(
+            "legacy recovery: provider did not confirm legacy success "
+            f"(status={getattr(verified, 'status', None)})"
+        )
+        db.commit()
+        db.refresh(attempt)
+        raise CommerceStateError("درگاه پرداخت این تراکنش را تأیید نکرد")
+
+    # Confirmed. Re-bind against the invoice as it is *now*: the eligibility
+    # precheck ran before the (potentially slow) provider round trip, so a
+    # concurrent revision/amount change or revoke could since have made the
+    # identity-mapped invoice stale. A stale success must never mark the wrong
+    # invoice paid — keep the genuine confirmation for staff and refuse.
+    fresh_invoice = _rebind_invoice_after_verify(db, attempt)
+    if fresh_invoice is None or not _settlement_invoice_is_current(attempt, fresh_invoice):
+        _mark_verified_needs_reconciliation(
+            db, attempt, str(id_get),
+            "legacy recovery blocked: invoice changed during provider verify "
+            f"(state={getattr(fresh_invoice, 'state', None)} "
+            f"revision={getattr(fresh_invoice, 'revision', None)} "
+            "total_rial="
+            f"{_expected_amount_rial(fresh_invoice) if fresh_invoice is not None else None})",
+        )
+        raise CommerceStateError(
+            "فاکتور پس از تأیید درگاه تغییر کرده است؛ نیازمند بررسی دستی"
+        )
+
+    # The audit row is committed by ``settle_verified_payment`` in the *same*
+    # transaction as the settlement (via ``on_success``): it exists exactly when
+    # a settlement happened, and is never written on a reconciliation branch
+    # that did not settle.
+    audit_summary = (
+        f"بازیابی پرداخت قدیمی بیت‌پی تراکنش #{attempt.id} "
+        f"(فاکتور #{invoice.id}، مبلغ {attempt.amount_rial} ریال) — {reason}"
+    )
+
+    def _record_audit(inner_db, _invoice, settled_attempt):
+        inner_db.add(
+            AuditLog(
+                user=actor or "system",
+                action=LEGACY_RECOVERY_ACTION,
+                entity="commerce_payment_attempt",
+                entity_id=settled_attempt.id,
+                summary=audit_summary,
+            )
+        )
+
+    try:
+        settle_verified_payment(
+            db, attempt, tracking_code=str(id_get), background_tasks=background_tasks,
+            on_success=_record_audit,
+        )
+    except CommerceReconciliationRequiredError as exc:
+        # The fresh re-bind above makes this unreachable in normal operation. If
+        # a change ever claims the row between that re-read and the conditional
+        # UPDATE, the settlement already preserved the payment for staff; no
+        # audit row was written and we never claim success.
+        raise CommerceStateError(
+            "پرداخت تأییدشده با فاکتور فعلی مطابقت ندارد؛ نیازمند بررسی دستی"
+        ) from exc
+
     db.refresh(attempt)
     return attempt

@@ -26,6 +26,14 @@ commerceApi.interceptors.response.use(
 export const submitCommerceRequest = (payload, config) =>
   commerceApi.post('/requests', payload, config);
 
+/**
+ * Public — begin the cart OTP gate: send a one-time SMS code to the customer's
+ * mobile. Returns `{ challenge_id, expires_in, resend_after, delivery,
+ * masked_mobile }`. The code itself is never returned.
+ */
+export const requestOtp = (payload, config) =>
+  commerceApi.post('/requests/otp', payload, config);
+
 /** Staff — paginated, newest-first request review queue (requires staff session). */
 export const getStaffRequests = (params = {}, config) =>
   commerceApi.get('/staff/requests', { params, ...config });
@@ -56,6 +64,20 @@ export const approveStaffInvoice = (id) =>
 export const revokeStaffInvoice = (id) =>
   commerceApi.post(`/staff/invoices/${id}/revoke`);
 
+// ── Manual (off-gateway) payment ─────────────────────────────────────
+//
+// The route is `POST /admin/invoices/{id}/manual-pay`: registered on the
+// commerce router, namespaced `/admin` and gated by `require_staff_role`
+// (routers/commerce.py `pay_invoice_manually`). It marks the invoice paid,
+// records the manual attempt, hands a fulfillment order to production and books
+// the invoice-linked accounting income row — all in one commit — so an
+// already-paid invoice is refused (400) rather than double-booked; the UI must
+// surface that refusal instead of retrying blindly.
+
+/** Staff — record a کارت به کارت / نقدی payment against a non-paid invoice. */
+export const manualPayStaffInvoice = (id, payload) =>
+  commerceApi.post(`/admin/invoices/${id}/manual-pay`, payload);
+
 // ── Public invoice payment (Task 3) ──────────────────────────────────
 //
 // The invoice token is a private bearer credential carried in the URL. These
@@ -66,12 +88,56 @@ export const revokeStaffInvoice = (id) =>
 export const getPublicInvoice = (token, config) =>
   commerceApi.get(`/invoices/${encodeURIComponent(token)}`, config);
 
+/** Public — URL to stream/download the PDF invoice for a private bearer token. */
+export const getPublicInvoicePdfUrl = (token) =>
+  `/api/v1/commerce/invoices/${encodeURIComponent(token)}/pdf`;
+
+/** Staff — URL to stream/download the PDF invoice for an invoice ID. */
+export const getStaffInvoicePdfUrl = (invoiceId) =>
+  `/api/v1/commerce/staff/invoices/${encodeURIComponent(invoiceId)}/pdf`;
+
 /**
- * Public — start (or resume) a DigiPay UPG payment for an approved invoice.
- * Returns `{ state, amount_rial, redirect_url }`; the caller validates
- * `redirect_url` against the DigiPay allowlist before sending the browser.
+ * Public — non-secret payment-method readiness for the pay page.
+ *
+ * Returns which gateways are actually selectable (`{ bitpay, digipay,
+ * snapppay }`, each `{ enabled }`), so the page never renders a usable CTA for
+ * a method the backend cannot pay through. No secret is involved.
  */
-export const payInvoice = (token) =>
-  commerceApi.post(`/invoices/${encodeURIComponent(token)}/pay`);
+export const getPaymentMethods = (config) =>
+  commerceApi.get('/payment-methods', config);
+
+/**
+ * Explicit provider → pay sub-path. There is deliberately **no ambient
+ * default**: a caller must name the method (BitPay is the only method the page
+ * ever selects; DigiPay stays parked), and an unknown/missing method throws
+ * rather than silently starting the wrong gateway.
+ */
+export const PAY_INVOICE_PATHS = Object.freeze({
+  digipay: '/pay',
+  bitpay: '/pay/bitpay',
+});
+
+/**
+ * Public — start (or resume) a payment for an approved invoice with an
+ * explicitly named provider.
+ *
+ * Returns `{ provider?, state, amount_rial, redirect_url }`; the caller
+ * validates `redirect_url` against that provider's allowlist before sending
+ * the browser.
+ */
+export const payInvoice = (token, method) => {
+  // Own-property check only: a plain-object index would also resolve inherited
+  // names (`toString`, `constructor`, `__proto__`, …) to a truthy value and let
+  // a bogus method slip past a bare falsy guard. Non-string keys are refused
+  // rather than coerced into a property lookup.
+  const hasMethod =
+    typeof method === 'string' &&
+    Object.prototype.hasOwnProperty.call(PAY_INVOICE_PATHS, method);
+  if (!hasMethod) {
+    return Promise.reject(new Error(`unsupported payment method: ${method}`));
+  }
+  const path = PAY_INVOICE_PATHS[method];
+  return commerceApi.post(`/invoices/${encodeURIComponent(token)}${path}`);
+};
 
 export default commerceApi;

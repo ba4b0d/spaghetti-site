@@ -15,3 +15,8 @@ google-auth>=2.0.0
 google-auth-oauthlib>=1.0.0
 cryptography>=41.0.0
 tzdata==2025.2
+reportlab>=5.0.0
+qrcode>=8.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+jdatetime>=4.1.0

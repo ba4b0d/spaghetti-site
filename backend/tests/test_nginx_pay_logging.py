@@ -200,3 +200,123 @@ def test_real_nginx_probe_never_logs_the_invoice_token(tmp_path):
         assert "/api/v1/products" in out, "ordinary access logging was disabled"
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+
+
+# ── SnappPay onboarding callback — the fixed callback path is a stub whose
+# query string is unparsed (no protocol), so the whole request line must never
+# reach the access log. Same two-block shape as the invoice API: a longer `^~`
+# prefix that wins over the generic `^~ /api/`, plus a case-insensitive `~*`
+# companion that precedes the static-asset regex. ─────────────────────────
+
+SNAPPAY_CALLBACK = "/api/v1/commerce/snappay/callback"
+
+
+def test_snappay_callback_prefix_is_longer_than_generic_api_prefix():
+    text = _conf_text()
+    specific = "location ^~ /api/v1/commerce/snappay/callback {"
+    generic = "location ^~ /api/ {"
+    assert specific in text, "no dedicated no-log block for the SnappPay callback"
+    assert generic in text  # generic block is unchanged
+    # Longer `^~` prefix wins by longest-match, so the snappay block is NOT
+    # shadowed by the logged generic API block.
+    assert text.index(specific) < text.index(generic)
+
+
+def test_snappay_callback_prefix_disables_access_log_and_proxies_identically():
+    block = _location_block(
+        _conf_text(), "location ^~ /api/v1/commerce/snappay/callback {"
+    )
+    assert "access_log off;" in block
+    # no URI in proxy_pass ⇒ the request URI (query included) is forwarded
+    # unchanged, matching the generic `^~ /api/` behaviour.
+    assert "proxy_pass http://backend:8000;" in block
+
+
+def test_snappay_callback_has_case_insensitive_companion_block():
+    block = _location_block(
+        _conf_text(), "location ~* ^/api/v1/commerce/snappay/callback {"
+    )
+    assert "access_log off;" in block
+    assert "proxy_pass http://backend:8000;" in block
+    # must precede the static-asset regex so a callback-shaped asset path is
+    # still handled here rather than served from the immutable-cache branch.
+    text = _conf_text()
+    assert text.index("location ~* ^/api/v1/commerce/snappay/callback {") < text.index(
+        "location ~* \\.(js|css|"
+    )
+
+
+@pytest.mark.skipif(not _docker_available(), reason="docker not available")
+def test_real_nginx_probe_never_logs_the_snappay_callback_query(tmp_path):
+    """Run the real config and prove, by request probes, that the SnappPay
+    callback query is not written to the access log while the fixed path is
+    still proxied and ordinary API requests are still logged."""
+    repo_server = _conf_text()
+    wrapper = (
+        "worker_processes 1;\n"
+        "pid /run/nginx.pid;\n"
+        "error_log /var/log/nginx/error.log warn;\n"
+        "events { worker_connections 1024; }\n"
+        "http {\n"
+        "  include /etc/nginx/mime.types;\n"
+        "  default_type text/plain;\n"
+        "  access_log /var/log/nginx/access.log;\n"
+        "  server { listen 8000; access_log off;"
+        " location / { return 200 \"UPSTREAM:$request_uri\"; } }\n"
+        + repo_server
+        + "}\n"
+    )
+    conf = tmp_path / "nginx.conf"
+    conf.write_text(wrapper, encoding="utf-8")
+
+    name = "snapcbprobe_pytest"
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+    run = subprocess.run(
+        [
+            "docker", "run", "-d", "--name", name,
+            "--add-host", "backend:127.0.0.1",
+            "-p", "0:80",
+            "-v", f"{conf.as_posix()}:/etc/nginx/nginx.conf:ro",
+            "nginx:alpine",
+        ],
+        capture_output=True, text=True, timeout=180,
+    )
+    try:
+        assert run.returncode == 0, run.stdout + run.stderr
+        port_out = subprocess.run(
+            ["docker", "port", name, "80"], capture_output=True, text=True, timeout=60
+        ).stdout.strip()
+        if not port_out:
+            pytest.skip("could not resolve forwarded port: " + port_out)
+        port = int(port_out.split(":")[-1])
+        base = f"http://127.0.0.1:{port}"
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(base + "/ready", timeout=1).read()
+                break
+            except Exception:  # noqa: BLE001
+                time.sleep(0.2)
+        else:
+            pytest.skip("nginx container never became ready")
+
+        sentinel = "SNAPPAYQUERYSECRET42"
+        # lower-case callback with a query — must be proxied and NOT logged
+        body = urllib.request.urlopen(
+            base + f"{SNAPPAY_CALLBACK}?token={sentinel}&amount=1"
+        ).read().decode()
+        assert "UPSTREAM" in body, body
+        # mixed-case variant must also be proxied (and not logged)
+        urllib.request.urlopen(
+            base + f"/API/v1/Commerce/Snappay/Callback?token={sentinel}"
+        ).read()
+        # an ordinary API request must STILL be logged
+        urllib.request.urlopen(base + "/api/v1/products").read()
+
+        logs = subprocess.run(
+            ["docker", "logs", name], capture_output=True, text=True, timeout=60
+        )
+        out = logs.stdout + logs.stderr
+        assert sentinel not in out, "the SnappPay callback query leaked into the log"
+        assert "/api/v1/products" in out, "ordinary access logging was disabled"
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)

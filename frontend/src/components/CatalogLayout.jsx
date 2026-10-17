@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { Link, NavLink, useNavigate, useLocation } from 'react-router-dom';
-import { Menu, X, ChevronDown, Search, ShoppingBag } from 'lucide-react';
+import { Menu, X, ChevronDown, Search, ShoppingBag, Package } from 'lucide-react';
 import { Z_INDEX_STICKY } from '../lib/constants';
 import BrandLogo from './BrandLogo';
 import CartDrawer from './CartDrawer';
@@ -333,6 +333,26 @@ export default function CatalogLayout({ children }) {
           </nav>
 
           <div className="catalog-topbar-actions">
+            <NavLink
+              to="/my-orders"
+              className={({ isActive }) =>
+                `relative inline-flex items-center justify-center w-11 h-11 rounded-[0.85rem] shrink-0 transition-colors ${
+                  isActive ? 'ring-1 ring-white/60' : ''
+                }`
+              }
+              style={({ isActive }) => ({
+                border: '1px solid color-mix(in srgb, #fff 30%, transparent)',
+                background: isActive
+                  ? 'color-mix(in srgb, #fff 24%, transparent)'
+                  : 'color-mix(in srgb, #fff 14%, transparent)',
+                color: '#ffffff',
+                cursor: 'pointer',
+              })}
+              aria-label="سفارش‌های من"
+              title="سفارش‌های من"
+            >
+              <Package size={20} strokeWidth={2.25} />
+            </NavLink>
             <button
               type="button"
               className="relative inline-flex items-center justify-center w-11 h-11 rounded-[0.85rem] shrink-0 transition-colors"
@@ -423,6 +443,9 @@ export default function CatalogLayout({ children }) {
           <NavLink to="/contact" className={drawerLinkClass} onClick={closeMenu}>
             تماس با ما
           </NavLink>
+          <NavLink to="/my-orders" className={drawerLinkClass} onClick={closeMenu}>
+            سفارش‌های من
+          </NavLink>
 
           {catTree.length > 0 && (
             <div className="mt-3 pt-3 border-t catalog-drawer-cats" style={{ borderColor: 'var(--border-color)' }}>
@@ -510,6 +533,7 @@ export default function CatalogLayout({ children }) {
               <Link to="/how-to-order" className="catalog-footer-link">سفارش از کاتالوگ</Link>
               <Link to="/custom-order" className="catalog-footer-link">سفارش طرح دلخواه</Link>
               <Link to="/contact" className="catalog-footer-link">تماس با ما</Link>
+              <Link to="/my-orders" className="catalog-footer-link">سفارش‌های من</Link>
               <Link to="/card" className="catalog-footer-link">کارت ویزیت</Link>
               <Link to="/privacy" className="catalog-footer-link">حریم خصوصی</Link>
               <Link to="/terms" className="catalog-footer-link">قوانین</Link>

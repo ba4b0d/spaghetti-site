@@ -267,6 +267,83 @@ describe('frontend/nginx.conf — token-bearing /pay/ route', () => {
   });
 });
 
+// ── Token-free gateway hand-off page: /pay/redirect ───────────────────────
+// The private /pay/<token> document is served `Referrer-Policy: no-referrer`
+// (the path segment is a bearer credential), so a direct browser navigation to
+// the BitPay portal from it carries no Referer and BitPay rejects the hand-off
+// with «آدرس ارجاعی نامعتبر» (invalid referer address). The fix is a
+// token-free same-origin intermediate page that the pay page hard-navigates
+// to; that page is served with an ORIGIN-only referrer policy, so the browser
+// emits `Referer: https://spaghettiprints.ir/` (scheme+host+port, never the
+// path/query/token) when it goes on to the portal.
+//
+// It is an EXACT-match location so it wins over the case-insensitive `~* /pay/`
+// regex by nginx's precedence rules without weakening that block: every
+// token-bearing /pay/<token> URI is still matched case-insensitively and keeps
+// no-referrer + no-store.
+describe('frontend/nginx.conf — token-free gateway hand-off (/pay/redirect)', () => {
+  const redirectLocation = locations.find((l) => l.type === '=' && l.target === '/pay/redirect');
+
+  it('is served by an exact-match location that beats the /pay/ regex', () => {
+    expect(redirectLocation, 'no `location = /pay/redirect` block found').toBeTruthy();
+    expect(matchLocation(locations, '/pay/redirect')).toBe(redirectLocation);
+  });
+
+  it('emits an origin-only referrer (never no-referrer) so BitPay gets a valid Referer', () => {
+    const rp = headerValue(addHeaders(redirectLocation.body), 'Referrer-Policy');
+    expect(rp).toBeTruthy();
+    expect(rp).not.toBe('no-referrer');
+    // `origin` sends scheme+host+port only — exactly what the portal needs.
+    expect(rp).toBe('origin');
+  });
+
+  it('is never cached and never access-logged', () => {
+    const cc = headerValue(addHeaders(redirectLocation.body), 'Cache-Control');
+    expect(cc).toBeTruthy();
+    expect(cc.toLowerCase()).toContain('no-store');
+    expect(redirectLocation.body).toMatch(/access_log\s+off;/);
+  });
+
+  it('restates every server-level security header (add_header does not inherit)', () => {
+    const headers = addHeaders(redirectLocation.body);
+    for (const [name, value] of SERVER_SECURITY_HEADERS) {
+      expect(headerValue(headers, name), `${name} missing in /pay/redirect`).toBe(value);
+    }
+    const serverCsp = headerValue(addHeaders(CONF), 'Content-Security-Policy');
+    expect(headerValue(headers, 'Content-Security-Policy')).toBe(serverCsp);
+  });
+
+  it('uses a `rewrite ... break` SPA fallback so its headers survive', () => {
+    // A try_files fallback would internally redirect to /index.html, re-match
+    // `~* \.html$` and drop the origin referrer policy set here.
+    expect(redirectLocation.body).toMatch(/rewrite\s+\S+\s+\/index\.html\s+break/);
+    expect(redirectLocation.body).not.toMatch(/try_files/);
+  });
+
+  it('never routes the hand-off to the bot meta-preview branch', () => {
+    const hit = matchLocation(locations, '/pay/redirect');
+    expect(hit.body).not.toMatch(/meta-preview/);
+    expect(hit.body).not.toMatch(/TelegramBot/);
+  });
+
+  it('keeps the token-bearing /pay/<token> route on no-referrer + no-store', () => {
+    for (const uri of ['/pay/abc123token', '/PAY/abc123token']) {
+      const hit = matchLocation(locations, uri);
+      expect(hit.type, `${uri} must stay on the case-insensitive regex`).toBe('~*');
+      expect(headerValue(addHeaders(hit.body), 'Referrer-Policy')).toBe('no-referrer');
+      expect(headerValue(addHeaders(hit.body), 'Cache-Control').toLowerCase()).toContain('no-store');
+      // And it is a different location than the hand-off page.
+      expect(hit).not.toBe(redirectLocation);
+    }
+  });
+
+  it('leaves the site-wide policy untouched', () => {
+    expect(headerValue(addHeaders(CONF), 'Referrer-Policy')).toBe(
+      'strict-origin-when-cross-origin'
+    );
+  });
+});
+
 // ── Two-tier trusted edge: realip recovery of the true client IP ──────────
 // Production path: client → Pi5 edge reverse proxy (192.168.100.50) → this
 // nginx → backend. The edge replaces X-Forwarded-For with the real client, but
@@ -306,6 +383,79 @@ describe('frontend/nginx.conf — two-tier trusted edge (realip)', () => {
     expect(headerIdx).toBeGreaterThanOrEqual(0);
     expect(headerIdx).toBeLessThan(
       CONF.indexOf('proxy_set_header X-Forwarded-For $remote_addr;')
+    );
+  });
+});
+
+// ── One-visit «سفارش‌های من» route: /my-orders ────────────────────────────
+// The public history page is a session-ENTRY document. It carries no token and
+// no personal data (the bearer lives only in tab sessionStorage; the history
+// arrives through the no-store /api/v1/commerce/history API), but it must still
+// never be cached and never leak a Referer. React Router resolves /MY-ORDERS and
+// /My-Orders as well, so — exactly like /pay/ — the rule is a case-INSENSITIVE
+// regex, and it must precede the static-asset regex.
+describe('frontend/nginx.conf — one-visit /my-orders route', () => {
+  const historyLocations = locations.filter(
+    (l) => (l.type === '~' || l.type === '~*') && /my-orders/i.test(l.target)
+  );
+  const historyLocation = historyLocations[0];
+
+  it('matches the history route with a case-insensitive regex', () => {
+    expect(historyLocations.length, 'no /my-orders location found').toBeGreaterThan(0);
+    expect(historyLocation.type, '/my-orders must be a case-insensitive regex').toBe('~*');
+    expect(historyLocation.target).toMatch(/my-orders/i);
+  });
+
+  it('places the history regex before the static-asset regex', () => {
+    const historyIdx = locations.indexOf(historyLocation);
+    const staticIdx = locations.indexOf(staticLocation);
+    expect(historyIdx).toBeGreaterThanOrEqual(0);
+    expect(staticIdx).toBeGreaterThan(historyIdx);
+  });
+
+  it.each(['/my-orders', '/MY-ORDERS', '/My-Orders', '/mY-oRdErS', '/my-orders/'])(
+    'routes %s to the hardened history location',
+    (uri) => {
+      const hit = matchLocation(locations, uri);
+      expect(hit).toBe(historyLocation);
+      // Hardening must travel with the location that actually serves the URI.
+      expect(headerValue(addHeaders(hit.body), 'Referrer-Policy')).toBe('no-referrer');
+      const cc = headerValue(addHeaders(hit.body), 'Cache-Control');
+      expect(cc).toBeTruthy();
+      expect(cc.toLowerCase()).toContain('no-store');
+    }
+  );
+
+  it('restates every server-level security header (add_header does not inherit)', () => {
+    const headers = addHeaders(historyLocation.body);
+    for (const [name, value] of SERVER_SECURITY_HEADERS) {
+      expect(headerValue(headers, name), `${name} missing in /my-orders`).toBe(value);
+    }
+    const serverCsp = headerValue(addHeaders(CONF), 'Content-Security-Policy');
+    expect(serverCsp, 'server-level CSP not found').toBeTruthy();
+    expect(headerValue(headers, 'Content-Security-Policy')).toBe(serverCsp);
+  });
+
+  it('uses a `rewrite ... break` SPA fallback and never the bot meta-preview branch', () => {
+    expect(historyLocation.body).toMatch(/rewrite\s+\S+\s+\/index\.html\s+break/);
+    expect(historyLocation.body).not.toMatch(/try_files/);
+    expect(historyLocation.body).not.toMatch(/meta-preview/);
+    expect(historyLocation.body).not.toMatch(/TelegramBot/);
+  });
+
+  it('never access-logs the history page (no personal query string may reach the log)', () => {
+    expect(historyLocation.body).toMatch(/access_log\s+off;/);
+  });
+
+  it('does not over-reach: lookalike paths keep the default SPA handling', () => {
+    for (const uri of ['/my-orders-archive', '/my-ordersx']) {
+      expect(matchLocation(locations, uri)).toBe(rootLocation);
+    }
+  });
+
+  it('leaves the site-wide policy untouched', () => {
+    expect(headerValue(addHeaders(CONF), 'Referrer-Policy')).toBe(
+      'strict-origin-when-cross-origin'
     );
   });
 });

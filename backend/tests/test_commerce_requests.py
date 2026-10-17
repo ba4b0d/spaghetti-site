@@ -6,6 +6,8 @@ commerce plan (docs/superpowers/plans/2026-10-10-order-invoice-payments.md).
 """
 import pytest
 
+from tests.otp_helpers import issue_test_otp
+
 
 @pytest.fixture(autouse=True)
 def _clear_rate_limiter(client):
@@ -39,9 +41,16 @@ def _create_product(client, auth_headers, *, name="محصول تستی", price=5
 def _valid_payload(product_id, qty=2, **overrides):
     payload = {
         "customer_name": "رضا",
+        "email": "reza@example.com",
         "mobile": "09123456789",
         "messenger": "telegram",
+        "address": "تهران، میدان آزادی، خیابان آزادی، پلاک ۱۰",
         "items": [{"product_id": product_id, "qty": qty}],
+        # The public gate now requires a verified one-time code. Mint a live
+        # challenge for the default mobile so these intake tests still exercise
+        # the request contract; the OTP path itself is covered in
+        # test_commerce_otp.py. No SMS is ever sent (see tests/otp_helpers.py).
+        **issue_test_otp(),
     }
     payload.update(overrides)
     return payload
@@ -207,6 +216,35 @@ def test_empty_customer_name_rejected(client, auth_headers):
     assert r.status_code == 422
 
 
+def test_mandatory_address_rejected_when_empty_or_short(client, auth_headers):
+    product = _create_product(client, auth_headers)
+    # Missing address
+    payload_missing = _valid_payload(product["id"])
+    del payload_missing["address"]
+    assert client.post("/api/v1/commerce/requests", json=payload_missing).status_code == 422
+
+    # Blank / whitespace address
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], address="   ")).status_code == 422
+
+    # Too short address (< 5 chars)
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], address="تهر")).status_code == 422
+
+
+def test_mandatory_email_rejected_when_empty_or_invalid(client, auth_headers):
+    product = _create_product(client, auth_headers)
+    # Missing email
+    payload_missing = _valid_payload(product["id"])
+    del payload_missing["email"]
+    assert client.post("/api/v1/commerce/requests", json=payload_missing).status_code == 422
+
+    # Blank / whitespace email
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], email="   ")).status_code == 422
+
+    # Invalid email syntax
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], email="not-an-email")).status_code == 422
+    assert client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], email="user@no-domain")).status_code == 422
+
+
 def test_huge_note_rejected(client, auth_headers):
     product = _create_product(client, auth_headers)
     r = client.post("/api/v1/commerce/requests", json=_valid_payload(product["id"], note="x" * 2001))
@@ -242,8 +280,14 @@ def test_boundary_payload_is_accepted(client, auth_headers):
 
 def test_public_post_is_rate_limited(client, auth_headers):
     product = _create_product(client, auth_headers)
-    payload = _valid_payload(product["id"])
-    statuses = [client.post("/api/v1/commerce/requests", json=payload).status_code for _ in range(6)]
+    # A fresh challenge per POST: the OTP is single-use, so reusing one payload
+    # would fail the gate (400) before the limiter is reached.
+    statuses = [
+        client.post(
+            "/api/v1/commerce/requests", json=_valid_payload(product["id"])
+        ).status_code
+        for _ in range(6)
+    ]
     assert statuses[:5] == [200] * 5
     assert statuses[5] == 429
 
@@ -426,3 +470,71 @@ def test_permanent_delete_handles_legacy_items_table(client, auth_headers):
     rows = client.get("/api/v1/commerce/staff/requests", headers=auth_headers).json()
     assert rows[0]["items"][0]["product_id"] is None
     assert rows[0]["items"][0]["display_name"] == "محصول قدیمی"
+
+
+# ── OTP consumption is atomic with request creation ──────────────────
+
+def _otp_payload(product_id, qty=1, **overrides):
+    """A payload bound to ONE explicit challenge (unlike ``_valid_payload``)."""
+    payload = {
+        "customer_name": "رضا",
+        "email": "reza@example.com",
+        "mobile": "09123456789",
+        "messenger": "telegram",
+        "address": "تهران، میدان آزادی، خیابان آزادی، پلاک ۱۰",
+        "items": [{"product_id": product_id, "qty": qty}],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_failed_creation_does_not_burn_the_otp(client, auth_headers):
+    """A rejected creation (inactive product) must leave the code usable.
+
+    The OTP is claimed in the same transaction as the request, so a validation
+    failure rolls the claim back. The customer can retry with the *same* code
+    instead of being stranded until the resend cooldown expires.
+    """
+    active = _create_product(client, auth_headers, name="فعال", price=50000)
+    inactive = _create_product(client, auth_headers, name="غیرفعال", price=50000)
+    upd = client.put(
+        f"/api/v1/products/{inactive['id']}", json={"is_active": False}, headers=auth_headers
+    )
+    assert upd.status_code in (200, 201), upd.text
+
+    otp = issue_test_otp()  # one challenge, deliberately reused across attempts
+
+    rejected = client.post(
+        "/api/v1/commerce/requests",
+        json=_otp_payload(inactive["id"], **otp),
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert client.get(
+        "/api/v1/commerce/staff/requests", headers=auth_headers
+    ).json() == []
+
+    # Same challenge + code, valid cart: the failed attempt did NOT consume it.
+    ok = client.post(
+        "/api/v1/commerce/requests",
+        json=_otp_payload(active["id"], **otp),
+    )
+    assert ok.status_code == 200, ok.text
+    assert len(client.get(
+        "/api/v1/commerce/staff/requests", headers=auth_headers
+    ).json()) == 1
+
+
+def test_otp_is_single_use_across_two_submissions(client, auth_headers):
+    """After a successful request the challenge is consumed — no reuse."""
+    product = _create_product(client, auth_headers)
+    otp = issue_test_otp()
+
+    first = client.post("/api/v1/commerce/requests", json=_otp_payload(product["id"], **otp))
+    assert first.status_code == 200, first.text
+
+    second = client.post("/api/v1/commerce/requests", json=_otp_payload(product["id"], **otp))
+    assert second.status_code == 400, second.text
+
+    assert len(client.get(
+        "/api/v1/commerce/staff/requests", headers=auth_headers
+    ).json()) == 1

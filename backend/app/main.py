@@ -33,10 +33,25 @@ from app.log_redaction import install_access_log_redaction
 install_access_log_redaction()
 from fastapi import FastAPI, Depends, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.database import engine, SessionLocal, Base
-from app.models import Settings, Machine, Material, Product, Category, ProductImage, Order, ProductCategory, BlogPost, SiteView
+from app.models import (
+    Settings,
+    Machine,
+    Material,
+    Product,
+    Category,
+    ProductImage,
+    Order,
+    ProductCategory,
+    BlogPost,
+    SiteView,
+    AccountingCategory,
+    AccountingTransaction,
+    seed_accounting_categories,
+)
 from app.seed import seed_all
 from fastapi import HTTPException
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -60,7 +75,14 @@ from app.routers.custom_orders import router as custom_orders_router
 from app.routers.customers import router as customers_router
 from app.routers.audit_logs import router as audit_router
 from app.routers.commerce import router as commerce_router
+from app.routers.commerce_history import (
+    NO_STORE_HEADERS,
+    router as commerce_history_router,
+)
 from app.routers.digipay_callback import router as digipay_callback_router
+from app.routers.snappay_callback import router as snappay_callback_router
+from app.routers.bitpay_callback import router as bitpay_callback_router
+from app.routers.accounting import router as accounting_router
 from app.telegram_bot import start_telegram_bot_thread, send_telegram_notification
 
 from sqlalchemy import inspect, text
@@ -68,6 +90,29 @@ from sqlalchemy import inspect, text
 # ── Uploads directory ────────────────────────────────────────────────
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ── Accounting module: schema + chart-of-accounts seed (Task 1) ───────
+# ``Base.metadata.create_all`` already creates these two tables on a fresh
+# database; the explicit existence check keeps a deployed database that predates
+# the accounting module in step without a manual migration, and is a no-op once
+# the tables exist. ``create_all`` never alters an existing table, so nothing
+# else here needs to change on a later startup.
+def ensure_accounting_schema_and_seed(db, bind=None) -> int:
+    """Create the accounting tables if missing, then seed default categories.
+
+    Idempotent — safe on every startup. Returns the number of seed categories
+    inserted (0 when the chart of accounts is already complete).
+    """
+    bind = bind if bind is not None else db.get_bind()
+    tables = set(inspect(bind).get_table_names())
+    if "accounting_categories" not in tables:
+        print("Creating accounting_categories table...")
+        AccountingCategory.__table__.create(bind=bind)
+    if "accounting_transactions" not in tables:
+        print("Creating accounting_transactions table...")
+        AccountingTransaction.__table__.create(bind=bind)
+    return seed_accounting_categories(db)
 
 
 @asynccontextmanager
@@ -193,6 +238,13 @@ async def lifespan(app: FastAPI):
             from app.models import SiteView
             SiteView.__table__.create(bind=engine)
 
+        # Migration: accounting tables + default chart of accounts (Task 1).
+        # Idempotent: creates the tables on a pre-accounting database and seeds
+        # any missing system «سرفصل» without duplicating or resurrecting rows.
+        seeded_categories = ensure_accounting_schema_and_seed(db)
+        if seeded_categories:
+            print(f"Seeded {seeded_categories} default accounting categories.")
+
         # Always sync: move any products with old category string but no m2m association
         from app.models import ProductCategory
         products_needing_sync = (
@@ -251,6 +303,23 @@ async def lifespan(app: FastAPI):
                         )
                     )
                 print("Added commerce_payment_attempts.reconciliation_required column.")
+
+        # Migration: commerce_requests.email + commerce_invoices.email
+        tables = inspect(engine).get_table_names()
+        if "commerce_requests" in tables:
+            req_cols = {c["name"] for c in inspect(engine).get_columns("commerce_requests")}
+            if "email" not in req_cols:
+                print("Adding commerce_requests.email column...")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE commerce_requests ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT ''"))
+                print("Added commerce_requests.email column.")
+        if "commerce_invoices" in tables:
+            inv_cols = {c["name"] for c in inspect(engine).get_columns("commerce_invoices")}
+            if "email" not in inv_cols:
+                print("Adding commerce_invoices.email column...")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE commerce_invoices ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT ''"))
+                print("Added commerce_invoices.email column.")
 
         # Migration: products.created_at
         product_cols = {c["name"] for c in inspector.get_columns("products")}
@@ -371,6 +440,43 @@ async def add_cms_branding_headers(request: Request, call_next):
     response.headers["X-CMS"] = "Spaghetti-CMS/1.0"
     return response
 
+
+# ── Order-history API no-store boundary ──────────────────────────────
+# The public history bearer is private data, and its responses include ones no
+# handler can stamp: FastAPI's request-validation ``422`` and slowapi's ``429``
+# are produced before/around a route handler. This prefix middleware backstops
+# every history response, success or error, with no-store/no-referrer. It is
+# added last, so it wraps the slowapi middleware and observes its 429 too.
+HISTORY_API_PREFIX = "/api/v1/commerce/history"
+
+
+@app.middleware("http")
+async def history_api_no_store(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith(HISTORY_API_PREFIX):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+# ── History API 500 backstop ─────────────────────────────────────────
+# An unhandled exception produces a ``500`` in Starlette's
+# ``ServerErrorMiddleware`` — the OUTERMOST layer, outside every user middleware
+# — so ``history_api_no_store`` above never sees it. FastAPI routes an
+# ``Exception`` (or ``500``) handler into that same outer middleware, so we
+# register one that stamps the history security headers itself. Every other path
+# gets the framework's default ``Internal Server Error`` body verbatim, and
+# ``ServerErrorMiddleware`` still re-raises afterwards, so uvicorn keeps logging
+# the traceback and ``TestClient(raise_server_exceptions=True)`` is unchanged.
+def _history_api_error_response(request: Request, exc: Exception):
+    headers = (
+        NO_STORE_HEADERS if request.url.path.startswith(HISTORY_API_PREFIX) else None
+    )
+    return PlainTextResponse("Internal Server Error", status_code=500, headers=headers)
+
+
+app.add_exception_handler(Exception, _history_api_error_response)
+
 # ── Include routers ──────────────────────────────────────────────────
 app.include_router(settings_router, dependencies=[Depends(require_staff_role)])
 # Public branding endpoint (favicon/logo) — no auth required, different path to avoid auth collision
@@ -393,7 +499,11 @@ app.include_router(customers_router)
 app.include_router(audit_router)
 app.include_router(catalog_router)  # No auth — public catalog
 app.include_router(commerce_router)  # Public request intake + staff request listing (auth per route)
+app.include_router(commerce_history_router)  # Public «سفارش‌های من» history (explicit bearer per route)
 app.include_router(digipay_callback_router)  # DigiPay UPG callback (untrusted form POST, verify server-side)
+app.include_router(snappay_callback_router)  # SnappPay onboarding reachability stub (no payment processing)
+app.include_router(bitpay_callback_router)  # BitPay GET callback (untrusted query, verify server-side)
+app.include_router(accounting_router, dependencies=[Depends(require_staff_role)])  # Accounting ledger — staff only
 
 # ── Static files for uploads with immutable caching ─────────────────
 class CachedStaticFiles(StaticFiles):

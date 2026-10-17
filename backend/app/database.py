@@ -80,6 +80,37 @@ def _migrate_orders():
 _migrate_orders()
 
 
+def _migrate_commerce_payment_attempts():
+    """Add Task 2 columns to ``commerce_payment_attempts`` (SQLite-safe).
+
+    ``create_all`` never alters an existing table, so a deployed database that
+    already holds DigiPay attempts needs the new ``provider_trans_id`` column
+    added in place. Guarded by a ``PRAGMA table_info`` check so it is a no-op on
+    a fresh database (the model already defines the column there).
+    """
+    try:
+        with engine.connect() as conn:
+            cols = {
+                row[1]
+                for row in conn.execute(
+                    text("PRAGMA table_info(commerce_payment_attempts)")
+                )
+            }
+            if cols and "provider_trans_id" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE commerce_payment_attempts "
+                        "ADD COLUMN provider_trans_id INTEGER"
+                    )
+                )
+                logger.info("Added commerce_payment_attempts.provider_trans_id column")
+    except Exception as exc:
+        logger.warning("Payment-attempt migration skipped: %s", exc)
+
+
+_migrate_commerce_payment_attempts()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

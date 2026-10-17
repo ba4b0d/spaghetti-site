@@ -19,6 +19,7 @@ SMTP client, Telegram sender) is replaced by a fake.
 import pytest
 
 from app.services import commerce_notifications as cn
+from tests.otp_helpers import issue_test_otp
 
 BASE = "/api/v1/commerce"
 
@@ -392,6 +393,43 @@ def test_post_sms_ir_verify_http_error_returns_false():
     ) is False
 
 
+def test_send_customer_otp_uses_otp_and_time_template_params(monkeypatch):
+    """Cart-OTP template 337011 substitutes the exact names ``OTP`` / ``TIME``.
+
+    The approved customer template carries ``#OTP#`` (the one-time code) and
+    ``#TIME#`` (validity in minutes). SMS.ir substitutes by exact,
+    case-sensitive name, so the single old ``CODE`` parameter left both
+    placeholders unsubstituted and the customer received the literal text.
+    """
+    # Deterministic regardless of a developer's .env.
+    for var in (
+        "SMS_IR_OTP_TEMPLATE_ID",
+        "SMS_IR_OTP_PARAM_OTP",
+        "SMS_IR_OTP_PARAM_TIME",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SMS_IR_API_KEY", "K")
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        cn, "post_sms_ir_verify", lambda **kw: captured.update(kw) or True
+    )
+
+    from app.services.commerce_otp import OTP_TTL_SECONDS
+
+    assert cn.send_customer_otp("09120000000", "54321") is True
+
+    assert captured["mobile"] == "09120000000"
+    assert captured["template_id"] == 337011  # the customer OTP template
+    params = captured["parameters"]
+    assert [p["name"] for p in params] == ["OTP", "TIME"]
+    values = {p["name"]: p["value"] for p in params}
+    assert values["OTP"] == "54321"
+    # The cart code lives 5 minutes, so the template's ``#TIME#`` renders ``5``.
+    assert values["TIME"] == "5"
+    assert OTP_TTL_SECONDS == 300
+
+
 def test_smtp_starttls_login_and_send():
     instances = []
     config = {
@@ -494,9 +532,14 @@ def _create_product(client, auth_headers, *, name="محصول تستی", price=5
 def _request_payload(product_id, qty=1):
     return {
         "customer_name": "رضا",
+        "email": "reza@example.com",
         "mobile": "09123456789",
         "messenger": "telegram",
+        "address": "تهران، خیابان آزادی، کوچه صادقی، پلاک ۱۵",
         "items": [{"product_id": product_id, "qty": qty}],
+        # Public intake now requires a verified OTP; mint a live challenge so
+        # the notification wiring keeps being exercised (no SMS is sent).
+        **issue_test_otp(),
     }
 
 
@@ -611,9 +654,14 @@ class _FakeDigiPay:
 
 
 @pytest.fixture()
-def fake_provider(client):
+def fake_provider(client, monkeypatch):
     from app.main import app
     from app.services import digipay
+
+    # DigiPay is parked in production (the legacy initiation route is a hard
+    # 503); these notification tests still drive the settlement path, so they opt
+    # in explicitly through the predicate seam.
+    monkeypatch.setattr(digipay, "checkout_enabled", lambda: True)
 
     fake = _FakeDigiPay()
     app.dependency_overrides[digipay.client_dependency] = lambda: fake
@@ -1020,3 +1068,26 @@ def test_staff_notify_is_rate_limited(client, auth_headers, monkeypatch):
         for _ in range(13)
     ]
     assert 429 in statuses
+
+
+def test_invoice_approval_dispatches_telegram_pdf_document(client, auth_headers, monkeypatch):
+    """When an invoice is approved, the generated PDF document is sent to Telegram admins."""
+    docs_sent = []
+
+    def _fake_doc(file_path, caption=""):
+        with open(file_path, "rb") as f:
+            data = f.read()
+        docs_sent.append({"data": data, "caption": caption})
+        return True
+
+    monkeypatch.setattr(cn, "send_telegram_document", _fake_doc)
+    monkeypatch.setattr(cn, "send_telegram_message", lambda text: cn.SENT)
+
+    invoice_id = _draft_invoice(client, auth_headers)
+    appr = client.post(f"{BASE}/staff/invoices/{invoice_id}/approve", headers=auth_headers)
+    assert appr.status_code == 200, appr.text
+
+    assert len(docs_sent) == 1
+    doc = docs_sent[0]
+    assert doc["data"].startswith(b"%PDF-")
+    assert f"#{invoice_id}" in doc["caption"] or "اسپاگتی پرینت" in doc["caption"]

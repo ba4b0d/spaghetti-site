@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, String, Boolean, Date, DateTime, ForeignKey, UniqueConstraint, Index, text
+from sqlalchemy import Column, Integer, BigInteger, Float, String, Boolean, Date, DateTime, ForeignKey, UniqueConstraint, Index, text
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 import re
@@ -318,6 +318,7 @@ class CommerceRequest(Base):
     receipt_id = Column(String(40), unique=True, nullable=False, index=True)  # opaque public receipt
     customer_name = Column(String(120), nullable=False)
     mobile = Column(String(11), nullable=False, index=True)   # Iranian 09xxxxxxxxx
+    email = Column(String(255), nullable=False, default="")
     messenger = Column(String(20), nullable=False)            # telegram | bale
     messenger_handle = Column(String(100), default="")
     address = Column(String(500), default="")
@@ -367,6 +368,31 @@ class CommerceRequestItem(Base):
     product = relationship("Product", lazy="joined")
 
 
+# ── Commerce: storefront cart OTP challenges ─────────────────────────
+# A short-lived, single-use proof-of-ownership for the mobile number a
+# customer enters at checkout. Only a *salted hash* of the code is persisted:
+# the plaintext code is never stored and never logged. A challenge is
+# invalidated the moment it is consumed, superseded by a newer challenge for
+# the same mobile, or exhausted by too many wrong attempts.
+class CommerceOtpChallenge(Base):
+    """One pending SMS one-time-code challenge for a storefront cart request."""
+
+    __tablename__ = "commerce_otp_challenges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    mobile = Column(String(11), nullable=False, index=True)
+    # 16 random bytes rendered as 32 hex chars; each code keeps its own salt so
+    # two identical codes never share a hash.
+    code_salt = Column(String(32), nullable=False)
+    code_hash = Column(String(64), nullable=False)       # SHA-256 hex of salt+code
+    expires_at = Column(DateTime, nullable=False, index=True)
+    consumed_at = Column(DateTime, nullable=True)        # set on success/invalidation
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    # SHA-256 hash of the issuing client IP — never the raw address.
+    client_ip_hash = Column(String(64), nullable=True)
+
+
 # ── Commerce: staff-reviewed invoices + private payment links (Task 2) ──
 # An invoice is the ONLY payable commerce artifact. A website request can
 # never be paid directly; staff must convert it into a reviewed invoice.
@@ -407,6 +433,7 @@ class CommerceInvoice(Base):
     )
     customer_name = Column(String(120), nullable=False, default="")
     mobile = Column(String(11), nullable=False, default="", index=True)
+    email = Column(String(255), nullable=False, default="")
     messenger = Column(String(20), nullable=False, default="telegram")
     messenger_handle = Column(String(100), default="")
     address = Column(String(500), default="")
@@ -499,6 +526,10 @@ COMMERCE_PAYMENT_ATTEMPT_STATES = (
 ACTIVE_PAYMENT_ATTEMPT_STATES = ("initiating", "pending", "unknown")
 
 PAYMENT_PROVIDER_DIGIPAY = "digipay"
+# Task 2: the BitPay gateway is a second provider recorded on the same attempt
+# table. ``provider`` therefore identifies which adapter issued the attempt and
+# must never be assumed to be DigiPay by shared settlement code.
+PAYMENT_PROVIDER_BITPAY = "bitpay"
 
 # DigiPay UPG ticket type used in v1. Only the IPG/Wallet direct-payment flow
 # is enabled: credit/BNPL additionally require a `basketDetailsDto` payload and
@@ -512,8 +543,12 @@ class CommercePaymentAttempt(Base):
 
     ``provider_id`` is the unique merchant reference sent to DigiPay and echoed
     back on the callback, which is how a stateless callback is matched to its
-    invoice without a bearer token in the URL. ``amount_rial`` is the immutable
-    Toman→Rial conversion (total_toman * 10) computed server-side exactly once.
+    invoice without a bearer token in the URL. For a BitPay attempt it instead
+    holds the attempt's own Latin-decimal id — the integer ``factorId`` the
+    documented gateway requires (any non-integer reference is silently coerced
+    to ``0``) — which is what the verify echo is matched against.
+    ``amount_rial`` is the immutable Toman→Rial conversion (total_toman * 10)
+    computed server-side exactly once.
     """
     __tablename__ = "commerce_payment_attempts"
     __table_args__ = (
@@ -547,6 +582,13 @@ class CommercePaymentAttempt(Base):
     # request must never reuse the ticket type in place of this value.
     payment_method = Column(Integer, nullable=True)
     tracking_code = Column(String(80), nullable=True)
+    # BitPay's ``gateway-result-second`` verify needs BOTH the ``trans_id`` (the
+    # transaction id the payer portal appends to our GET callback) and the
+    # ``id_get`` returned by ``gateway-send`` at initiation. ``tracking_code``
+    # holds the durable ``id_get`` (it is the key that links an untrusted GET
+    # callback back to the attempt); this column holds the ``trans_id`` so a
+    # timed-out verify can still be reconciled by staff. NULL for DigiPay.
+    provider_trans_id = Column(Integer, nullable=True)
     redirect_url = Column(String(1000), nullable=True)
     last_error = Column(String(300), nullable=True)
     verified_at = Column(DateTime, nullable=True)
@@ -566,4 +608,192 @@ class CommercePaymentAttempt(Base):
     )
 
     invoice = relationship("CommerceInvoice", lazy="joined")
+
+
+# ── Commerce: history-purpose OTP challenges + one-visit sessions ────
+# «سفارشهای من» proves ownership of a mobile with its OWN challenge table, so a
+# checkout OTP can never be verified (or consumed) here and a history OTP can
+# never authorize a cart request. The SMS budget, however, is deliberately
+# shared across both purposes — see ``commerce_otp.count_recent_sends``.
+class CommerceHistoryOtpChallenge(Base):
+    """One pending SMS one-time-code challenge for the order-history page.
+
+    Same shape as ``CommerceOtpChallenge`` (salted hash only, single-use,
+    attempt-limited) but purpose-specific state: the history page must not be
+    able to spend — or be spent by — a checkout challenge.
+    """
+
+    __tablename__ = "commerce_history_otp_challenges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    mobile = Column(String(11), nullable=False, index=True)
+    code_salt = Column(String(32), nullable=False)
+    code_hash = Column(String(64), nullable=False)       # SHA-256 hex of salt+code
+    expires_at = Column(DateTime, nullable=False, index=True)
+    consumed_at = Column(DateTime, nullable=True)        # set on success/invalidation
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    # SHA-256 hash of the issuing client IP — never the raw address.
+    client_ip_hash = Column(String(64), nullable=True, index=True)
+
+
+class CommerceHistorySession(Base):
+    """A short-lived, revocable read session for one verified mobile.
+
+    Only the SHA-256 hash of the bearer is persisted: the raw token is returned
+    to the client exactly once, lives in tab-scoped ``sessionStorage`` and is
+    never logged. The 30-minute absolute TTL (enforced by the service) bounds
+    replay of a copied token; revocation is a server-side write.
+    """
+
+    __tablename__ = "commerce_history_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    mobile = Column(String(11), nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+# ── Accounting: cash-basis ledger (دفتر حسابداری) ─────────────────────
+# A category is one «سرفصل» (chart-of-accounts line). The defaults below are
+# seeded as ``is_system=True`` at startup: staff may add custom categories and
+# archive (soft-delete) any of them, but a system category can never be deleted
+# or have its ``type`` changed — see the accounting router (Task 2).
+ACCOUNTING_TYPES = ("income", "expense")
+
+# Default expense «سرفصل»s (seeded verbatim, in display order).
+DEFAULT_EXPENSE_CATEGORY_NAMES = (
+    "خرید فیلامنت و متریال",
+    "قطعات یدکی و نگهداری پرینتر",
+    "بسته‌بندی و کارتن",
+    "هزینه ارسال و پست",
+    "هزینه اشتراک و اینترنت",
+    "برق کارگاه",
+    "تبلیغات و مارکتینگ",
+    "سایر هزینه‌ها",
+)
+
+# Default income «سرفصل»s (seeded verbatim, in display order).
+DEFAULT_INCOME_CATEGORY_NAMES = (
+    "فروش محصول و خدمات",
+    "سایر درآمدها",
+)
+
+# The system income category every auto-synced (paid-invoice) transaction is
+# booked against, so online/manual invoice income never lands in «سایر درآمدها».
+SYSTEM_SALES_INCOME_CATEGORY_NAME = DEFAULT_INCOME_CATEGORY_NAMES[0]
+
+
+class AccountingCategory(Base):
+    """One ledger category (سرفصل درآمد/هزینه) of the accounting module."""
+
+    __tablename__ = "accounting_categories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    type = Column(String(20), nullable=False, index=True)  # income | expense
+    # Seeded defaults are system rows: they cannot be deleted or retyped, so the
+    # auto-sync code can rely on e.g. “فروش محصول و خدمات” always existing.
+    is_system = Column(Boolean, default=False, nullable=False)
+    # Soft deletion (archive) — archived categories keep their historical
+    # transactions and stay out of the pickers.
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class AccountingTransaction(Base):
+    """One cash-basis income/expense line of the accounting ledger.
+
+    ``amount_toman`` is integer Toman stored as ``BigInteger`` so a ``SUM()``
+    over the table cannot overflow 32 bits. ``invoice_id`` is UNIQUE as well as
+    indexed: the invoice→income sync is idempotent at the database level, so a
+    replayed payment callback can never double-book the same invoice.
+    ``transaction_date`` is a Gregorian ``YYYY-MM-DD`` date — Shamsi conversion
+    happens only at the UI/export boundary.
+    """
+
+    __tablename__ = "accounting_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    # RESTRICT: a category with booked transactions cannot be hard-deleted
+    # (staff archive it instead, which keeps history readable).
+    category_id = Column(
+        Integer,
+        ForeignKey("accounting_categories.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    type = Column(String(20), nullable=False, index=True)  # income | expense
+    amount_toman = Column(BigInteger, nullable=False)
+    transaction_date = Column(Date, nullable=False, index=True)
+    # bank | cash | gateway | other — where the money actually moved.
+    account_type = Column(String(30), default="bank", nullable=False)
+    reference_code = Column(String(100), default="")
+    description = Column(String(1000), default="")
+    attachment_url = Column(String(500), nullable=True)
+    # Set only for auto-synced invoice income. The accounting router refuses to
+    # change the amount/type of such a row and refuses to delete it.
+    invoice_id = Column(
+        Integer,
+        ForeignKey("commerce_invoices.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
+    order_id = Column(
+        Integer,
+        ForeignKey("orders.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_by_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    category = relationship("AccountingCategory")
+    invoice = relationship("CommerceInvoice")
+    order = relationship("Order")
+
+
+def seed_accounting_categories(db) -> int:
+    """Insert any missing default system accounting category (idempotent).
+
+    A category counts as already present when a row with the same ``name`` AND
+    ``type`` exists — ``is_active`` is deliberately ignored, so an archived
+    system category is never resurrected on the next startup. Returns the number
+    of rows inserted (0 when the chart of accounts is already complete).
+
+    Safe to call on every startup: it commits only when it actually inserted.
+    """
+    existing = {
+        (name, ctype)
+        for name, ctype in db.query(AccountingCategory.name, AccountingCategory.type).all()
+    }
+
+    added = 0
+    for ctype, names in (
+        ("expense", DEFAULT_EXPENSE_CATEGORY_NAMES),
+        ("income", DEFAULT_INCOME_CATEGORY_NAMES),
+    ):
+        for name in names:
+            if (name, ctype) in existing:
+                continue
+            db.add(AccountingCategory(name=name, type=ctype, is_system=True, is_active=True))
+            existing.add((name, ctype))
+            added += 1
+
+    if added:
+        db.commit()
+    return added
 

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import {
   Image,
@@ -8,9 +8,9 @@ import {
   PenTool,
   PackageCheck,
   Send,
-  CheckCircle2,
+  Phone,
 } from 'lucide-react';
-import { submitCustomOrder } from '../lib/api';
+import { getContact } from '../lib/api';
 import { useSEO, buildWebSiteJsonLd } from '../lib/seo';
 
 const STEPS = [
@@ -52,107 +52,26 @@ const STEPS = [
   },
 ];
 
-function CustomOrderForm() {
-  const [form, setForm] = useState({ name: '', contact: '', channel: 'telegram', description: '', reference_product: '' });
-  const [status, setStatus] = useState('idle'); // idle | submitting | success | error
-  const [error, setError] = useState('');
+function formatPhoneHref(phone) {
+  const clean = (phone || '').replace(/\s+/g, '');
+  const rawDigits = clean.replace(/[^0-9]/g, '');
+  if (!rawDigits) return 'tel:+989981923856';
+  const intl = rawDigits.startsWith('98')
+    ? `+${rawDigits}`
+    : rawDigits.startsWith('0')
+    ? `+98${rawDigits.slice(1)}`
+    : `+98${rawDigits}`;
+  return `tel:${clean.startsWith('+') ? clean : intl}`;
+}
 
-  const handleChange = (e) => setForm({ ...form, [e.target.name]: e.target.value });
+function formatTelegramHref(handle) {
+  const clean = (handle || '').replace(/^@/, '').trim();
+  return clean ? `https://t.me/${clean}` : 'https://t.me/spaghetti_print';
+}
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!form.contact.trim() || form.contact.trim().length < 3) {
-      setError('لطفاً حداقل یک راه ارتباطی (شماره یا آیدی) وارد کنید.');
-      return;
-    }
-    setStatus('submitting');
-    setError('');
-    try {
-      await submitCustomOrder(form);
-      setStatus('success');
-    } catch (err) {
-      setStatus('error');
-      setError(err?.response?.data?.detail || 'خطا در ثبت درخواست. لطفاً دوباره تلاش کنید.');
-    }
-  };
-
-  if (status === 'success') {
-    return (
-      <div className="p-8 rounded-2xl text-center space-y-3" style={{ backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-color)' }}>
-        <CheckCircle2 size={40} className="mx-auto" style={{ color: '#16a34a' }} />
-        <h3 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>درخواست شما ثبت شد!</h3>
-        <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-          به‌زودی برای استعلام قیمت با شما تماس می‌گیریم. همچنین می‌توانید از طریق پیام‌رسان‌ها سریع‌تر پاسخ بگیرید.
-        </p>
-        <Link to="/contact" className="public-btn public-btn-primary inline-flex items-center gap-2 mt-2">
-          <MessageCircle size={16} />
-          ارتباط مستقیم
-        </Link>
-      </div>
-    );
-  }
-
-  return (
-    <form onSubmit={handleSubmit} className="p-6 rounded-2xl space-y-4" style={{ backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-color)' }}>
-      <h3 className="font-bold text-lg" style={{ color: 'var(--text-primary)' }}>درخواست سریع سفارش</h3>
-      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-        فرم را پر کنید؛ ما در سریع‌ترین زمان استعلام قیمت می‌فرستیم.
-      </p>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div>
-          <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-primary)' }}>نام شما</label>
-          <input name="name" value={form.name} onChange={handleChange} className="input-field" placeholder="نام و نام خانوادگی" />
-        </div>
-        <div>
-          <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-primary)' }}>
-            راه ارتباطی <span style={{ color: 'var(--danger)' }}>*</span>
-          </label>
-          <input name="contact" value={form.contact} onChange={handleChange} className="input-field" placeholder="شماره موبایل یا آیدی تلگرام" required />
-        </div>
-      </div>
-
-      <div>
-        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-primary)' }}>کانال ارتباطی</label>
-        <select name="channel" value={form.channel} onChange={handleChange} className="select-field">
-          <option value="telegram">تلگرام</option>
-          <option value="instagram">اینستاگرام</option>
-          <option value="bale">بله</option>
-          <option value="phone">تماس تلفنی</option>
-        </select>
-      </div>
-
-      <div>
-        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-primary)' }}>توضیح طرح / قطعه</label>
-        <textarea name="description" value={form.description} onChange={handleChange} className="input-field" rows={4} placeholder="چه چیزی می‌خواهید؟ ابعاد حدودی، جنس، رنگ، یا اگر فایل STL/عکس دارید توضیح دهید..." />
-      </div>
-
-      <div>
-        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-primary)' }}>کد محصول (اختیاری)</label>
-        <input name="reference_product" value={form.reference_product} onChange={handleChange} className="input-field" placeholder="مثلاً KE015 — اگر از کاتالوگ انتخاب کرده‌اید" />
-      </div>
-
-      {error && (
-        <div className="p-3 rounded-lg text-sm" style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}>
-          {error}
-        </div>
-      )}
-
-      <button type="submit" disabled={status === 'submitting'} className="btn-primary w-full inline-flex items-center justify-center gap-2">
-        {status === 'submitting' ? (
-          <>
-            <span className="w-4 h-4 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: '#fff', borderTopColor: 'transparent' }} />
-            در حال ثبت...
-          </>
-        ) : (
-          <>
-            <Send size={16} />
-            ثبت درخواست استعلام قیمت
-          </>
-        )}
-      </button>
-    </form>
-  );
+function formatBaleHref(handle) {
+  const clean = (handle || '').replace(/^@/, '').trim();
+  return clean ? `https://ble.ir/${clean}` : 'https://ble.ir/spaghetti_print';
 }
 
 export default function CustomOrder() {
@@ -162,6 +81,32 @@ export default function CustomOrder() {
     url: '/custom-order',
     jsonLd: buildWebSiteJsonLd(),
   });
+
+  const [contact, setContact] = useState({
+    telegram: 'spaghetti_print',
+    bale: 'spaghetti_print',
+    phone: '0998 192 3856',
+  });
+
+  useEffect(() => {
+    getContact()
+      .then((res) => {
+        const api = res.data || {};
+        const tg = (api.contact_telegram || '').replace(/^@/, '').trim();
+        const bl = (api.contact_bale || '').replace(/^@/, '').trim();
+        const ph = (api.contact_phone || '').trim();
+        setContact((prev) => ({
+          telegram: tg || prev.telegram,
+          bale: bl || prev.bale,
+          phone: ph || prev.phone,
+        }));
+      })
+      .catch(() => {});
+  }, []);
+
+  const telegramHref = formatTelegramHref(contact.telegram);
+  const baleHref = formatBaleHref(contact.bale);
+  const phoneHref = formatPhoneHref(contact.phone);
 
   return (
     <div className="public-page" dir="rtl">
@@ -192,13 +137,42 @@ export default function CustomOrder() {
       </ol>
 
       <div className="public-page-actions">
-        <Link to="/contact" className="public-btn public-btn-primary">
-          تماس با ما
-        </Link>
+        <a
+          href={telegramHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="public-btn public-btn-telegram"
+        >
+          <Send size={18} />
+          <span>ارسال پیام در تلگرام</span>
+        </a>
+
+        <a
+          href={baleHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="public-btn public-btn-bale"
+        >
+          <MessageCircle size={18} />
+          <span>ارسال پیام در بله</span>
+        </a>
+
+        <a
+          href={phoneHref}
+          className="public-btn public-btn-phone"
+        >
+          <Phone size={18} />
+          <span>تماس تلفنی</span>
+        </a>
       </div>
 
-      <div className="max-w-3xl mx-auto px-4 sm:px-6 mt-16">
-        <CustomOrderForm />
+      <div className="text-center mt-6">
+        <Link
+          to="/contact"
+          className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 hover:text-orange-400 transition-colors"
+        >
+          مشاهده سایر اطلاعات در صفحه تماس با ما ←
+        </Link>
       </div>
     </div>
   );

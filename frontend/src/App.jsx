@@ -26,13 +26,15 @@ const Terms = lazy(() => import('./pages/Terms'));
 const DigitalCard = lazy(() => import('./pages/DigitalCard'));
 const InvoicePayment = lazy(() => import('./pages/InvoicePayment'));
 const PaymentResult = lazy(() => import('./pages/PaymentResult'));
+const PaymentHandoff = lazy(() => import('./pages/PaymentHandoff'));
 const UsersPage = lazy(() => import('./pages/Users'));
 const Categories = lazy(() => import('./pages/Categories'));
 const Collections = lazy(() => import('./pages/Collections'));
 const Orders = lazy(() => import('./pages/Orders'));
 const CommerceAdmin = lazy(() => import('./pages/CommerceAdmin'));
-const CustomOrders = lazy(() => import('./pages/CustomOrders'));
+const Accounting = lazy(() => import('./pages/Accounting'));
 const Customers = lazy(() => import('./pages/Customers'));
+const CustomerOrders = lazy(() => import('./pages/CustomerOrders'));
 const AuditLogs = lazy(() => import('./pages/AuditLogs'));
 const BlogList = lazy(() => import('./pages/BlogList'));
 const BlogPostDetail = lazy(() => import('./pages/BlogPostDetail'));
@@ -95,8 +97,14 @@ function AppRoutes() {
                 <Route path="/cart" element={<CatalogLayout><CheckoutRequest /></CatalogLayout>} />
                 <Route path="/contact" element={<CatalogLayout><Contact /></CatalogLayout>} />
                 <Route path="/card" element={<DigitalCard />} />
+                {/* Public one-visit order history — no account, tab-only session. */}
+                <Route path="/my-orders" element={<CatalogLayout><CustomerOrders /></CatalogLayout>} />
                 {/* Generic, token-free result page (backend callback 303 target). */}
                 <Route path="/pay/result" element={<PaymentResult />} />
+                {/* Token-free same-origin gateway hand-off page. Ranked above
+                    the dynamic /pay/:token route (static segments win), so the
+                    private invoice page never resolves here. */}
+                <Route path="/pay/redirect" element={<PaymentHandoff />} />
                 {/* Public private invoice payment page. */}
                 <Route path="/pay/:token" element={<InvoicePayment />} />
                 <Route path="/how-to-order" element={<CatalogLayout><HowToOrder /></CatalogLayout>} />
@@ -117,7 +125,8 @@ function AppRoutes() {
         <Route path="/collections" element={<ProtectedRoute><Layout><Collections /></Layout></ProtectedRoute>} />
         <Route path="/orders" element={<ProtectedRoute><Layout><Orders /></Layout></ProtectedRoute>} />
         <Route path="/commerce-admin" element={<ProtectedRoute><Layout><CommerceAdmin /></Layout></ProtectedRoute>} />
-        <Route path="/custom-orders" element={<ProtectedRoute><Layout><CustomOrders /></Layout></ProtectedRoute>} />
+        <Route path="/accounting" element={<ProtectedRoute><Layout><Accounting /></Layout></ProtectedRoute>} />
+        <Route path="/custom-orders" element={<Navigate to="/commerce-admin" replace />} />
         <Route path="/customers" element={<ProtectedRoute><Layout><Customers /></Layout></ProtectedRoute>} />
 
         {/* Protected admin only */}

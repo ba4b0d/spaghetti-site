@@ -128,12 +128,65 @@ describe('commerceApi public contract', () => {
     expect(config).toBeUndefined();
   });
 
-  it('starts a DigiPay payment via the token-scoped pay endpoint', async () => {
+  it('starts a BitPay payment via the explicit token-scoped pay endpoint', async () => {
     const { mod, commerceClient } = await loadCommerceApi();
 
-    mod.payInvoice('tok_XYZ');
+    mod.payInvoice('tok_XYZ', 'bitpay');
+
+    expect(commerceClient.post).toHaveBeenCalledWith('/invoices/tok_XYZ/pay/bitpay');
+  });
+
+  it('still maps the parked DigiPay method to its own endpoint when named', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+
+    mod.payInvoice('tok_XYZ', 'digipay');
 
     expect(commerceClient.post).toHaveBeenCalledWith('/invoices/tok_XYZ/pay');
+  });
+
+  it('rejects an unknown or missing method instead of defaulting', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+
+    await expect(mod.payInvoice('tok_XYZ')).rejects.toThrow(/unsupported payment method/);
+    await expect(mod.payInvoice('tok_XYZ', 'paypal')).rejects.toThrow(/unsupported payment method/);
+    expect(commerceClient.post).not.toHaveBeenCalled();
+  });
+
+  it('rejects inherited Object.prototype names instead of coercing them to a path', async () => {
+    // `PAY_INVOICE_PATHS[method]` on a plain object resolves inherited names
+    // (toString/constructor/__proto__/valueOf/…) to a truthy function/object,
+    // which the old `if (!path)` guard accepted — a prototype-lookup exploit
+    // that issued a bogus POST. Only own, string keys may ever match.
+    const { mod, commerceClient } = await loadCommerceApi();
+
+    for (const name of [
+      'toString',
+      'constructor',
+      'valueOf',
+      '__proto__',
+      'hasOwnProperty',
+      'isPrototypeOf',
+      'propertyIsEnumerable',
+    ]) {
+      await expect(mod.payInvoice('tok_XYZ', name)).rejects.toThrow(
+        /unsupported payment method/
+      );
+    }
+    // Non-string keys must not be coerced into a lookup either.
+    await expect(mod.payInvoice('tok_XYZ', {})).rejects.toThrow(/unsupported payment method/);
+    await expect(mod.payInvoice('tok_XYZ', ['bitpay'])).rejects.toThrow(
+      /unsupported payment method/
+    );
+    expect(commerceClient.post).not.toHaveBeenCalled();
+  });
+
+  it('reads the public payment-method readiness endpoint', async () => {
+    const { mod, commerceClient } = await loadCommerceApi();
+    const config = { signal: new AbortController().signal };
+
+    mod.getPaymentMethods(config);
+
+    expect(commerceClient.get).toHaveBeenCalledWith('/payment-methods', config);
   });
 
   it('does not force a login redirect on a public 401', async () => {

@@ -122,9 +122,16 @@ Copy `backend/.env.example` to `backend/.env` and configure:
 | `DIGIPAY_ENV` | DigiPay UPG base URL selector: `production` → `api.mydigipay.com`, `staging` (or `uat`/`test`) → `uat.mydigipay.info`. **Caution:** `staging` points every payment (and its redirect allowlist) at the UAT host — never combine it with live merchant credentials; leave as `production` | `production` |
 | `DIGIPAY_BASE_URL` | Optional HTTPS host override (DigiPay hosts only; any other host is refused) | *optional* |
 | `DIGIPAY_CALLBACK_URL` | Optional absolute HTTPS callback; defaults to `PUBLIC_SITE_ORIGIN` + `/api/v1/commerce/digipay/callback` | *optional* |
+| `BITPAY_API_KEY` | BitPay gateway API key. Leave blank to disable BitPay — its pay endpoint then returns `503` instead of pretending to work | *optional* |
+| `BITPAY_ENV` | BitPay environment selector: `production` → `/payment/*`, `test` (or `sandbox`/`staging`/`uat`) → `/payment-test/*` — both on `bitpay.ir`. A typo never silently means production | `production` |
+| `BITPAY_ENABLE_TEST_CHECKOUT` | Explicit opt-in for a **non-production** test checkout. BitPay becomes payable — both the pay-page CTA **and** the server-side initiation endpoint — only when this is truthy **and** `BITPAY_ENV=test` **and** `PUBLIC_SITE_ORIGIN` is a provably non-production origin. The production hosts `spaghettiprints.ir`/`www.spaghettiprints.ir` are never allowed (a trailing dot is normalised away), so a sandbox key/env accidentally copied to the live host can neither surface nor execute a test checkout; `POST /invoices/{token}/pay/bitpay` returns `503` | *unset* |
+| `BITPAY_ENABLE_LIVE_CHECKOUT` | Explicit opt-in for a **live** (production) checkout — a separate switch from `BITPAY_ENABLE_TEST_CHECKOUT`, so arming one can never arm the other. BitPay becomes payable — both the pay-page CTA **and** the server-side initiation endpoint — only when this is truthy **and** `BITPAY_ENV=production` **and** `PUBLIC_SITE_ORIGIN` is **exactly** a production origin (`spaghettiprints.ir`/`www.spaghettiprints.ir`). A live key on any other origin (staging, localhost, malformed) is refused: readiness reports disabled and `POST /invoices/{token}/pay/bitpay` returns `503` | *unset* |
+| `BITPAY_BASE_URL` | Optional HTTPS override; must be `https://bitpay.ir` (any other host is refused) | *optional* |
+| `BITPAY_CALLBACK_URL` | Optional absolute HTTPS callback; defaults to `PUBLIC_SITE_ORIGIN` + `/api/v1/commerce/bitpay/callback` | *optional* |
 | `COMMERCE_NOTIFY_TELEGRAM` | Enable Telegram admin alerts (`0`/`false` to silence) | `1` |
 | `COMMERCE_NOTIFY_SMS` | Enable SMS.ir admin alerts | `1` |
 | `SMS_IR_API_KEY` / `SMS_IR_TEMPLATE_ID` / `SMS_IR_ADMIN_MOBILE` | SMS.ir API key + approved admin-alert template id + recipient. All three required together or the channel is skipped. The approved template's parameter placeholders must match the names the app sends **exactly, case-sensitively** (the admin-alert template `309349` is approved with `#EVENT#` / `#CODE#`, sent uppercase as `EVENT` / `CODE`); a differently-cased name is not substituted and the send is rejected | *optional* |
+| `SMS_IR_OTP_TEMPLATE_ID` / `SMS_IR_OTP_PARAM_OTP` / `SMS_IR_OTP_PARAM_TIME` | Customer checkout one-time code (cart OTP). Approved SMS.ir OTP template id + its parameter names. Needs only `SMS_IR_API_KEY`; it is **independent of the admin SMS channel** (no admin recipient, not gated by `COMMERCE_NOTIFY_SMS`). The approved OTP template `337011` uses the placeholders `#OTP#` / `#TIME#`, so `SMS_IR_OTP_PARAM_OTP` must be the UPPERCASE name `OTP` and `SMS_IR_OTP_PARAM_TIME` the UPPERCASE name `TIME` (SMS.ir substitutes case-sensitively) | `337011` / `OTP` / `TIME` |
 | `COMMERCE_NOTIFY_SMTP` | Enable SMTP admin alerts | `1` |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_ADMIN_TO` | Admin mailbox. All required together (no fallback mailbox); incomplete config disables the channel | *optional* |
 | `SMTP_TLS` | `starttls` (port 587) or `ssl` (port 465) | `starttls` |
@@ -281,6 +288,17 @@ as an untrusted hint — the invoice is settled only after a server-side
     (including the token) when an upstream error embeds the URI. A hardened
     deployment should lower `error_log` to `crit` so those lines are not kept;
     the access-log leak is fully closed.
+- **The SnappPay onboarding callback query is kept out of the logs.** The fixed
+  onboarding URL `/api/v1/commerce/snappay/callback` is a reachability stub —
+  SnappPay has issued no protocol or credentials, so the query string is
+  unparsed and whatever a caller puts there must be assumed sensitive. It is
+  therefore redacted at **both** layers, exactly like the invoice token: nginx
+  disables its access log for the callback prefix (a dedicated `^~` prefix plus
+  a case-insensitive `~*` companion, both proxying identically), and
+  `app/log_redaction.py` rewrites the callback query to `?<redacted>` in
+  `uvicorn.access`. The stub handler additionally logs only the fixed path and
+  method, never the query, headers or body. The same nginx *error*-log residual
+  as above applies.
 
 ---
 

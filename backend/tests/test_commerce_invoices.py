@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 import pytest
 from app.models import AuditLog, CommerceInvoice
 from tests.conftest import TestSessionLocal
+from tests.otp_helpers import issue_test_otp
 
 BASE = "/api/v1/commerce"
 
@@ -91,7 +92,7 @@ def test_website_conversion_and_role_guard(client, auth_headers):
     assert client.post(f"{BASE}/staff/invoices", json=draft()).status_code == 401
     product = client.post("/api/v1/products", json={"name": "فیگور", "weight_g": 40, "print_time_hours": 1, "final_price": 150000}, headers=auth_headers)
     assert product.status_code == 201, product.text
-    req = client.post(f"{BASE}/requests", json={"customer_name":"رضا", "mobile":"09123456789", "messenger":"telegram", "items":[{"product_id":product.json()["id"],"qty":1}]})
+    req = client.post(f"{BASE}/requests", json={"customer_name":"رضا", "mobile":"09123456789", "messenger":"telegram", "address": "تهران، شهرک غرب، پلاک ۴", "items":[{"product_id":product.json()["id"],"qty":1}], **issue_test_otp()})
     assert req.status_code == 200, req.text
     requests = client.get(f"{BASE}/staff/requests", headers=auth_headers).json()
     inv = create(client, auth_headers, request_id=requests[0]["id"])
@@ -237,3 +238,32 @@ def test_staff_invoice_mutations_are_audited_without_token(client, auth_headers)
         assert raw_token not in repr([r.summary for r in rows])
     finally:
         db.close()
+
+
+def test_download_public_and_staff_invoice_pdf(client, auth_headers):
+    inv = create(client, auth_headers)
+    approved = client.post(f"{BASE}/staff/invoices/{inv['id']}/approve", headers=auth_headers)
+    assert approved.status_code == 200, approved.text
+    token = approved.json()["share_url"].rsplit("/", 1)[-1]
+
+    # Public download with valid token
+    pub_res = client.get(f"{BASE}/invoices/{token}/pdf")
+    assert pub_res.status_code == 200, pub_res.text
+    assert pub_res.headers["content-type"] == "application/pdf"
+    assert pub_res.headers["cache-control"] == "no-store"
+    assert f"spaghetti-invoice-{inv['id']}.pdf" in pub_res.headers["content-disposition"]
+    assert pub_res.content.startswith(b"%PDF-")
+    assert len(pub_res.content) > 3000
+
+    # Public download with invalid token returns 404
+    assert client.get(f"{BASE}/invoices/invalid_token_xyz/pdf").status_code == 404
+
+    # Staff download requires auth
+    unauth_staff = client.get(f"{BASE}/staff/invoices/{inv['id']}/pdf")
+    assert unauth_staff.status_code in (401, 403)
+
+    # Staff download with auth
+    staff_res = client.get(f"{BASE}/staff/invoices/{inv['id']}/pdf", headers=auth_headers)
+    assert staff_res.status_code == 200, staff_res.text
+    assert staff_res.headers["content-type"] == "application/pdf"
+    assert staff_res.content.startswith(b"%PDF-")

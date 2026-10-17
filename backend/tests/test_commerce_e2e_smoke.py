@@ -25,6 +25,8 @@ Nothing here reads credentials, mutates production data, or sends anything.
 """
 import pytest
 
+from tests.otp_helpers import issue_test_otp
+
 BASE = "/api/v1/commerce"
 CALLBACK = f"{BASE}/digipay/callback"
 
@@ -119,9 +121,14 @@ def no_live_io(monkeypatch):
 
 
 @pytest.fixture()
-def fake_provider(client):
+def fake_provider(client, monkeypatch):
     from app.main import app
     from app.services import digipay
+
+    # DigiPay is parked in production (the legacy initiation route is a hard
+    # 503); this smoke test still drives the full settlement path, so it opts in
+    # explicitly through the predicate seam.
+    monkeypatch.setattr(digipay, "checkout_enabled", lambda: True)
 
     fake = FakeDigiPay()
     app.dependency_overrides[digipay.client_dependency] = lambda: fake
@@ -146,9 +153,13 @@ def _website_request(client, auth_headers, product_id):
         f"{BASE}/requests",
         json={
             "customer_name": "رضا",
+            "email": "reza@example.com",
             "mobile": "09123456789",
             "messenger": "telegram",
+            "address": "تهران، شهرک غرب، خیابان ایران زمین، پلاک ۱۲",
             "items": [{"product_id": product_id, "qty": 2}],
+            # Public intake now requires a verified OTP (no SMS is sent).
+            **issue_test_otp(),
         },
     )
     assert r.status_code == 200, r.text

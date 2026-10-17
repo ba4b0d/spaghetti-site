@@ -13,10 +13,21 @@ Staff:
     POST /api/v1/commerce/staff/invoices/{id}/revoke   invalidate the private link
     POST /api/v1/commerce/staff/invoices/{id}/notify   re-emit admin alert (retry)
     POST /api/v1/commerce/staff/requests/{id}/notify   re-emit request alert (retry)
+    GET  /api/v1/commerce/staff/payments               payment queue needing attention
+    POST /api/v1/commerce/staff/payments/{id}/reconcile            resolve a stuck attempt
+    POST /api/v1/commerce/admin/invoices/{id}/manual-pay           record an off-gateway
+                                                                  (card-to-card / cash)
+                                                                  payment + book the ledger
+
+Admin-only (not employee):
+    POST /api/v1/commerce/staff/payments/{id}/recover-legacy-bitpay audited legacy BitPay settle
 
 Payment initiation/callback arrive in Task 3. Handlers stay thin; validation
 and persistence live in ``app.services.commerce``.
 """
+import re
+from datetime import date
+
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -32,10 +43,13 @@ from sqlalchemy.orm import Session
 
 from app.audit import log_user
 from app.database import get_db
-from app.routers.auth import limiter, require_staff_role
+from app.routers.auth import limiter, require_admin, require_staff_role
 from app.services import commerce as commerce_service
 from app.services import commerce_notifications
+from app.services import commerce_otp
+from app.services import bitpay
 from app.services import digipay
+from app.services import invoice_pdf
 from app.services.commerce import (
     MAX_DISTINCT_PRODUCTS,
     MAX_INVOICE_ITEMS,
@@ -104,11 +118,17 @@ class CommerceRequestCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     customer_name: str = Field(..., min_length=1, max_length=120)
+    email: str = Field(..., min_length=5, max_length=255)
     mobile: str
     messenger: str
     messenger_handle: str = Field(default="", max_length=100)
-    address: str = Field(default="", max_length=500)
+    address: str = Field(..., min_length=5, max_length=500)
     note: str = Field(default="", max_length=2000)
+    # Ownership proof for ``mobile`` (see app.services.commerce_otp): the request
+    # is accepted only after the SMS one-time code is verified. Both fields are
+    # required, so a client cannot bypass the gate by omitting them.
+    otp_challenge_id: int = Field(..., ge=1)
+    otp_code: str = Field(..., min_length=1, max_length=16)
     items: list[CommerceRequestItemIn] = Field(..., min_length=1, max_length=MAX_DISTINCT_PRODUCTS)
 
     @field_validator("customer_name")
@@ -117,6 +137,22 @@ class CommerceRequestCreate(BaseModel):
         if not value.strip():
             raise ValueError("نام مشتری الزامی است")
         return value
+
+    @field_validator("email")
+    @classmethod
+    def _valid_email(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", cleaned):
+            raise ValueError("ایمیل معتبر الزامی است")
+        return cleaned
+
+    @field_validator("address")
+    @classmethod
+    def _address_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if len(cleaned) < 5:
+            raise ValueError("نشانی تحویل الزامی است (حداقل ۵ کاراکتر)")
+        return cleaned
 
     @field_validator("mobile")
     @classmethod
@@ -138,6 +174,50 @@ class CommerceRequestCreate(BaseModel):
         return self
 
 
+class OtpRequest(BaseModel):
+    """Public payload for the cart one-time-code endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mobile: str
+
+
+@router.post("/requests/otp")
+@limiter.limit("3/minute")
+def request_cart_otp(
+    request: Request,
+    body: OtpRequest,
+    db: Session = Depends(get_db),
+):
+    """Public — send a one-time SMS code to the customer's own mobile.
+
+    ``request`` MUST be the first parameter: slowapi resolves the client key
+    from it, and without it the app crashes at import. A resend cooldown or an
+    hourly cap answers 429; a transport/config failure answers 503. The code is
+    never echoed back — only an opaque challenge id and timing hints are.
+    """
+    try:
+        mobile = _normalize_mobile(body.mobile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    client_ip = request.client.host if request.client else None
+    try:
+        challenge = commerce_otp.issue_challenge(db, mobile, client_ip=client_ip)
+    except commerce_otp.OtpThrottled as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except commerce_otp.OtpDeliveryError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    return {
+        "challenge_id": challenge.id,
+        "expires_in": commerce_otp.OTP_TTL_SECONDS,
+        "resend_after": commerce_otp.OTP_RESEND_COOLDOWN_SECONDS,
+        "delivery": "sms",
+        "masked_mobile": commerce_notifications.mask_mobile(mobile),
+    }
+
+
 @router.post("/requests")
 @limiter.limit("5/minute")
 def create_request(
@@ -148,26 +228,55 @@ def create_request(
 ):
     """Public — record a pending-review website cart request.
 
-    Returns an opaque receipt identifier only; no invoice or payment link is
-    produced before staff review. The admin alert is dispatched as a *background*
-    task after the response, so a slow Telegram/SMS/SMTP transport cannot delay
-    the customer's acknowledgement.
+    Ownership of ``mobile`` is proven FIRST: the submitted OTP must match the
+    issued challenge, otherwise the request is rejected and — crucially — no
+    request row is written. The proof is consumed in the SAME transaction as
+    the request: the claim is left uncommitted (``commit=False``) and committed
+    together with the new row, so a rejected creation (empty cart, inactive
+    product, …) rolls the claim back and leaves the customer's code usable
+    instead of stranding them for the cooldown. Single-use is still guaranteed
+    under concurrent submits by the service's atomic claim — only one verifier
+    can win, so only one request row is ever written per challenge. Returns an
+    opaque receipt identifier only; no invoice or payment link is produced
+    before staff review. The admin alert is dispatched as a *background* task
+    after the transaction commits, so a slow Telegram/SMS/SMTP transport cannot
+    delay the customer's acknowledgement.
     """
     try:
-        created = commerce_service.create_website_request(
+        commerce_otp.verify_challenge(
+            db,
+            body.otp_challenge_id,
+            body.otp_code,
+            body.mobile,
+            commit=False,
+        )
+        created = commerce_service.prepare_website_request(
             db,
             customer_name=body.customer_name,
+            email=body.email,
             mobile=body.mobile,
             messenger=body.messenger,
             messenger_handle=body.messenger_handle,
             address=body.address,
             note=body.note,
             items=[{"product_id": i.product_id, "qty": i.qty} for i in body.items],
-            background_tasks=background_tasks,
         )
+        # Atomic create + consume: both land, or neither does.
+        db.commit()
+    except commerce_otp.OtpError as exc:
+        # Invalid / expired / unknown / exhausted all answer 400 with a generic
+        # Persian message — the failure never reveals whether the mobile exists.
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
     except CommerceValidationError as exc:
+        # Request rejected: the uncommitted OTP claim is rolled back, so the
+        # proof stays usable until it expires.
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # After-commit alert (built against the committed row), then the minimal
+    # public acknowledgement.
+    commerce_service.notify_request_created(created, background_tasks=background_tasks)
     return commerce_service.serialize_public_receipt(created)
 
 
@@ -221,6 +330,7 @@ class InvoiceWrite(BaseModel):
     # PUT so a revision cannot silently re-point the invoice at another request.
     request_id: StrictInt | None = Field(default=None, ge=1)
     customer_name: str = Field(..., min_length=1, max_length=120)
+    email: str = Field(default="", max_length=255)
     mobile: str
     messenger: str = "telegram"
     messenger_handle: str = Field(default="", max_length=100)
@@ -276,6 +386,7 @@ def create_staff_invoice(
             db,
             request_id=body.request_id,
             customer_name=body.customer_name,
+            email=body.email,
             mobile=body.mobile,
             messenger=body.messenger,
             messenger_handle=body.messenger_handle,
@@ -339,6 +450,7 @@ def update_staff_invoice(
             db,
             invoice_id,
             customer_name=body.customer_name,
+            email=body.email,
             mobile=body.mobile,
             messenger=body.messenger,
             messenger_handle=body.messenger_handle,
@@ -428,6 +540,29 @@ def revoke_invoice(
     return payload
 
 
+@router.get("/staff/invoices/{invoice_id}/pdf")
+def download_staff_invoice_pdf(
+    invoice_id: int,
+    user=Depends(require_staff_role),
+    db: Session = Depends(get_db),
+):
+    """Staff — download high-fidelity Persian PDF invoice for an invoice ID."""
+    try:
+        invoice = commerce_service.get_staff_invoice(db, invoice_id)
+    except commerce_service.CommerceNotFoundError as exc:
+        raise _validation_error(exc)
+
+    pdf_bytes = invoice_pdf.generate_invoice_pdf(invoice)
+    filename = f"spaghetti-invoice-{invoice.id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+        },
+    )
+
+
 @router.post("/staff/requests/{request_id}/notify")
 @limiter.limit("10/minute")
 def resend_request_notification(
@@ -501,6 +636,95 @@ def resend_invoice_notification(
     return {"invoice_id": invoice.id, "event": event, "channels": channels}
 
 
+# ── Task 4: admin manual payment (کارت به کارت / نقدی) ────────────────
+
+class ManualPayRequest(BaseModel):
+    """Staff payload recording an off-gateway payment on an invoice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # ``card_to_card`` | ``cash`` — the two ways money actually arrives here.
+    payment_method: str
+    # Staff tracking/reference: the bank transfer reference, a receipt number,
+    # or empty for a cash payment that has none.
+    reference_code: str = Field(default="", max_length=100)
+    # Gregorian ``YYYY-MM-DD`` (the UI converts its Shamsi picker); the accounting
+    # row is booked on exactly this day, never "today".
+    paid_at: str
+    note: str = Field(default="", max_length=1000)
+
+    @field_validator("payment_method")
+    @classmethod
+    def _valid_payment_method(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if cleaned not in commerce_service.MANUAL_PAYMENT_METHODS:
+            raise ValueError("روش پرداخت باید کارت به کارت یا نقدی باشد")
+        return cleaned
+
+    @field_validator("reference_code")
+    @classmethod
+    def _clean_reference_code(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("note")
+    @classmethod
+    def _clean_note(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("paid_at")
+    @classmethod
+    def _valid_gregorian_date(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        try:
+            return date.fromisoformat(cleaned).isoformat()
+        except ValueError:
+            raise ValueError("تاریخ پرداخت باید به شکل YYYY-MM-DD باشد")
+
+
+@router.post("/admin/invoices/{invoice_id}/manual-pay")
+def pay_invoice_manually(
+    invoice_id: int,
+    body: ManualPayRequest,
+    user=Depends(require_staff_role),
+    db: Session = Depends(get_db),
+):
+    """Staff/Admin — record an off-gateway payment and sync the ledger.
+
+    Marks the invoice paid (refusing an already-paid one), records the manual
+    attempt, creates the fulfillment order for the production queue and books the
+    invoice-linked accounting income row — all in one commit, so the ledger can
+    never disagree with the invoice. The bookable ``invoice_id`` unique
+    constraint makes the ledger entry idempotent.
+    """
+    try:
+        invoice, _attempt = commerce_service.record_manual_payment(
+            db,
+            invoice_id,
+            payment_method=body.payment_method,
+            reference_code=body.reference_code,
+            paid_at=date.fromisoformat(body.paid_at),
+            note=body.note,
+            user_id=user.get("id"),
+        )
+    except commerce_service.CommerceStateError as exc:
+        # An already-paid invoice is a rejected staff request (400), not a
+        # conflicting transition: the same money must never be booked twice.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except (
+        commerce_service.CommerceValidationError,
+        commerce_service.CommerceNotFoundError,
+        commerce_service.CommerceGoneError,
+        commerce_service.CommerceConfigError,
+    ) as exc:
+        raise _validation_error(exc)
+
+    log_user(
+        user, db, "manual_pay", "commerce_invoice", invoice.id,
+        f"ثبت پرداخت دستی فاکتور #{invoice.id} ({body.payment_method})",
+    )
+    return commerce_service.serialize_staff_invoice(invoice)
+
+
 @router.get("/invoices/{token}")
 @limiter.limit("30/minute")
 def read_public_invoice(
@@ -530,6 +754,66 @@ def read_public_invoice(
     return commerce_service.serialize_public_invoice(invoice)
 
 
+@router.get("/invoices/{token}/pdf")
+@limiter.limit("30/minute")
+def download_public_invoice_pdf(
+    request: Request,
+    response: Response,
+    token: str = Path(..., min_length=1, max_length=200),
+    db: Session = Depends(get_db),
+):
+    """Public — download high-fidelity Persian PDF invoice behind its private token.
+
+    Carries NO_STORE_HEADERS to prevent intermediary or browser leaks.
+    """
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        invoice = commerce_service.resolve_public_invoice(db, token)
+    except (
+        commerce_service.CommerceNotFoundError,
+        commerce_service.CommerceGoneError,
+    ) as exc:
+        http_exc = _validation_error(exc)
+        http_exc.headers = {**(http_exc.headers or {}), **NO_STORE_HEADERS}
+        raise http_exc
+
+    pdf_bytes = invoice_pdf.generate_invoice_pdf(invoice, raw_token=token)
+    filename = f"spaghetti-invoice-{invoice.id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            **NO_STORE_HEADERS,
+            "Content-Disposition": f'inline; filename="{filename}"',
+        },
+    )
+
+
+# ── Task 3: public payment-method readiness ──────────────────────────
+
+@router.get("/payment-methods")
+@limiter.limit("60/minute")
+def list_payment_methods(request: Request, response: Response):
+    """Public — non-secret readiness of the selectable payment gateways.
+
+    The storefront pay page reads this before rendering any gateway CTA so a
+    method can never look payable when the backend cannot actually pay through
+    it. DigiPay is parked and the SnappPay onboarding stub is non-settling, so
+    both are always reported disabled (DigiPay through its unconditional
+    predicate); BitPay is enabled only for an explicitly opted-in deployment —
+    either a sandbox test checkout (``BITPAY_ENABLE_TEST_CHECKOUT`` plus a
+    non-production origin) or a live checkout (``BITPAY_ENABLE_LIVE_CHECKOUT``
+    plus the production origin). No credential — least of all the API key — is
+    included.
+    """
+    response.headers.update(NO_STORE_HEADERS)
+    return {
+        "bitpay": bitpay.public_readiness(),
+        "digipay": {"enabled": digipay.checkout_enabled()},
+        "snapppay": {"enabled": False},
+    }
+
+
 # ── Task 3: public payment initiation ────────────────────────────────
 
 @router.post("/invoices/{token}/pay")
@@ -547,8 +831,22 @@ def pay_invoice(
     returns the provider's HTTPS ``redirect_url``. Valid only for an approved,
     unexpired, unpaid invoice; repeated clicks while an attempt is in flight are
     idempotent. The private bearer token is never forwarded to the gateway.
+
+    DigiPay is parked: :func:`digipay.checkout_enabled` is unconditionally
+    false, so this route is a hard ``503`` checked *before* the provider is ever
+    resolved or used — neither an injected client nor fully-present merchant
+    credentials can start a payment. The public readiness snapshot reports the
+    same predicate, so CTA and route can never disagree.
     """
     response.headers.update(NO_STORE_HEADERS)
+
+    # Unconditional server-side kill switch: DigiPay is parked, so no injected
+    # or configured provider can start a payment. Evaluated before the client is
+    # resolved and before any invoice/attempt work.
+    if not digipay.checkout_enabled():
+        http_exc = HTTPException(status_code=503, detail="درگاه پرداخت دیجی‌پی در این محیط غیرفعال است")
+        http_exc.headers = {**NO_STORE_HEADERS}
+        raise http_exc
 
     if client is None:
         try:
@@ -582,6 +880,81 @@ def pay_invoice(
         raise http_exc
 
     return {
+        "state": attempt.state,
+        "amount_rial": attempt.amount_rial,
+        "redirect_url": attempt.redirect_url,
+    }
+
+
+@router.post("/invoices/{token}/pay/bitpay")
+@limiter.limit("10/minute")
+def pay_invoice_bitpay(
+    request: Request,
+    response: Response,
+    token: str = Path(..., min_length=1, max_length=200),
+    db: Session = Depends(get_db),
+    client=Depends(bitpay.client_dependency),
+):
+    """Public — start (or resume) a BitPay payment for an approved invoice.
+
+    Provider-explicit sibling of ``/pay`` (DigiPay): records a durable attempt
+    tagged ``provider=bitpay`` — persisting the ``id_get`` the callback will be
+    matched on — and returns the gateway's HTTPS portal URL. Same validity and
+    idempotency rules as DigiPay; the private bearer token is never forwarded to
+    the gateway.
+
+    A sandbox checkout is only *executed* on an explicitly opted-in, provably
+    non-production test deployment, and a live checkout only on an explicitly
+    opted-in production deployment — the *same* shared predicate that gates the
+    public readiness snapshot. The check runs before the provider is resolved
+    and independently of any injected client, so a direct POST cannot run a
+    checkout the deployment has not enabled; the specific refusal is ``503``.
+    """
+    response.headers.update(NO_STORE_HEADERS)
+
+    if not bitpay.checkout_allowed():
+        http_exc = HTTPException(
+            status_code=503,
+            detail="درگاه پرداخت بیت‌پی در این محیط غیرفعال است",
+        )
+        http_exc.headers = {**NO_STORE_HEADERS}
+        raise http_exc
+
+    if client is None:
+        try:
+            client = bitpay.get_client()
+        except bitpay.BitPayConfigError:
+            http_exc = HTTPException(status_code=503, detail="درگاه پرداخت پیکربندی نشده است")
+            http_exc.headers = {**NO_STORE_HEADERS}
+            raise http_exc
+
+    try:
+        callback_url = bitpay.build_callback_url()
+    except (bitpay.BitPayConfigError, commerce_service.CommerceConfigError) as exc:
+        http_exc = HTTPException(status_code=500, detail="پیکربندی درگاه پرداخت نامعتبر است")
+        http_exc.headers = {**NO_STORE_HEADERS}
+        raise http_exc from exc
+
+    try:
+        invoice = commerce_service.resolve_public_invoice(db, token)
+        attempt = commerce_service.start_bitpay_payment(
+            db, invoice, client, callback_url=callback_url
+        )
+    except (
+        CommerceValidationError,
+        commerce_service.CommerceNotFoundError,
+        commerce_service.CommerceGoneError,
+        commerce_service.CommerceStateError,
+        commerce_service.CommerceConfigError,
+        commerce_service.CommercePaymentError,
+        commerce_service.CommerceGatewayUnavailableError,
+    ) as exc:
+        http_exc = _validation_error(exc)
+        http_exc.headers = {**(http_exc.headers or {}), **NO_STORE_HEADERS}
+        raise http_exc
+
+    return {
+        "provider": "bitpay",
         "state": attempt.state,
         "amount_rial": attempt.amount_rial,
         "redirect_url": attempt.redirect_url,
@@ -643,6 +1016,7 @@ def reconcile_staff_payment(
     user=Depends(require_staff_role),
     db: Session = Depends(get_db),
     client=Depends(digipay.client_dependency),
+    bitpay_client=Depends(bitpay.client_dependency),
 ):
     """Staff — resolve a stuck attempt (re-query the provider, or abandon it).
 
@@ -668,17 +1042,27 @@ def reconcile_staff_payment(
             detail="برای رهاسازی تراکنش، ثبت دلیل الزامی است",
         )
 
-    if client is None and body.action == "verify":
+    # Resolve a provider-appropriate client for "verify": a BitPay attempt must
+    # be re-queried through the BitPay adapter, never the DigiPay one.
+    provider_client = client
+    if attempt.provider == commerce_service.PAYMENT_PROVIDER_BITPAY:
+        provider_client = bitpay_client
+        if provider_client is None and body.action == "verify":
+            try:
+                provider_client = bitpay.get_client()
+            except bitpay.BitPayConfigError:
+                provider_client = None
+    elif provider_client is None and body.action == "verify":
         try:
-            client = digipay.get_client()
+            provider_client = digipay.get_client()
         except digipay.DigiPayConfigError:
             # Unconfigured gateway: reconcile() keeps the attempt open rather
             # than guessing an outcome.
-            client = None
+            provider_client = None
 
     try:
         resolved = commerce_service.reconcile_payment_attempt(
-            db, attempt, client, abandon=(body.action == "abandon"), reason=body.reason,
+            db, attempt, provider_client, abandon=(body.action == "abandon"), reason=body.reason,
             background_tasks=background_tasks,
         )
     except commerce_service.CommerceValidationError as exc:
@@ -690,4 +1074,98 @@ def reconcile_staff_payment(
         user, db, "reconcile", "commerce_payment_attempt", resolved.id,
         f"تسویه دستی تراکنش #{resolved.id} → {resolved.state}",
     )
+    return commerce_service.serialize_staff_payment_attempt(resolved)
+
+
+# ── Legacy BitPay recovery — admin-only, explicit, audited ───────────
+#
+# The ordinary staff ``reconcile`` above deliberately refuses to settle a
+# pre-fix BitPay attempt (its alnum ``factorId`` was coerced to ``0``, so it can
+# never be matched). When such a payment was genuinely taken, this is the single
+# admin-only path that can close it — and only after a fresh server-to-server
+# verify proves the documented ``factorId == 0`` artifact with an exact amount.
+
+class LegacyBitpayRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # An affirmative opt-in: REQUIRED — no default, so a request that omits the
+    # field is a validation error rather than a silently-defaulted ``False``.
+    # (Pydantic does not run a field's validator over its default, so a
+    # default-false opt-in would be a silent bypass: ``{"reason": ...}`` would
+    # pass validation and settle unaudited.)
+    confirm_legacy_recovery: bool
+    reason: str = Field(..., min_length=1, max_length=200)
+
+    @field_validator("confirm_legacy_recovery")
+    @classmethod
+    def _affirmed(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("برای بازیابی پرداخت قدیمی، تأیید صریح الزامی است")
+        return value
+
+
+@router.post("/staff/payments/{attempt_id}/recover-legacy-bitpay")
+def recover_legacy_bitpay_payment(
+    attempt_id: int,
+    body: LegacyBitpayRecoveryRequest,
+    background_tasks: BackgroundTasks,
+    user=Depends(require_admin),
+    db: Session = Depends(get_db),
+    bitpay_client=Depends(bitpay.client_dependency),
+):
+    """Admin — explicitly recover an already-paid *legacy* (alnum-factor) BitPay attempt.
+
+    Admin-only (never an employee). Requires an affirmative opt-in plus a
+    recorded reason, re-verifies server-to-server through the BitPay adapter, and
+    settles only the documented legacy success (``factorId`` coercion artifact
+    ``0`` + exact amount) for the attempt's own persisted ``id_get``/``trans_id``
+    on its current payable invoice. The settlement and its audit entry commit
+    together; a refused recovery keeps the lock (never an unsafe abandon).
+    """
+    # Defence in depth for a security-critical settlement: the request model
+    # already makes the affirmation required and non-false, but the handler
+    # re-asserts it explicitly rather than relying on schema validation alone.
+    if body.confirm_legacy_recovery is not True:
+        raise HTTPException(
+            status_code=422,
+            detail="برای بازیابی پرداخت قدیمی، تأیید صریح الزامی است",
+        )
+
+    from app.models import CommercePaymentAttempt
+
+    attempt = (
+        db.query(CommercePaymentAttempt)
+        .filter(CommercePaymentAttempt.id == attempt_id)
+        .first()
+    )
+    if attempt is None:
+        raise HTTPException(status_code=404, detail="تراکنش یافت نشد")
+
+    provider_client = bitpay_client
+    if provider_client is None:
+        try:
+            provider_client = bitpay.get_client()
+        except bitpay.BitPayConfigError:
+            provider_client = None
+
+    try:
+        resolved = commerce_service.recover_legacy_bitpay_attempt(
+            db,
+            attempt,
+            provider_client,
+            reason=body.reason,
+            actor=(user.get("username") or "") if isinstance(user, dict) else "",
+            background_tasks=background_tasks,
+        )
+    except commerce_service.CommerceValidationError as exc:
+        raise _validation_error(exc)
+    except commerce_service.CommerceStateError as exc:
+        raise _validation_error(exc)
+    except commerce_service.CommerceGatewayUnavailableError as exc:
+        raise _validation_error(exc)
+    except commerce_service.CommercePaymentError as exc:
+        raise _validation_error(exc)
+    except commerce_service.CommerceNotFoundError as exc:
+        raise _validation_error(exc)
+
     return commerce_service.serialize_staff_payment_attempt(resolved)

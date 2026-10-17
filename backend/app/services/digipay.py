@@ -136,6 +136,26 @@ def resolve_base_url() -> str:
     return DIGIPAY_LIVE_BASE_URL
 
 
+def checkout_enabled() -> bool:
+    """Whether DigiPay may start a payment at all.
+
+    Requires an explicit opt-in (DIGIPAY_ENABLE_CHECKOUT or DIGIPAY_ENABLE_LIVE_CHECKOUT)
+    plus all four merchant credentials.
+    """
+    flag = (
+        os.getenv("DIGIPAY_ENABLE_CHECKOUT")
+        or os.getenv("DIGIPAY_ENABLE_LIVE_CHECKOUT")
+        or ""
+    ).strip().lower()
+    if flag not in ("1", "true", "yes", "on", "enabled"):
+        return False
+    client_id = (os.getenv("DIGIPAY_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("DIGIPAY_CLIENT_SECRET") or "").strip()
+    username = (os.getenv("DIGIPAY_USERNAME") or "").strip()
+    password = (os.getenv("DIGIPAY_PASSWORD") or "").strip()
+    return bool(client_id and client_secret and username and password)
+
+
 def build_callback_url() -> str:
     """The callback the gateway posts back to — server config only."""
     raw = (os.getenv("DIGIPAY_CALLBACK_URL") or "").strip()

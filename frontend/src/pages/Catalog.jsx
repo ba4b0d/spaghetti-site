@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { Search, Package, Clock, Weight, Layers, ChevronLeft, ChevronRight, Ruler, Send, ShoppingCart } from 'lucide-react';
+import { Search, Package, Clock, Weight, Layers, ChevronLeft, ChevronRight, Ruler, ShoppingCart } from 'lucide-react';
 import { getCatalog, getCatalogCategories, getCatalogCollections } from '../lib/api';
 import { formatPrice, formatMinutes } from '../lib/utils';
 import { addItem } from '../lib/cart';
@@ -296,12 +296,6 @@ function isWithinDays(isoDate, days = 14) {
   cutoff.setDate(cutoff.getDate() - days);
   cutoff.setHours(0, 0, 0, 0);
   return date >= cutoff;
-}
-
-function telegramShareUrl(product) {
-  const url = `${window.location.origin}/catalog/${product.slug}`;
-  const text = `${displayName(product.name)}${product.product_id ? ` — کد: ${product.product_id}` : ''}`;
-  return `https://t.me/share/url?url=${encodeURIComponent(url)}&text=${encodeURIComponent(text)}`;
 }
 
 function displayName(name) {
@@ -1020,7 +1014,6 @@ export default function Catalog() {
           {filtered.slice(0, visibleCount).map((product, idx) => {
             const price = product.final_price;
             const isNew = isWithinDays(product.created_at, 14);
-            const shareUrl = telegramShareUrl(product);
             const isBundle = product.isCollectionBundle;
             const cardLink = isBundle ? `/collection/${encodeURIComponent(product.collectionTag)}` : `/catalog/${product.slug}`;
 
@@ -1184,18 +1177,6 @@ export default function Catalog() {
                     {justAdded === product.id ? 'افزوده شد ✓' : 'افزودن'}
                   </button>
                 ) : null}
-
-                {/* Telegram share — sits in the bottom-left corner next to the price, outside the Link to avoid nesting */}
-                <a
-                  href={shareUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="absolute bottom-4 left-4 z-[2] p-2 rounded-full bg-[var(--bg-secondary)] hover:bg-[#2AABEE] text-[var(--text-secondary)] hover:text-white transition-colors border border-[var(--border-color)] shadow-sm"
-                  aria-label="اشتراک در تلگرام"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <Send size={13} />
-                </a>
               </article>
             );
           })}

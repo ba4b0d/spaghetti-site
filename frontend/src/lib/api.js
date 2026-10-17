@@ -198,4 +198,42 @@ export const getAuditLogs = (limit = 100) => api.get('/audit', { params: { limit
 // ===== Bulk Product Actions =====
 export const bulkProductAction = (data) => api.post('/products/bulk', data);
 
+// ===== Accounting (دفتر حسابداری) =====
+export const getAccountingCategories = (type) =>
+  api.get('/accounting/categories', { params: type ? { type } : {} });
+
+export const createAccountingCategory = (payload) =>
+  api.post('/accounting/categories', payload);
+
+export const updateAccountingCategory = (id, payload) =>
+  api.put(`/accounting/categories/${id}`, payload);
+
+export const deleteAccountingCategory = (id) =>
+  api.delete(`/accounting/categories/${id}`);
+
+export const getAccountingTransactions = (params = {}) =>
+  api.get('/accounting/transactions', { params });
+
+export const createAccountingTransaction = (payload) =>
+  api.post('/accounting/transactions', payload);
+
+export const updateAccountingTransaction = (id, payload) =>
+  api.put(`/accounting/transactions/${id}`, payload);
+
+export const deleteAccountingTransaction = (id) =>
+  api.delete(`/accounting/transactions/${id}`);
+
+export const getAccountingSummary = (params = {}) =>
+  api.get('/accounting/summary', { params });
+
+export const uploadAccountingAttachment = (formData) =>
+  api.post('/accounting/upload-attachment', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+
+export const getAccountingExportUrl = (params = {}) => {
+  const query = new URLSearchParams(params).toString();
+  return `/api/v1/accounting/export${query ? `?${query}` : ''}`;
+};
+
 export default api;

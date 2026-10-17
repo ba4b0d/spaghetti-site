@@ -39,7 +39,9 @@ Design rules enforced here (see spec "Notifications"):
   channel is fully configured.
 """
 import html
+import inspect
 import logging
+import math
 import os
 import smtplib
 import ssl
@@ -47,7 +49,12 @@ from email.message import EmailMessage
 
 import requests
 
-from app.telegram_bot import get_telegram_config, send_telegram_notification
+from app.telegram_bot import (
+    get_telegram_config,
+    send_telegram_notification,
+    send_telegram_document,
+)
+from app.services import invoice_pdf, email_templates
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +99,21 @@ SMS_TIMEOUT = 10.0
 # ``event`` / ``code`` is not substituted and the send is rejected.
 SMS_PARAM_EVENT = "EVENT"
 SMS_PARAM_CODE = "CODE"
+
+# ── Customer checkout OTP (storefront cart) ──────────────────────────
+# The one-time code sent to a *customer's own* mobile at checkout is a
+# FUNCTIONAL delivery, independent of the admin-alert channel above: it needs
+# only the API key and its own approved template, never the admin recipient or
+# the COMMERCE_NOTIFY_SMS flag.
+#
+# Customer template 337011 is approved with the placeholders ``#OTP#`` (the
+# one-time code) and ``#TIME#`` (validity in whole minutes). SMS.ir substitutes
+# by EXACT, case-sensitive name — sending any other name leaves the placeholder
+# literal in the delivered SMS (a real customer received "#OTP#" / "#TIME#"), so
+# these names must match the approved template verbatim.
+OTP_TEMPLATE_ID = 337011
+OTP_PARAM_OTP = "OTP"
+OTP_PARAM_TIME = "TIME"
 
 SMTP_TIMEOUT = 15.0
 TLS_STARTTLS = "starttls"
@@ -141,6 +163,25 @@ def sms_config() -> dict | None:
     if template_id <= 0:
         return None
     return {"api_key": api_key, "template_id": template_id, "mobile": mobile}
+
+
+def customer_otp_config() -> dict | None:
+    """SMS.ir config for the CUSTOMER OTP template only: api_key + template id.
+
+    No admin recipient, no admin-notify flag — this is functional delivery of a
+    one-time code to a customer's own mobile, not an alert. ``sms_config`` above
+    must NOT be reused for it: that one is gated on the ``COMMERCE_NOTIFY_SMS``
+    toggle and requires ``SMS_IR_ADMIN_MOBILE``, neither of which applies here.
+    """
+    api_key = _clean("SMS_IR_API_KEY")
+    template_raw = _clean("SMS_IR_OTP_TEMPLATE_ID", str(OTP_TEMPLATE_ID))
+    if not (api_key and template_raw):
+        return None
+    try:
+        template_id = int(template_raw)
+    except ValueError:
+        return None
+    return {"api_key": api_key, "template_id": template_id} if template_id > 0 else None
 
 
 def smtp_config() -> dict | None:
@@ -286,11 +327,37 @@ def build_payload(event: str, subject) -> dict:
         {"name": SMS_PARAM_CODE, "value": code},
     ]
 
+    pdf_bytes = None
+    if invoice and event in (EVENT_INVOICE_APPROVED, EVENT_PAYMENT_VERIFIED):
+        try:
+            pdf_bytes = invoice_pdf.generate_invoice_pdf(subject)
+        except Exception as pdf_err:
+            logger.warning("Failed to render invoice PDF for notification: %s", pdf_err)
+
+    email_html = None
+    try:
+        email_html = email_templates.render_commerce_email(
+            event=event,
+            code=code,
+            customer_name=name,
+            mobile=mobile,
+            channel=channel,
+            items=items,
+            total=total,
+            order_id=order_id,
+            is_admin=True,
+        )
+    except Exception as render_err:
+        logger.warning("Failed to render email HTML for notification: %s", render_err)
+
     return {
         "telegram": "\n".join(tg_lines),
         "email_subject": f"[Spaghetti Print] {label} {code}",
         "email_body": "\n".join(email_lines),
+        "email_html": email_html,
         "sms": sms_parameters,
+        "pdf_bytes": pdf_bytes,
+        "invoice_code": code,
     }
 
 
@@ -334,20 +401,67 @@ def post_sms_ir_verify(
         return False
 
 
+def _otp_ttl_minutes() -> str:
+    """The ``#TIME#`` value: the OTP lifetime as whole minutes.
+
+    Imported locally: ``commerce_otp`` imports this module at top level, so a
+    module-level import here would be circular. Rounds up so a TTL that is not
+    a whole number of minutes still tells the customer how long the code lives.
+    """
+    from app.services.commerce_otp import OTP_TTL_SECONDS
+
+    return str(math.ceil(OTP_TTL_SECONDS / 60))
+
+
+def send_customer_otp(mobile: str, code: str) -> bool:
+    """Send the storefront one-time code to the customer's own mobile.
+
+    Functional delivery (not an admin alert): needs only the API key and the
+    OTP template id. Returns ``False`` — never raises — when unconfigured or the
+    provider does not acknowledge, so the caller can drop the unusable
+    challenge. The ``code`` is never logged.
+    """
+    config = customer_otp_config()
+    if config is None:
+        return False
+    param_otp = _clean("SMS_IR_OTP_PARAM_OTP", OTP_PARAM_OTP) or OTP_PARAM_OTP
+    param_time = _clean("SMS_IR_OTP_PARAM_TIME", OTP_PARAM_TIME) or OTP_PARAM_TIME
+    parameters = [
+        {"name": param_otp, "value": code},
+        {"name": param_time, "value": _otp_ttl_minutes()},
+    ]
+    try:
+        acked = post_sms_ir_verify(
+            api_key=config["api_key"],
+            template_id=config["template_id"],
+            mobile=mobile,
+            parameters=parameters,
+        )
+    except Exception as exc:  # noqa: BLE001 - provider/network error is a failed send
+        logger.warning("SMS.ir customer OTP send error: %s", _safe(exc))
+        return False
+    return bool(acked)
+
+
 def send_smtp_mail(
     *,
     config: dict,
     subject: str,
     body: str,
+    html_body: str | None = None,
+    recipient_override: str | None = None,
     timeout: float = SMTP_TIMEOUT,
     smtp_factory=None,
 ) -> bool:
-    """Send one admin email over STARTTLS or SSL. Returns True on completion."""
+    """Send one admin or customer email over STARTTLS or SSL. Returns True on completion."""
+    recipient = recipient_override or config["recipient"]
     message = EmailMessage()
     message["From"] = config["sender"]
-    message["To"] = config["recipient"]
+    message["To"] = recipient
     message["Subject"] = subject
     message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
 
     host, port, tls = config["host"], config["port"], config["tls"]
     if smtp_factory is not None:
@@ -363,7 +477,7 @@ def send_smtp_mail(
         if tls == TLS_STARTTLS:
             smtp.starttls(context=ssl.create_default_context())
         smtp.login(config["username"], config["password"])
-        smtp.sendmail(config["sender"], [config["recipient"]], message.as_string())
+        smtp.sendmail(config["sender"], [recipient], message.as_string())
     return True
 
 
@@ -417,17 +531,43 @@ def send_sms_alert(parameters: list) -> str:
     return SENT if acked else FAILED
 
 
-def send_email_alert(subject: str, body: str) -> str:
+def send_email_alert(subject: str, body: str, html_body: str | None = None) -> str:
     """SMTP admin channel; SKIPPED when unconfigured, FAILED on send error."""
     config = smtp_config()
     if config is None:
         return SKIPPED
     try:
-        ok = send_smtp_mail(config=config, subject=subject, body=body)
+        ok = send_smtp_mail(config=config, subject=subject, body=body, html_body=html_body)
     except Exception as exc:  # noqa: BLE001 - SMTP/network error
         logger.warning("SMTP admin notification error: %s", _safe(exc))
         return FAILED
     return SENT if ok else FAILED
+
+
+def send_customer_email(
+    recipient: str,
+    subject: str,
+    body: str,
+    html_body: str | None = None,
+) -> bool:
+    """Send a transactional email to a customer's mailbox.
+
+    Returns False when SMTP is unconfigured or send fails; never raises.
+    """
+    config = smtp_config()
+    if not config or not recipient:
+        return False
+    try:
+        return send_smtp_mail(
+            config=config,
+            subject=subject,
+            body=body,
+            html_body=html_body,
+            recipient_override=recipient,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to send customer email to %s: %s", recipient, _safe(exc))
+        return False
 
 
 # ── Entry point ──────────────────────────────────────────────────────
@@ -458,15 +598,52 @@ def deliver_payload(event: str, payload: dict) -> dict:
     raise into the ASGI layer after the response was produced.
     """
     try:
+        def _deliver_telegram():
+            res = send_telegram_message(payload["telegram"])
+            pdf_bytes = payload.get("pdf_bytes")
+            if pdf_bytes and res == SENT:
+                temp_path = None
+                try:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp.write(pdf_bytes)
+                        temp_path = tmp.name
+                    caption = f"📄 فاکتور {payload.get('invoice_code', '')} — اسپاگتی پرینت"
+                    send_telegram_document(temp_path, caption=caption)
+                except Exception as doc_err:
+                    logger.warning("commerce telegram PDF dispatch failed: %s", doc_err)
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+            return res
+
+        def _deliver_email():
+            send_fn = send_email_alert
+            subj = payload["email_subject"]
+            body = payload["email_body"]
+            html_body = payload.get("email_html")
+            try:
+                sig = inspect.signature(send_fn)
+                accepts_html = "html_body" in sig.parameters or len(sig.parameters) >= 3 or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+            except (ValueError, TypeError):
+                accepts_html = True
+
+            if accepts_html and html_body:
+                try:
+                    return send_fn(subj, body, html_body=html_body)
+                except TypeError:
+                    pass
+            return send_fn(subj, body)
+
         return {
-            "telegram": _run_channel(
-                "telegram", event, lambda: send_telegram_message(payload["telegram"])
-            ),
+            "telegram": _run_channel("telegram", event, _deliver_telegram),
             "sms": _run_channel("sms", event, lambda: send_sms_alert(payload["sms"])),
-            "email": _run_channel(
-                "email", event,
-                lambda: send_email_alert(payload["email_subject"], payload["email_body"]),
-            ),
+            "email": _run_channel("email", event, _deliver_email),
         }
     except Exception as exc:  # noqa: BLE001 - never leak out of a background task
         logger.warning("commerce notification delivery failed event=%s: %s", event, _safe(exc))
