@@ -25,6 +25,7 @@ import sys
 from datetime import date
 
 import pytest
+from fastapi import HTTPException
 
 from app.models import (
     AccountingCategory,
@@ -345,6 +346,63 @@ def test_update_category_blocks_type_change_once_transactions_exist(client, auth
         ).status_code
         == 200
     )
+
+
+def test_update_category_retype_rejection_does_not_leak_the_rename(
+    client, auth_headers, seeded, db
+):
+    """M-1: the retype guard must run *before* ``category.name`` is touched.
+
+    A rejected request that had already mutated ``name`` leaves the ORM object
+    dirty, so any later commit on the same session persists half the edit.
+    """
+    created = client.post(
+        "/api/v1/accounting/categories",
+        json={"name": "دسته با تراکنش", "type": "expense"},
+        headers=auth_headers,
+    ).json()
+    client.post(
+        "/api/v1/accounting/transactions",
+        json={
+            "title": "هزینه آزمایشی",
+            "category_id": created["id"],
+            "type": "expense",
+            "amount_toman": 50_000,
+            "transaction_date": "2026-10-17",
+        },
+        headers=auth_headers,
+    )
+
+    # Rename + retype in one payload: the retype is illegal, so the whole
+    # request must be refused *and* the rename must not survive.
+    blocked = client.put(
+        f"/api/v1/accounting/categories/{created['id']}",
+        json={"name": "نام تازه", "type": "income"},
+        headers=auth_headers,
+    )
+    assert blocked.status_code == 400
+
+    listed = {
+        c["id"]: c
+        for c in client.get("/api/v1/accounting/categories", headers=auth_headers).json()
+    }
+    assert listed[created["id"]]["name"] == "دسته با تراکنش"
+    assert listed[created["id"]]["type"] == "expense"
+
+    # Service-level: a direct call that raises must leave the session clean, so
+    # a later commit (any other code path sharing the session) cannot flush a
+    # half-applied rename.
+    row = db.query(AccountingCategory).filter(AccountingCategory.id == created["id"]).one()
+    with pytest.raises(HTTPException) as excinfo:
+        accounting_service.update_category(db, created["id"], name="نام تازه", type="income")
+    assert excinfo.value.status_code == 400
+    assert row.name == "دسته با تراکنش"  # not even in memory
+
+    db.commit()
+    db.expire_all()
+    after = db.query(AccountingCategory).filter(AccountingCategory.id == created["id"]).one()
+    assert after.name == "دسته با تراکنش"
+    assert after.type == "expense"
 
 
 def test_delete_category_soft_deletes_custom_and_protects_system(client, auth_headers, seeded, db):
@@ -697,6 +755,70 @@ def test_invoice_linked_transaction_guardrails(client, auth_headers, seeded, db)
     assert db.query(AccountingTransaction).filter(
         AccountingTransaction.id == txn.id
     ).first() is not None
+
+
+def test_invoice_linked_transaction_rejects_title_and_account_type_changes(
+    client, auth_headers, seeded, db
+):
+    """I-1: the linked-row writable surface is exactly four fields.
+
+    The brief ("Only permits editing description, category_id (must still be
+    income), reference_code, and attachment_url") and the design doc ("only …
+    may be updated") are stricter than the frozen trio: a *changed* ``title`` or
+    ``account_type`` is a 400, while an identical echo stays a no-op so a full
+    row PUT from the UI still succeeds.
+    """
+    txn = _linked_transaction(db)
+    original_title = txn.title
+    original_account_type = txn.account_type
+
+    for payload in (
+        {"title": "عنوان دستکاری‌شده"},
+        {"title": ""},
+        {"account_type": "cash"},
+        {"amount_toman": 1_000},
+        {"type": "expense"},
+        {"transaction_date": "2026-01-01"},
+    ):
+        res = client.put(
+            f"/api/v1/accounting/transactions/{txn.id}", json=payload, headers=auth_headers
+        )
+        assert res.status_code == 400, (payload, res.text)
+        assert res.json()["detail"] == accounting_service.LINKED_IMMUTABLE_DETAIL
+
+    # A full-payload echo of the untouched row (plus one legal edit) still works.
+    echo = client.put(
+        f"/api/v1/accounting/transactions/{txn.id}",
+        json={
+            "title": original_title,
+            "account_type": original_account_type,
+            "amount_toman": 800_000,
+            "type": "income",
+            "transaction_date": "2026-10-17",
+            "description": "توضیح تازه",
+        },
+        headers=auth_headers,
+    )
+    assert echo.status_code == 200, echo.text
+    assert echo.json()["title"] == original_title
+    assert echo.json()["account_type"] == original_account_type
+    assert echo.json()["description"] == "توضیح تازه"
+
+    # Byte-identical echo after trimming is still a no-op, not a modification.
+    padded = client.put(
+        f"/api/v1/accounting/transactions/{txn.id}",
+        json={"title": f"  {original_title}  ", "account_type": original_account_type},
+        headers=auth_headers,
+    )
+    assert padded.status_code == 200, padded.text
+    assert padded.json()["title"] == original_title
+
+    db.refresh(txn)
+    assert txn.title == original_title
+    assert txn.account_type == original_account_type
+    assert txn.amount_toman == 800_000
+    assert txn.type == "income"
+    assert txn.transaction_date == date(2026, 10, 17)
 
 
 # ── Summary ──────────────────────────────────────────────────────────

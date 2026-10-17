@@ -161,7 +161,12 @@ def update_transaction(
     body: TransactionUpdate,
     db: Session = Depends(get_db),
 ):
-    """Update a manual row (or re-describe an invoice-linked one)."""
+    """Update a manual row, or an invoice-linked one's four editable fields.
+
+    ``invoice_id IS NOT NULL`` → only ``description``, ``category_id`` (income),
+    ``reference_code`` and ``attachment_url`` may change; an unchanged echo of
+    any other field is a no-op, a real edit is a 400.
+    """
     return accounting_service.update_transaction(
         db, transaction_id, body.model_dump(exclude_unset=True)
     )

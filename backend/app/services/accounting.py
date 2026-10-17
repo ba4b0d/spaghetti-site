@@ -12,9 +12,14 @@ without going through HTTP. Three groups of concerns live here:
 2. **Ledger validation.** ``create_transaction`` / ``update_transaction``
    enforce ``amount_toman > 0``, a non-blank title, a closed ``account_type``
    set and — the invariant the whole P&L rests on —
-   ``transaction.type == category.type``. Invoice-linked rows are frozen:
-   ``amount_toman``, ``type`` and ``transaction_date`` may not change and the row
-   may never be deleted, so a gateway callback can never rewrite booked income.
+   ``transaction.type == category.type``. Invoice-linked rows are almost fully
+   read-only: the *only* writable fields are ``description``, ``category_id``
+   (which must still resolve to an income category), ``reference_code`` and
+   ``attachment_url``; anything else — ``title``, ``account_type``,
+   ``amount_toman``, ``type``, ``transaction_date`` — is refused with a 400
+   (an *identical* echo of an unchanged value is a no-op, so a UI that PUTs the
+   whole row back still works), and the row may never be deleted. A gateway
+   callback can therefore never rewrite booked income.
    ``invoice_id`` is deliberately absent from the update input: the link is
    owned by the payment flow alone.
 3. **Reporting.** ``compute_summary`` sums with SQL ``SUM()`` over a
@@ -85,8 +90,27 @@ CSV_COLUMNS = [
     "توضیحات",
 ]
 
-# Fields a payment-linked (invoice) row may never have rewritten.
-LINKED_FROZEN_FIELDS = ("amount_toman", "type", "transaction_date")
+# Fields a payment-linked (invoice) row may never have rewritten: the payload
+# value must either be absent or *identical* to the stored one.
+LINKED_FROZEN_FIELDS = (
+    "amount_toman",
+    "type",
+    "transaction_date",
+    # The booking's identity and its «حساب / صندوق» belong to the payment flow
+    # too — the design allows only the four fields below to be updated.
+    "title",
+    "account_type",
+)
+
+# The *complete* set of fields an invoice-linked row may actually change
+# (design §3.1 and the Task 2 brief: "Only permits editing description,
+# category_id (must still be income), reference_code, and attachment_url").
+LINKED_UPDATE_FIELDS = (
+    "category_id",
+    "reference_code",
+    "description",
+    "attachment_url",
+)
 
 # Fields a manual row may update.
 MANUAL_UPDATE_FIELDS = (
@@ -99,6 +123,13 @@ MANUAL_UPDATE_FIELDS = (
     "reference_code",
     "description",
     "attachment_url",
+)
+
+# Persian text returned when an invoice-linked row is asked to change something
+# outside ``LINKED_UPDATE_FIELDS``.
+LINKED_IMMUTABLE_DETAIL = (
+    "از تراکنش متصل به فاکتور فقط توضیحات، سرفصل، شماره پیگیری و پیوست "
+    "قابل ویرایش است"
 )
 
 
@@ -276,7 +307,12 @@ def update_category(
     name: Optional[str] = None,
     type: Optional[str] = None,
 ) -> dict:
-    """Rename a custom «سرفصل»; retype only while nothing is booked under it."""
+    """Rename a custom «سرفصل»; retype only while nothing is booked under it.
+
+    Every guard runs *before* the first mutation, so a rejected request cannot
+    leave the ORM object dirty (a later autoflush on the same session would
+    otherwise commit half the edit — e.g. the rename — despite the 400).
+    """
     category = get_category_or_404(db, category_id)
 
     if category.is_system:
@@ -285,21 +321,28 @@ def update_category(
             detail="سرفصل‌های سیستمی قابل ویرایش نیستند",
         )
 
+    # ── Phase 1: validate everything, mutate nothing ──
+    clean_name: Optional[str] = None
     if name is not None:
         clean_name = _clean_text(name, 100)
         if not clean_name:
             raise HTTPException(status_code=400, detail="نام سرفصل نمی‌تواند خالی باشد")
-        _assert_name_is_unique(db, clean_name, category.type, exclude_id=category.id)
-        category.name = clean_name
 
-    if type is not None and type != category.type:
+    retype = type is not None and type != category.type
+    if retype:
         _require_valid_type(type)
-        booked = _transactions_under_category(db, category.id)
-        if booked:
+        if _transactions_under_category(db, category.id):
             raise HTTPException(
                 status_code=400,
                 detail="تا زمانی که تراکنشی به این سرفصل متصل است، نوع آن قابل تغییر نیست",
             )
+
+    # ── Phase 2: every guard passed — now apply ──
+    if clean_name is not None:
+        _assert_name_is_unique(db, clean_name, category.type, exclude_id=category.id)
+        category.name = clean_name
+
+    if retype:
         _assert_name_is_unique(db, category.name, type, exclude_id=category.id)
         category.type = type
 
@@ -449,6 +492,19 @@ def create_transaction(
     return serialize_transaction(txn)
 
 
+def _normalized_update_value(field: str, value: Any) -> Any:
+    """Normalise a payload value the way the write path would store it.
+
+    Lets an *identical* echo of an untouched field compare equal — a title with
+    stray whitespace is stored trimmed, so it must also be compared trimmed.
+    """
+    if field == "title":
+        return _clean_text(value, 200)
+    if field == "account_type":
+        return value or ""
+    return value
+
+
 def update_transaction(
     db: Session,
     transaction_id: int,
@@ -459,22 +515,29 @@ def update_transaction(
     ``payload`` holds only the fields the client actually sent (the router
     passes ``model_dump(exclude_unset=True)``), which is what lets a frozen
     field be told apart from an untouched one.
+
+    For an invoice-linked row the writable surface is exactly
+    ``LINKED_UPDATE_FIELDS`` — ``description``, ``category_id`` (income only),
+    ``reference_code`` and ``attachment_url``. Any other field may only be
+    echoed back *unchanged*; a real edit to ``title``, ``account_type``,
+    ``amount_toman``, ``type`` or ``transaction_date`` is a 400.
     """
     txn = get_transaction_or_404(db, transaction_id)
     payload = {k: v for k, v in payload.items() if k in MANUAL_UPDATE_FIELDS}
 
     linked = txn.invoice_id is not None
     if linked:
-        # Booked invoice income is immutable: the payment flow owns the amount,
-        # the direction and the booking date.
+        # Booked invoice income is immutable: the payment flow owns the title,
+        # the amount, the direction, the account and the booking date. An
+        # identical echo is still a harmless no-op, so a UI that PUTs the whole
+        # row back keeps working.
         for field in LINKED_FROZEN_FIELDS:
-            if field in payload and payload[field] != getattr(txn, field):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "مبلغ، نوع و تاریخ تراکنش‌های متصل به فاکتور قابل تغییر نیست"
-                    ),
-                )
+            if field in payload and _normalized_update_value(
+                field, payload[field]
+            ) != getattr(txn, field):
+                raise HTTPException(status_code=400, detail=LINKED_IMMUTABLE_DETAIL)
+        # Drop the (identical) echoes and leave only the allowed four behind.
+        payload = {k: v for k, v in payload.items() if k in LINKED_UPDATE_FIELDS}
 
     # ── Validate against the *effective* post-update state ──
     new_type = payload.get("type", txn.type)
