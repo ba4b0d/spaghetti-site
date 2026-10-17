@@ -97,6 +97,27 @@ export const getCustomerProfile = (token, config) => {
   });
 };
 
+/**
+ * Public — start (or resume) a payment for one of the verified customer's own
+ * invoices. The invoice must belong to the session's mobile and be approved and
+ * unexpired; the server re-checks all of that, so this call is never the
+ * authority. Requires the caller to pass the bearer explicitly, like the other
+ * history reads. Resolves to `{ data: { redirect_url } }` — the caller hands the
+ * browser over to the gateway's HTTPS portal.
+ */
+export const payCustomerInvoice = (token, invoiceId, gateway = 'digipay', config) => {
+  const missing = missingBearer(token);
+  if (missing) return missing;
+  return historyApi.post(
+    `/history/invoices/${invoiceId}/pay`,
+    { gateway },
+    {
+      ...config,
+      headers: bearerHeaders(token, config),
+    }
+  );
+};
+
 /** Public — revoke the presented bearer server-side (idempotent). */
 export const signOutHistory = (token, config) => {
   const missing = missingBearer(token);

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import {
   AlertTriangle,
   ArrowRight,
+  Check,
   Clock,
   CreditCard,
   FileText,
@@ -19,12 +20,14 @@ import {
   ShieldCheck,
   ShoppingBag,
   User,
+  X,
 } from 'lucide-react';
 import { formatPrice } from '../lib/utils';
 import { useNoReferrerPolicy } from '../hooks/useNoReferrerPolicy';
 import {
   getCustomerHistory,
   getCustomerProfile,
+  payCustomerInvoice,
   requestHistoryOtp,
   signOutHistory,
   verifyHistoryOtp,
@@ -46,11 +49,11 @@ import {
  * sign-out or an invalid session wipes it *and* the in-memory history before
  * anything else.
  *
- * The page is read-only. It never reconstructs or issues a payment link: an
- * approved invoice whose raw (hashed-at-rest) link cannot be recovered shows a
- * «تماس با پشتیبانی» note instead of a pay button, and paid/revoked entries
- * have no action at all. Statuses come from the server; nothing is inferred
- * from a redirect query parameter.
+ * An approved invoice the customer owns can be paid directly: the card shows a
+ * «پرداخت آنلاین» button that opens a gateway-picker modal and, on success,
+ * hands the browser to the provider's HTTPS portal. Nothing is inferred from a
+ * redirect query parameter; statuses come from the server, and paid/revoked
+ * entries have no action at all.
  */
 
 const MOBILE_RE = /^09\d{9}$/;
@@ -71,9 +74,24 @@ export const HISTORY_STATE_LABELS = Object.freeze({
 /** Neutral fallback for any state the client does not recognise. */
 export const UNKNOWN_STATE_LABEL = 'وضعیت نامشخص';
 
-/** Shown for an approved invoice — its raw payment link is not recoverable. */
-export const PAYMENT_SUPPORT_MESSAGE =
-  'برای دریافت لینک پرداخت با پشتیبانی تماس بگیرید.';
+/** Selectable gateways, in the order the modal renders them. */
+export const PAYMENT_GATEWAYS = Object.freeze([
+  {
+    value: 'digipay',
+    label: 'درگاه پرداخت دیجی‌پی (DigiPay)',
+    hint: 'پیش‌فرض — کارت‌های عضو شتاب و اعتباری',
+  },
+  {
+    value: 'bitpay',
+    label: 'درگاه پرداخت بیت‌پی (BitPay)',
+    hint: 'کارت‌های عضو شتاب و ارز دیجیتال',
+  },
+]);
+
+export const DEFAULT_GATEWAY = 'digipay';
+
+export const PAYMENT_START_ERROR =
+  'شروع پرداخت ناموفق بود؛ لطفاً دوباره تلاش کنید.';
 
 export const RATE_LIMIT_MESSAGE =
   'تعداد درخواست‌ها بیش از حد مجاز است؛ لطفاً کمی بعد دوباره تلاش کنید.';
@@ -154,7 +172,191 @@ function ErrorBox({ children }) {
   );
 }
 
-function HistoryEntryCard({ entry }) {
+/**
+ * Gateway picker + price breakdown for one approved invoice.
+ *
+ * The modal is presentation + one call: it never decides whether a payment is
+ * allowed — the server does. On success it hands the browser to the provider's
+ * HTTPS portal with `window.location.href`; a 401 is surfaced to the page as a
+ * lost session instead of a generic error.
+ */
+export function PayInvoiceModal({ entry, token, onClose, onSessionLost }) {
+  const [gateway, setGateway] = useState(DEFAULT_GATEWAY);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const shipping = Number(entry?.shipping_toman) || 0;
+  const total = Number(entry?.total_toman) || 0;
+  const items = Array.isArray(entry?.items) ? entry.items : [];
+  const summedItems = items.reduce(
+    (sum, item) => sum + (Number(item?.line_total_toman) || 0),
+    0
+  );
+  // Prefer the frozen line totals; fall back to total − shipping when a legacy
+  // invoice carries no per-line amount.
+  const itemsTotal = summedItems > 0 ? summedItems : Math.max(total - shipping, 0);
+
+  const close = () => {
+    if (busy) return;
+    onClose?.();
+  };
+
+  const submit = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await payCustomerInvoice(token, entry?.id, gateway);
+      const url = res?.data?.redirect_url;
+      if (typeof url !== 'string' || !url.trim()) {
+        setError(PAYMENT_START_ERROR);
+        return;
+      }
+      // Leave the SPA for the gateway's HTTPS portal.
+      window.location.href = url;
+    } catch (err) {
+      if (err?.response?.status === 401) {
+        onSessionLost?.();
+        return;
+      }
+      setError(extractError(err, PAYMENT_START_ERROR));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6"
+      style={{ backgroundColor: 'rgba(2, 6, 23, 0.6)' }}
+      role="presentation"
+      onClick={close}
+    >
+      <div
+        data-testid="pay-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`پرداخت آنلاین فاکتور #${entry?.id}`}
+        className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-2xl border p-5 space-y-4 animate-fade-in"
+        style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)' }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="flex items-start justify-between gap-2">
+          <h2 className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>
+            پرداخت آنلاین فاکتور #{entry?.id}
+          </h2>
+          <button
+            type="button"
+            onClick={close}
+            data-testid="pay-modal-close"
+            aria-label="بستن"
+            disabled={busy}
+            className="shrink-0 p-1 rounded-lg"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <X size={18} />
+          </button>
+        </header>
+
+        <div
+          data-testid="pay-breakdown"
+          className="rounded-xl border p-3 space-y-1.5 text-xs"
+          style={{ borderColor: 'var(--border-color)', backgroundColor: 'var(--bg-secondary)' }}
+        >
+          <div className="flex items-center justify-between" style={{ color: 'var(--text-secondary)' }}>
+            <span>مبلغ اقلام سفارش</span>
+            <span className="tabular-nums font-semibold">{formatPrice(itemsTotal)}</span>
+          </div>
+          <div className="flex items-center justify-between" style={{ color: 'var(--text-secondary)' }}>
+            <span>هزینه بسته‌بندی و ارسال</span>
+            <span className="tabular-nums font-semibold">{formatPrice(shipping)}</span>
+          </div>
+          <div
+            className="flex items-center justify-between pt-1.5 border-t"
+            style={{ borderColor: 'var(--border-color)', color: 'var(--text-primary)' }}
+          >
+            <span className="font-bold">مبلغ کل قابل پرداخت</span>
+            <span data-testid="pay-total" className="tabular-nums font-black">
+              {formatPrice(total)}
+            </span>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <p className="text-xs font-semibold" style={{ color: 'var(--text-secondary)' }}>
+            انتخاب درگاه پرداخت
+          </p>
+          {PAYMENT_GATEWAYS.map((option) => {
+            const selected = gateway === option.value;
+            return (
+              <label
+                key={option.value}
+                data-testid={`gateway-${option.value}`}
+                className="flex items-start gap-2.5 p-3 rounded-xl border cursor-pointer"
+                style={{
+                  borderColor: selected
+                    ? 'var(--brand-orange, #ff9a3d)'
+                    : 'var(--border-color)',
+                  backgroundColor: selected ? 'rgba(255, 154, 61, 0.07)' : 'var(--bg-secondary)',
+                }}
+              >
+                <input
+                  type="radio"
+                  name="pay-gateway"
+                  value={option.value}
+                  checked={selected}
+                  disabled={busy}
+                  onChange={() => setGateway(option.value)}
+                  className="mt-0.5 accent-[var(--brand-orange,#ff9a3d)]"
+                />
+                <span className="min-w-0">
+                  <span
+                    className="block text-xs font-bold"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    {option.label}
+                  </span>
+                  <span className="block text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                    {option.hint}
+                  </span>
+                </span>
+                {selected ? (
+                  <Check size={15} className="ml-auto shrink-0" style={{ color: 'var(--brand-orange, #ff9a3d)' }} />
+                ) : null}
+              </label>
+            );
+          })}
+        </div>
+
+        {error ? <ErrorBox>{error}</ErrorBox> : null}
+
+        <button
+          type="button"
+          data-testid="pay-submit"
+          onClick={submit}
+          disabled={busy}
+          className="btn-primary w-full inline-flex items-center justify-center gap-2"
+          style={busy ? { opacity: 0.7, pointerEvents: 'none' } : undefined}
+        >
+          {busy ? <Loader2 size={17} className="animate-spin" /> : <CreditCard size={17} />}
+          {busy ? 'در حال انتقال…' : 'انتقال به درگاه بانکی'}
+        </button>
+
+        <button
+          type="button"
+          onClick={close}
+          disabled={busy}
+          className="w-full text-xs font-medium py-1"
+          style={{ color: 'var(--text-secondary)' }}
+        >
+          انصراف
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function HistoryEntryCard({ entry, onPay }) {
   const kind = entry?.kind === 'invoice' ? 'invoice' : 'request';
   const state = entry?.state;
   const label = stateLabel(state);
@@ -256,17 +458,26 @@ function HistoryEntryCard({ entry }) {
       ) : null}
 
       {state === 'approved' ? (
-        <p
-          data-testid="pay-support"
-          className="text-[11px] leading-relaxed rounded-xl border p-2.5"
+        <div
+          className="rounded-xl border p-3 space-y-2"
           style={{
             borderColor: 'color-mix(in srgb, var(--brand-orange, #ff9a3d) 30%, var(--border-color))',
             backgroundColor: 'rgba(255, 154, 61, 0.05)',
-            color: 'var(--text-secondary)',
           }}
         >
-          {PAYMENT_SUPPORT_MESSAGE}
-        </p>
+          <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+            این فاکتور آمادهٔ پرداخت است؛ با انتخاب درگاه، مستقیم به صفحهٔ پرداخت منتقل می‌شوید.
+          </p>
+          <button
+            type="button"
+            data-testid={`pay-online-btn-${entry?.id}`}
+            onClick={() => onPay?.(entry)}
+            className="btn-primary w-full inline-flex items-center justify-center gap-2"
+          >
+            <CreditCard size={16} />
+            پرداخت آنلاین
+          </button>
+        </div>
       ) : null}
     </article>
   );
@@ -294,6 +505,7 @@ export default function CustomerOrders() {
   const [listError, setListError] = useState(null);
   const [profile, setProfile] = useState(null);
   const [activeTab, setActiveTab] = useState('orders'); // orders | profile
+  const [payTarget, setPayTarget] = useState(null);
 
   const mountedRef = useRef(true);
   const abortRef = useRef(null);
@@ -317,6 +529,7 @@ export default function CustomerOrders() {
     setListError(null);
     setProfile(null);
     setActiveTab('orders');
+    setPayTarget(null);
     setOtp(null);
     setCode('');
     setMaskedMobile('');
@@ -962,7 +1175,11 @@ export default function CustomerOrders() {
       {items.length > 0 ? (
         <div className="space-y-3">
           {items.map((entry) => (
-            <HistoryEntryCard key={`${entry?.kind}-${entry?.id}`} entry={entry} />
+            <HistoryEntryCard
+              key={`${entry?.kind}-${entry?.id}`}
+              entry={entry}
+              onPay={setPayTarget}
+            />
           ))}
         </div>
       ) : null}
@@ -1011,11 +1228,20 @@ export default function CustomerOrders() {
       >
         <FileText size={15} className="shrink-0 mt-0.5 text-[var(--brand-orange)]" />
         <span>
-          این صفحه فقط وضعیت ثبت‌شده روی سرور را نشان می‌دهد و به‌تنهایی امکان پرداخت ایجاد نمی‌کند.
-          برای پرداخت فاکتور، لینک اختصاصی صادرشده توسط پشتیبانی را از طریق پیام‌رسان دریافت کنید.
+          فاکتورهای تأییدشده را می‌توانید همین‌جا به‌صورت آنلاین پرداخت کنید. وضعیت پرداخت پس از
+          بازگشت از درگاه از سرور خوانده می‌شود و تنها فاکتورهای تأییدشده و منقضی‌نشده قابل پرداخت‌اند.
         </span>
       </div>
         </>
+      ) : null}
+
+      {payTarget ? (
+        <PayInvoiceModal
+          entry={payTarget}
+          token={token}
+          onClose={() => setPayTarget(null)}
+          onSessionLost={handleSessionLost}
+        />
       ) : null}
 
       <div className="mt-3 flex items-center justify-center">

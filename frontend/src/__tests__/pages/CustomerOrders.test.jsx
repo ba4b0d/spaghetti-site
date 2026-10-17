@@ -14,6 +14,7 @@ const apiMock = vi.hoisted(() => ({
   verifyHistoryOtp: vi.fn(),
   getCustomerHistory: vi.fn(),
   getCustomerProfile: vi.fn(),
+  payCustomerInvoice: vi.fn(),
   signOutHistory: vi.fn(),
 }));
 const sessionMock = vi.hoisted(() => ({
@@ -368,7 +369,7 @@ describe('CustomerOrders — entry cards, states and money', () => {
     expect(screen.queryByTestId('entry-total-invoice-21')).toBeNull();
   });
 
-  it('shows frozen totals for an approved invoice with no pay CTA', async () => {
+  it('shows frozen totals for an approved invoice with an online pay CTA', async () => {
     withSession();
     apiMock.getCustomerHistory.mockResolvedValue({
       data: { items: [approvedInvoice], has_more: false },
@@ -380,11 +381,9 @@ describe('CustomerOrders — entry cards, states and money', () => {
     const totals = screen.getByTestId('entry-total-invoice-22');
     expect(totals.textContent).toContain(formatPrice(120000));
 
-    // The raw payment link cannot be reconstructed: no pay CTA, and a support
-    // note instead.
-    const support = screen.getByTestId('pay-support');
-    expect(support.textContent).toContain('پشتیبانی');
-    expect(screen.queryByRole('button', { name: /پرداخت/ })).toBeNull();
+    // The approved invoice is payable from the customer area: a prominent CTA,
+    // and still no raw /pay link anywhere in the DOM.
+    expect(screen.getByTestId('pay-online-btn-22')).toBeInTheDocument();
     const links = container.querySelectorAll('a[href]');
     expect(
       Array.from(links).some((a) => (a.getAttribute('href') || '').startsWith('/pay'))
@@ -402,6 +401,7 @@ describe('CustomerOrders — entry cards, states and money', () => {
     expect(screen.getByText('پرداخت‌شده')).toBeInTheDocument();
     expect(screen.getByTestId('entry-total-invoice-23').textContent).toContain(formatPrice(50000));
     expect(screen.queryByTestId('pay-support')).toBeNull();
+    expect(screen.queryByTestId('pay-online-btn-23')).toBeNull();
     expect(screen.queryByRole('button', { name: /پرداخت/ })).toBeNull();
   });
 
