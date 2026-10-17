@@ -82,6 +82,7 @@ from app.routers.commerce_history import (
 from app.routers.digipay_callback import router as digipay_callback_router
 from app.routers.snappay_callback import router as snappay_callback_router
 from app.routers.bitpay_callback import router as bitpay_callback_router
+from app.routers.accounting import router as accounting_router
 from app.telegram_bot import start_telegram_bot_thread, send_telegram_notification
 
 from sqlalchemy import inspect, text
@@ -103,7 +104,7 @@ def ensure_accounting_schema_and_seed(db, bind=None) -> int:
     Idempotent — safe on every startup. Returns the number of seed categories
     inserted (0 when the chart of accounts is already complete).
     """
-    bind = bind if bind is not None else engine
+    bind = bind if bind is not None else db.get_bind()
     tables = set(inspect(bind).get_table_names())
     if "accounting_categories" not in tables:
         print("Creating accounting_categories table...")
@@ -502,6 +503,7 @@ app.include_router(commerce_history_router)  # Public «سفارش‌های من
 app.include_router(digipay_callback_router)  # DigiPay UPG callback (untrusted form POST, verify server-side)
 app.include_router(snappay_callback_router)  # SnappPay onboarding reachability stub (no payment processing)
 app.include_router(bitpay_callback_router)  # BitPay GET callback (untrusted query, verify server-side)
+app.include_router(accounting_router, dependencies=[Depends(require_staff_role)])  # Accounting ledger — staff only
 
 # ── Static files for uploads with immutable caching ─────────────────
 class CachedStaticFiles(StaticFiles):
