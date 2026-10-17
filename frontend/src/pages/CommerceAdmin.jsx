@@ -89,21 +89,29 @@ export const MANUAL_PAYMENT_METHODS = [
 const DEFAULT_MANUAL_PAYMENT_METHOD = 'card_to_card';
 const GATEWAY_PILL = 'درگاه آنلاین (دیجی‌پی / بیت‌پی)';
 
-// Printing must emit the label and nothing else: hide the whole document, then
-// reveal the slip subtree and drop the dialog chrome from the print flow.
+// Printing must emit the label and nothing else. The slip lives inside a modal
+// whose backdrop/transform/overflow would otherwise clip it, so print layout
+// hides the whole document and lifts the slip out to a fixed, full-width block:
+// ``visibility`` (not ``display``) keeps an ancestor's box from forcing layout
+// collapse while still revealing the slip subtree.
 export const POSTAL_PRINT_CSS = `
 @media print {
+  @page { size: auto; margin: 10mm; }
   body * { visibility: hidden !important; }
   #postal-slip-print, #postal-slip-print * { visibility: visible !important; }
   #postal-slip-print {
     position: fixed !important;
-    inset: 0 !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
     margin: 0 !important;
-    padding: 12px !important;
-    background: #ffffff !important;
-    color: #000000 !important;
+    padding: 20px !important;
+    background: white !important;
+    color: black !important;
     box-shadow: none !important;
     border: none !important;
+    z-index: 999999 !important;
   }
   .postal-slip-no-print { display: none !important; }
 }

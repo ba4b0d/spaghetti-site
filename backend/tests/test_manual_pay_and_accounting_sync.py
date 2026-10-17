@@ -586,3 +586,58 @@ def test_gateway_callback_books_gateway_income_end_to_end(
     assert txn.amount_toman == invoice.total_toman
     assert txn.transaction_date == _tehran_today()
     assert txn.order_id == invoice.order_id
+
+
+# ── Staff queue exposes the settled payment badges ───────────────────
+def test_staff_queue_carries_the_settled_payment_badges(client, auth_headers, seeded, db):
+    """A paid invoice read back from the staff queue keeps its method + reference.
+
+    The invoice table carries no payment columns, so the badge data can only be
+    rebuilt from the invoice's *verified* attempt. Without that, the «پرداخت‌شده»
+    tab renders a paid card with no «how was it paid» pill after a reload.
+    """
+    # Manual (card-to-card) settlement — a string method + staff reference.
+    manual_id = _approved_invoice(client, auth_headers)
+    assert (
+        _manual_pay(client, auth_headers, manual_id, reference_code="CART-999").status_code
+        == 200
+    )
+
+    # Gateway settlement — the callback-stamped numeric method code + tracking id.
+    gateway_id = _approved_invoice(client, auth_headers)
+    attempt = _pending_attempt(db, gateway_id)
+    attempt.payment_method = commerce_service.PAYMENT_METHOD_IPG
+    db.commit()
+    commerce_service.settle_verified_payment(db, attempt, tracking_code="TRK-4242")
+    db.expire_all()
+
+    rows = {
+        row["id"]: row
+        for row in client.get(f"{BASE}/staff/invoices", headers=auth_headers).json()
+    }
+
+    manual = rows[manual_id]
+    assert manual["state"] == "paid"
+    assert manual["payment_method"] == "card_to_card"
+    assert manual["reference_code"] == "CART-999"
+    assert manual["paid_at"].startswith("2026-10-17")
+
+    gateway = rows[gateway_id]
+    assert gateway["state"] == "paid"
+    assert gateway["payment_method"] == commerce_service.PAYMENT_METHOD_IPG
+    assert gateway["reference_code"] == "TRK-4242"
+    assert gateway["paid_at"] is not None
+
+
+def test_staff_queue_omits_payment_badges_for_an_unpaid_invoice(client, auth_headers, seeded):
+    """An approved (not-yet-paid) invoice exposes no method/reference at all."""
+    invoice_id = _approved_invoice(client, auth_headers)
+
+    row = next(
+        r
+        for r in client.get(f"{BASE}/staff/invoices", headers=auth_headers).json()
+        if r["id"] == invoice_id
+    )
+    assert row["state"] == "approved"
+    assert "payment_method" not in row
+    assert "reference_code" not in row

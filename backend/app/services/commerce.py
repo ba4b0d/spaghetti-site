@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, object_session, selectinload
 
 from app.models import (
     COMMERCE_INVOICE_STATES,
@@ -800,7 +800,7 @@ def serialize_invoice_item(item: CommerceInvoiceItem) -> dict:
 
 def serialize_staff_invoice(invoice: CommerceInvoice) -> dict:
     """Staff view — full detail, but never the raw or hashed token."""
-    return {
+    out = {
         "id": invoice.id,
         "request_id": invoice.request_id,
         "customer_name": invoice.customer_name,
@@ -826,6 +826,36 @@ def serialize_staff_invoice(invoice: CommerceInvoice) -> dict:
         "updated_at": invoice.updated_at.isoformat() if invoice.updated_at else None,
         "items": [serialize_invoice_item(i) for i in invoice.items],
     }
+
+    # Settled-payment metadata for the staff badges. A paid invoice loaded from
+    # the queue must render its «how did it get paid» pill (method + reference)
+    # without a second request — but the invoice table itself carries no payment
+    # columns, so the durable evidence lives on its *verified* attempt: the
+    # manual provider keeps the staff-chosen method + reference, a gateway one
+    # keeps its DigiPay/BitPay method code and tracking/provider transaction id.
+    if invoice.state == "paid":
+        session = object_session(invoice)
+        attempt = None
+        if session is not None:
+            attempt = (
+                session.query(CommercePaymentAttempt)
+                .filter(
+                    CommercePaymentAttempt.invoice_id == invoice.id,
+                    CommercePaymentAttempt.state == "verified",
+                )
+                .order_by(CommercePaymentAttempt.id.desc())
+                .first()
+            )
+        if attempt is not None:
+            out["payment_method"] = attempt.payment_method
+            out["reference_code"] = (
+                attempt.provider_trans_id or attempt.tracking_code or ""
+            )
+            out["paid_at"] = (
+                attempt.verified_at.isoformat() if attempt.verified_at else None
+            )
+
+    return out
 
 
 def serialize_public_invoice(invoice: CommerceInvoice) -> dict:
