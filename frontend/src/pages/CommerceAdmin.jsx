@@ -12,6 +12,11 @@ import {
   Link2,
   ArrowLeft,
   Inbox,
+  Search,
+  X,
+  CreditCard,
+  Package,
+  Printer,
 } from 'lucide-react';
 import { getProductsAll } from '../lib/api';
 import {
@@ -21,10 +26,13 @@ import {
   updateStaffInvoice,
   approveStaffInvoice,
   revokeStaffInvoice,
+  manualPayStaffInvoice,
   getStaffInvoicePdfUrl,
 } from '../lib/commerceApi';
 import { formatPrice } from '../lib/utils';
+import { shamsiToGregorianIso, gregorianIsoToShamsi, todayGregorianIso } from '../lib/shamsi';
 import Modal from '../components/Modal';
+import ShamsiDateField from '../components/ShamsiDateField';
 
 /**
  * Staff commerce admin — Task 2.
@@ -47,6 +55,107 @@ const MESSENGER_OPTIONS = [
   { value: 'telegram', label: 'تلگرام' },
   { value: 'bale', label: 'بله' },
 ];
+
+const MESSENGER_LABELS = Object.fromEntries(MESSENGER_OPTIONS.map((o) => [o.value, o.label]));
+
+// ── Task 5: status tabs, search, manual payment, postal label ─────────
+//
+// The tab bar splits the *loaded* dataset (the queue is paginated, so counts
+// are per loaded page) by effective display state — an approved invoice whose
+// link has expired reads as «لغو / منقضی» exactly like a revoked one. Counts
+// come from the same predicate that filters the list, so a tab can never
+// advertise a row the list then hides.
+export const SEARCH_DEBOUNCE_MS = 300;
+
+export const INVOICE_TABS = [
+  { value: 'all', label: 'همه', matches: () => true },
+  { value: 'draft', label: 'پیش‌نویس', matches: (state) => state === 'draft' },
+  { value: 'approved', label: 'در انتظار پرداخت', matches: (state) => state === 'approved' },
+  { value: 'paid', label: 'پرداخت‌شده', matches: (state) => state === 'paid' },
+  {
+    value: 'cancelled_or_expired',
+    label: 'لغو / منقضی',
+    matches: (state) => state === 'revoked' || state === 'expired',
+  },
+];
+
+// The two accepted backend values for an off-gateway payment; card-to-card is
+// the default because it is what almost every transfer arrives as.
+export const MANUAL_PAYMENT_METHODS = [
+  { value: 'card_to_card', label: 'کارت به کارت' },
+  { value: 'cash', label: 'نقدی / واریز دستی' },
+];
+
+const DEFAULT_MANUAL_PAYMENT_METHOD = 'card_to_card';
+const GATEWAY_PILL = 'درگاه آنلاین (دیجی‌پی / بیت‌پی)';
+
+// Printing must emit the label and nothing else: hide the whole document, then
+// reveal the slip subtree and drop the dialog chrome from the print flow.
+export const POSTAL_PRINT_CSS = `
+@media print {
+  body * { visibility: hidden !important; }
+  #postal-slip-print, #postal-slip-print * { visibility: visible !important; }
+  #postal-slip-print {
+    position: fixed !important;
+    inset: 0 !important;
+    margin: 0 !important;
+    padding: 12px !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+  .postal-slip-no-print { display: none !important; }
+}
+`;
+
+/** Label for `payment_method`, a string for manual payments but a legacy
+ * integer callback code for gateway settlements — both must degrade safely. */
+function paymentMethodPill(invoice) {
+  const raw = invoice?.payment_method;
+  if (raw == null || raw === '') return null;
+  if (typeof raw === 'number') return GATEWAY_PILL;
+  const text = String(raw).trim();
+  if (!text) return null;
+  if (/^\d+$/.test(text)) return GATEWAY_PILL;
+  const key = text.toLowerCase();
+  if (key === 'card_to_card' || key === 'card-to-card') return 'کارت به کارت';
+  if (key === 'cash') return 'نقدی';
+  if (['gateway', 'online', 'digipay', 'bitpay'].includes(key)) return GATEWAY_PILL;
+  return text;
+}
+
+/** Tracking/reference code of a settled invoice, whichever field carries it. */
+function invoiceReferenceCode(invoice) {
+  const raw = invoice?.reference_code ?? invoice?.tracking_code ?? invoice?.provider_trans_id;
+  const code = raw == null ? '' : String(raw).trim();
+  return code || null;
+}
+
+/** Search needle → comparable form (Persian/Arabic digits → ASCII, lowercased). */
+function searchNeedle(value) {
+  return normalizeDigits(value).trim().toLowerCase();
+}
+
+/** Search matches customer name, mobile, or the invoice id (`104` or `#104`). */
+function invoiceMatchesSearch(invoice, needle) {
+  if (!needle) return true;
+  const name = String(invoice?.customer_name ?? '').toLowerCase();
+  if (name.includes(needle)) return true;
+  const mobile = normalizeDigits(invoice?.mobile ?? '').replace(/\s+/g, '');
+  if (mobile.includes(needle)) return true;
+  const idNeedle = needle.replace(/^#/, '');
+  return idNeedle !== '' && String(invoice?.id ?? '').includes(idNeedle);
+}
+
+/** Copy/paste-ready recipient block for the messenger conversation. */
+function recipientAddressText(invoice) {
+  return [
+    `نام گیرنده: ${invoice?.customer_name || ''}`.trim(),
+    `شماره تماس: ${invoice?.mobile || ''}`.trim(),
+    `آدرس: ${invoice?.address || ''}`.trim(),
+  ].join('\n');
+}
 
 const STATE_META = {
   draft: { label: 'پیش‌نویس', color: '#94a3b8', bg: 'rgba(148,163,184,0.15)' },
@@ -267,6 +376,27 @@ export default function CommerceAdmin() {
   // Invoice awaiting confirmation before an edit that would kill its live link.
   const [confirmEdit, setConfirmEdit] = useState(null);
 
+  // Task 5 — tab filter + debounced search over the loaded invoice page.
+  const [activeTab, setActiveTab] = useState('all');
+  const [searchInput, setSearchInput] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [copiedAddressId, setCopiedAddressId] = useState(null);
+  const addressResetRef = useRef(null);
+
+  // Manual (off-gateway) payment — invoice under edit plus its little form.
+  const [manualPayInvoice, setManualPayInvoice] = useState(null);
+  const [manualForm, setManualForm] = useState({
+    payment_method: DEFAULT_MANUAL_PAYMENT_METHOD,
+    reference_code: '',
+    paid_at: '',
+    note: '',
+  });
+  const [manualError, setManualError] = useState(null);
+  const [manualSaving, setManualSaving] = useState(false);
+
+  // Postal packing slip (لیبل پستی) for a paid/approved invoice.
+  const [slipInvoice, setSlipInvoice] = useState(null);
+
   // Editor
   const [showModal, setShowModal] = useState(false);
   const [editingId, setEditingId] = useState(null);
@@ -331,9 +461,43 @@ export default function CommerceAdmin() {
   useEffect(
     () => () => {
       if (copyResetRef.current) clearTimeout(copyResetRef.current);
+      if (addressResetRef.current) clearTimeout(addressResetRef.current);
     },
     []
   );
+
+  // Debounce the invoice search: typing must stay cheap on a long queue, and
+  // the filter only re-runs once the staff member pauses.
+  useEffect(() => {
+    const timer = setTimeout(() => setSearchQuery(searchInput), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
+  // ── Status tabs + filtered invoice list ────────────────────────────
+
+  const invoiceStates = useMemo(
+    () => invoices.map((invoice) => invoiceDisplayState(invoice)),
+    [invoices]
+  );
+
+  const tabCounts = useMemo(
+    () =>
+      INVOICE_TABS.reduce((acc, tab) => {
+        acc[tab.value] = invoiceStates.filter((state) => tab.matches(state)).length;
+        return acc;
+      }, {}),
+    [invoiceStates]
+  );
+
+  const needle = useMemo(() => searchNeedle(searchQuery), [searchQuery]);
+
+  const visibleInvoices = useMemo(() => {
+    const tab = INVOICE_TABS.find((t) => t.value === activeTab) || INVOICE_TABS[0];
+    return invoices.filter(
+      (invoice) =>
+        tab.matches(invoiceDisplayState(invoice)) && invoiceMatchesSearch(invoice, needle)
+    );
+  }, [invoices, activeTab, needle]);
 
   // ── Editor open helpers ────────────────────────────────────────────
 
@@ -589,6 +753,107 @@ export default function CommerceAdmin() {
     }
   };
 
+  // ── Manual payment (کارت به کارت / نقدی) ───────────────────────────
+
+  const openManualPay = (invoice) => {
+    setManualPayInvoice(invoice);
+    setManualForm({
+      payment_method: DEFAULT_MANUAL_PAYMENT_METHOD,
+      reference_code: '',
+      // Defaults to today, edited as Shamsi and submitted as Gregorian ISO.
+      paid_at: gregorianIsoToShamsi(todayGregorianIso()),
+      note: '',
+    });
+    setManualError(null);
+  };
+
+  const closeManualPay = () => {
+    if (manualSaving) return;
+    setManualPayInvoice(null);
+  };
+
+  /**
+   * Record an off-gateway payment. The server owns the whole booking (invoice →
+   * paid, manual attempt, fulfillment order, invoice-linked accounting income
+   * row) in one commit, and refuses a second recording outright — so the card is
+   * only flipped to paid once that call returned, and a refusal stays on screen
+   * instead of being retried blindly.
+   */
+  const handleManualPaySubmit = async (event) => {
+    event.preventDefault();
+    if (manualSaving || !manualPayInvoice) return;
+
+    const reference = manualForm.reference_code.trim();
+    if (!reference) {
+      setManualError('شماره پیگیری / ارجاع الزامی است');
+      return;
+    }
+    const paidIso = shamsiToGregorianIso(manualForm.paid_at);
+    if (!paidIso) {
+      setManualError('تاریخ پرداخت را به شکل ۱۴۰۵/۰۴/۲۸ وارد کنید');
+      return;
+    }
+
+    setManualError(null);
+    setManualSaving(true);
+    const invoice = manualPayInvoice;
+    try {
+      const res = await manualPayStaffInvoice(invoice.id, {
+        payment_method: manualForm.payment_method,
+        reference_code: reference,
+        paid_at: paidIso,
+        note: manualForm.note.trim(),
+      });
+      const updated = res?.data;
+      setInvoices((prev) =>
+        prev.map((inv) =>
+          inv.id === invoice.id
+            ? {
+                ...inv,
+                ...(updated || {}),
+                state: updated?.state || 'paid',
+                // The staff serializer carries no payment fields, so the method
+                // and reference staff just recorded stay on the card for badges.
+                payment_method: manualForm.payment_method,
+                reference_code: reference,
+              }
+            : inv
+        )
+      );
+      setManualPayInvoice(null);
+      setStatusMessage(`پرداخت دستی فاکتور #${invoice.id} ثبت شد.`);
+    } catch (err) {
+      setManualError(extractError(err));
+    } finally {
+      setManualSaving(false);
+    }
+  };
+
+  // ── Postal packing slip (لیبل پستی) ────────────────────────────────
+
+  const handleCopyAddress = async (invoice) => {
+    const text = recipientAddressText(invoice);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // Fallback for browsers without the async clipboard API.
+        const el = document.createElement('textarea');
+        el.value = text;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+      }
+      setCopiedAddressId(invoice.id);
+      setStatusMessage(`آدرس گیرنده فاکتور #${invoice.id} کپی شد.`);
+      if (addressResetRef.current) clearTimeout(addressResetRef.current);
+      addressResetRef.current = setTimeout(() => setCopiedAddressId(null), COPY_RESET_MS);
+    } catch {
+      setActionError('کپی آدرس ناموفق بود؛ آدرس را دستی انتخاب کنید.');
+    }
+  };
+
   return (
     <div className="space-y-6 animate-fade-in">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -731,19 +996,97 @@ export default function CommerceAdmin() {
           </div>
         </div>
 
+        {!invoicesError && (
+          <div
+            className="px-4 py-3 space-y-2 border-b"
+            style={{ borderColor: 'var(--border-color)' }}
+          >
+            {/* Status tabs — each count comes from the same bucket predicate
+                that filters the list below. */}
+            <div
+              className="flex items-center gap-1 flex-wrap"
+              role="group"
+              aria-label="فیلتر وضعیت فاکتور"
+            >
+              {INVOICE_TABS.map((tab) => {
+                const selected = activeTab === tab.value;
+                return (
+                  <button
+                    key={tab.value}
+                    type="button"
+                    data-testid={`invoice-tab-${tab.value}`}
+                    aria-pressed={selected}
+                    onClick={() => setActiveTab(tab.value)}
+                    className="text-xs px-2.5 py-1 rounded-full border transition-colors"
+                    style={{
+                      borderColor: selected ? 'var(--accent)' : 'var(--border-color)',
+                      backgroundColor: selected ? 'var(--accent-light)' : 'transparent',
+                      color: selected ? 'var(--accent)' : 'var(--text-secondary)',
+                      fontWeight: selected ? 600 : 400,
+                    }}
+                  >
+                    {tab.label} ({tabCounts[tab.value] ?? 0})
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Debounced search over name / mobile / invoice id. */}
+            <div className="relative">
+              <Search
+                size={14}
+                aria-hidden="true"
+                className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                style={{ color: 'var(--text-muted)' }}
+              />
+              <input
+                type="search"
+                data-testid="invoice-search"
+                aria-label="جستجوی فاکتور"
+                className="input-field w-full pr-9 text-xs"
+                placeholder="جستجو بر اساس نام مشتری، شماره موبایل یا شماره فاکتور…"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+              />
+              {searchInput && (
+                <button
+                  type="button"
+                  data-testid="invoice-search-clear"
+                  aria-label="پاک کردن جستجو"
+                  onClick={() => setSearchInput('')}
+                  className="absolute left-2 top-1/2 -translate-y-1/2 p-1 rounded-md"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  <X size={14} />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {invoicesError ? (
           <p className="px-4 py-6 text-xs" style={{ color: '#ef4444' }}>{invoicesError}</p>
         ) : invoices.length === 0 ? (
           <p className="px-4 py-6 text-xs text-center" style={{ color: 'var(--text-muted)' }}>
             هنوز فاکتوری ساخته نشده است.
           </p>
+        ) : visibleInvoices.length === 0 ? (
+          <p
+            data-testid="invoice-filter-empty"
+            className="px-4 py-6 text-xs text-center"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            فاکتوری با این فیلتر یافت نشد.
+          </p>
         ) : (
           <div className="divide-y" style={{ borderColor: 'var(--border-color)' }}>
-            {invoices.map((invoice) => {
+            {visibleInvoices.map((invoice) => {
               const display = invoiceDisplayState(invoice);
               const meta = STATE_META[display] || STATE_META.draft;
               const shareUrl = shareLinks[invoice.id];
               const editable = invoice.state !== 'paid';
+              const paymentPill = paymentMethodPill(invoice);
+              const referenceCode = invoiceReferenceCode(invoice);
               return (
                 <div key={invoice.id} className="px-4 py-3 space-y-2">
                   <div className="flex flex-col sm:flex-row sm:items-center gap-3">
@@ -756,6 +1099,7 @@ export default function CommerceAdmin() {
                           #{invoice.id} · نسخه {invoice.revision}
                         </span>
                         <span
+                          data-testid={`invoice-state-${invoice.id}`}
                           className="text-[10px] font-semibold px-2 py-0.5 rounded-full"
                           style={{ backgroundColor: meta.bg, color: meta.color }}
                         >
@@ -792,6 +1136,28 @@ export default function CommerceAdmin() {
                           ویرایش
                         </button>
                       )}
+                      {display !== 'paid' && (
+                        <button
+                          type="button"
+                          data-testid={`manual-pay-btn-${invoice.id}`}
+                          onClick={() => openManualPay(invoice)}
+                          className="btn-secondary text-xs inline-flex items-center gap-1"
+                          title="ثبت پرداخت کارت به کارت یا نقدی"
+                        >
+                          <CreditCard size={13} /> ثبت پرداخت دستی
+                        </button>
+                      )}
+                      {(display === 'paid' || display === 'approved') && (
+                        <button
+                          type="button"
+                          data-testid={`postal-slip-btn-${invoice.id}`}
+                          onClick={() => setSlipInvoice(invoice)}
+                          className="btn-secondary text-xs inline-flex items-center gap-1"
+                          title="لیبل پستی بسته"
+                        >
+                          <Package size={13} /> لیبل پستی
+                        </button>
+                      )}
                       {display === 'draft' && (
                         <button
                           type="button"
@@ -822,6 +1188,29 @@ export default function CommerceAdmin() {
                       )}
                     </div>
                   </div>
+
+                  {display === 'paid' && (paymentPill || referenceCode) && (
+                    <div className="flex items-center gap-2 flex-wrap text-[10px]">
+                      {paymentPill && (
+                        <span
+                          data-testid={`payment-method-${invoice.id}`}
+                          className="px-2 py-0.5 rounded-full font-semibold"
+                          style={{ backgroundColor: 'rgba(14,165,233,0.14)', color: '#0ea5e9' }}
+                        >
+                          {paymentPill}
+                        </span>
+                      )}
+                      {referenceCode && (
+                        <span
+                          data-testid={`payment-reference-${invoice.id}`}
+                          className="font-mono"
+                          style={{ color: 'var(--text-muted)' }}
+                        >
+                          کد پیگیری: <span style={{ direction: 'ltr' }}>{referenceCode}</span>
+                        </span>
+                      )}
+                    </div>
+                  )}
 
                   {shareUrl && (
                     <div
@@ -1094,6 +1483,264 @@ export default function CommerceAdmin() {
             </button>
           </div>
         </form>
+      </Modal>
+
+      {/* ── Manual (off-gateway) payment ── */}
+      <Modal
+        isOpen={manualPayInvoice != null}
+        onClose={closeManualPay}
+        title={manualPayInvoice ? `ثبت پرداخت دستی فاکتور #${manualPayInvoice.id}` : ''}
+        size="md"
+      >
+        {manualPayInvoice && (
+          <form onSubmit={handleManualPaySubmit} className="space-y-4" noValidate>
+            <div
+              className="rounded-lg px-3 py-2 text-xs space-y-1"
+              style={{ backgroundColor: 'var(--bg-tertiary)' }}
+            >
+              <div className="flex justify-between gap-3">
+                <span style={{ color: 'var(--text-muted)' }}>نام مشتری:</span>
+                <span style={{ color: 'var(--text-primary)' }}>{manualPayInvoice.customer_name}</span>
+              </div>
+              <div className="flex justify-between gap-3">
+                <span style={{ color: 'var(--text-muted)' }}>مبلغ کل:</span>
+                <span style={{ color: 'var(--accent)', fontWeight: 600 }}>
+                  {formatPrice(manualPayInvoice.total_toman)}
+                </span>
+              </div>
+            </div>
+
+            <fieldset>
+              <legend className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+                روش پرداخت
+              </legend>
+              <div className="flex items-center gap-4 flex-wrap">
+                {MANUAL_PAYMENT_METHODS.map((method) => (
+                  <label
+                    key={method.value}
+                    className="flex items-center gap-1.5 text-xs"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    <input
+                      type="radio"
+                      name="manual-payment-method"
+                      value={method.value}
+                      checked={manualForm.payment_method === method.value}
+                      onChange={() =>
+                        setManualForm((f) => ({ ...f, payment_method: method.value }))
+                      }
+                    />
+                    {method.label}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+
+            <div>
+              <label
+                htmlFor="manual-reference"
+                className="block text-xs font-medium mb-1"
+                style={{ color: 'var(--text-secondary)' }}
+              >
+                شماره پیگیری / ارجاع *
+              </label>
+              <input
+                id="manual-reference"
+                className="input-field w-full"
+                style={{ direction: 'ltr' }}
+                value={manualForm.reference_code}
+                onChange={(e) => setManualForm((f) => ({ ...f, reference_code: e.target.value }))}
+                maxLength={100}
+                placeholder="REF-…"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="manual-paid-at"
+                className="block text-xs font-medium mb-1"
+                style={{ color: 'var(--text-secondary)' }}
+              >
+                تاریخ پرداخت *
+              </label>
+              <ShamsiDateField
+                id="manual-paid-at"
+                aria-label="تاریخ پرداخت"
+                value={manualForm.paid_at}
+                onChange={(value) => setManualForm((f) => ({ ...f, paid_at: value }))}
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="manual-note"
+                className="block text-xs font-medium mb-1"
+                style={{ color: 'var(--text-secondary)' }}
+              >
+                یادداشت (توضیحات پرداخت)
+              </label>
+              <textarea
+                id="manual-note"
+                rows={2}
+                className="input-field w-full"
+                value={manualForm.note}
+                onChange={(e) => setManualForm((f) => ({ ...f, note: e.target.value }))}
+                maxLength={1000}
+              />
+            </div>
+
+            {manualError && (
+              <div
+                role="alert"
+                className="p-3 rounded-xl text-xs border"
+                style={{
+                  backgroundColor: 'rgba(239,68,68,0.08)',
+                  borderColor: 'rgba(239,68,68,0.35)',
+                  color: '#ef4444',
+                }}
+              >
+                {manualError}
+              </div>
+            )}
+
+            <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+              با ثبت پرداخت، فاکتور «پرداخت‌شده» می‌شود، سفارش تولید ساخته و درآمد آن در دفتر حسابداری
+              ثبت می‌شود. ثبت دوباره یک فاکتور پرداخت‌شده پذیرفته نمی‌شود.
+            </p>
+
+            <div className="flex gap-2 pt-1">
+              <button
+                type="button"
+                className="btn-secondary flex-1 justify-center"
+                onClick={closeManualPay}
+                disabled={manualSaving}
+              >
+                انصراف
+              </button>
+              <button
+                type="submit"
+                data-testid="manual-pay-submit"
+                className="btn-primary flex-1 justify-center"
+                disabled={manualSaving}
+              >
+                {manualSaving ? <Loader2 size={15} className="animate-spin" /> : null} تأیید و ثبت
+                پرداخت
+              </button>
+            </div>
+          </form>
+        )}
+      </Modal>
+
+      {/* ── Postal packing slip (لیبل پستی) ── */}
+      <Modal
+        isOpen={slipInvoice != null}
+        onClose={() => setSlipInvoice(null)}
+        title={slipInvoice ? `لیبل پستی فاکتور #${slipInvoice.id}` : ''}
+        size="md"
+      >
+        {slipInvoice && (
+          <>
+            {/* Print styling lives with the label so printing emits only it. */}
+            <style>{POSTAL_PRINT_CSS}</style>
+            <div
+              id="postal-slip-print"
+              data-testid="postal-slip"
+              className="space-y-3 text-xs"
+              style={{
+                backgroundColor: '#ffffff',
+                color: '#000000',
+                border: '1px solid #000000',
+                borderRadius: '0.5rem',
+                padding: '14px',
+              }}
+            >
+              <div
+                className="flex items-start justify-between gap-3 pb-2"
+                style={{ borderBottom: '1px dashed #000000' }}
+              >
+                <div className="space-y-0.5">
+                  <div style={{ fontWeight: 700 }}>فرستنده</div>
+                  <div>اسپاگتی پرینت</div>
+                  <div>پشتیبانی: تهران</div>
+                  <div>وب‌سایت: spaghettiprints.ir</div>
+                </div>
+                <div className="text-left space-y-1" style={{ direction: 'ltr' }}>
+                  <div className="font-mono" style={{ fontWeight: 700 }}>
+                    #{slipInvoice.id}
+                  </div>
+                  {/* Decorative barcode placeholder — the id is the human key. */}
+                  <div
+                    aria-hidden="true"
+                    style={{
+                      width: '120px',
+                      height: '34px',
+                      backgroundImage:
+                        'repeating-linear-gradient(90deg, #000000 0 1px, transparent 1px 3px, #000000 3px 5px, transparent 5px 6px)',
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-0.5">
+                <div style={{ fontWeight: 700 }}>گیرنده</div>
+                <div>نام: {slipInvoice.customer_name}</div>
+                <div>
+                  شماره تماس: <span style={{ direction: 'ltr' }}>{slipInvoice.mobile}</span>
+                </div>
+                <div>آدرس: {slipInvoice.address || '—'}</div>
+                <div>
+                  شناسه سفارش / پیام‌رسان:{' '}
+                  {MESSENGER_LABELS[slipInvoice.messenger] || slipInvoice.messenger || '—'}
+                  {slipInvoice.messenger_handle ? ` — ${slipInvoice.messenger_handle}` : ''}
+                </div>
+              </div>
+
+              <div className="space-y-0.5">
+                <div style={{ fontWeight: 700 }}>محتویات بسته</div>
+                {(slipInvoice.items || []).length === 0 ? (
+                  <div>—</div>
+                ) : (
+                  <ul className="list-disc pr-4">
+                    {(slipInvoice.items || []).map((item, idx) => (
+                      <li key={idx}>
+                        {item.description} × {item.qty}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div>توضیحات / مشخصات: {slipInvoice.specification || '—'}</div>
+              </div>
+            </div>
+
+            <div className="flex gap-2 pt-4 postal-slip-no-print">
+              <button
+                type="button"
+                data-testid="postal-slip-copy"
+                className="btn-secondary flex-1 justify-center inline-flex items-center gap-1"
+                onClick={() => handleCopyAddress(slipInvoice)}
+              >
+                {copiedAddressId === slipInvoice.id ? <Check size={14} /> : <Copy size={14} />}
+                {copiedAddressId === slipInvoice.id ? 'کپی شد' : 'کپی آدرس گیرنده'}
+              </button>
+              <button
+                type="button"
+                data-testid="postal-slip-print"
+                className="btn-secondary flex-1 justify-center inline-flex items-center gap-1"
+                onClick={() => window.print()}
+              >
+                <Printer size={14} /> چاپ برچسب
+              </button>
+              <button
+                type="button"
+                data-testid="postal-slip-close"
+                className="btn-secondary justify-center"
+                onClick={() => setSlipInvoice(null)}
+              >
+                بستن
+              </button>
+            </div>
+          </>
+        )}
       </Modal>
     </div>
   );

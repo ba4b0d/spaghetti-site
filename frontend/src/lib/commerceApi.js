@@ -64,6 +64,20 @@ export const approveStaffInvoice = (id) =>
 export const revokeStaffInvoice = (id) =>
   commerceApi.post(`/staff/invoices/${id}/revoke`);
 
+// ── Manual (off-gateway) payment ─────────────────────────────────────
+//
+// The route is `POST /admin/invoices/{id}/manual-pay`: registered on the
+// commerce router, namespaced `/admin` and gated by `require_staff_role`
+// (routers/commerce.py `pay_invoice_manually`). It marks the invoice paid,
+// records the manual attempt, hands a fulfillment order to production and books
+// the invoice-linked accounting income row — all in one commit — so an
+// already-paid invoice is refused (400) rather than double-booked; the UI must
+// surface that refusal instead of retrying blindly.
+
+/** Staff — record a کارت به کارت / نقدی payment against a non-paid invoice. */
+export const manualPayStaffInvoice = (id, payload) =>
+  commerceApi.post(`/admin/invoices/${id}/manual-pay`, payload);
+
 // ── Public invoice payment (Task 3) ──────────────────────────────────
 //
 // The invoice token is a private bearer credential carried in the URL. These
