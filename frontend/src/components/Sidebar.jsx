@@ -12,7 +12,6 @@ import {
   FolderHeart,
   ClipboardList,
   BookOpen,
-  Inbox,
   UserRound,
   ScrollText,
   Receipt,
@@ -33,7 +32,6 @@ export default function Sidebar({ onLinkClick }) {
         ]
       : [
           { path: '/dashboard', label: 'داشبورد', icon: LayoutDashboard },
-          { path: '/custom-orders', label: 'سفارشات سایت', icon: Inbox },
           { path: '/orders', label: 'سفارش‌ها', icon: ClipboardList },
           { path: '/commerce-admin', label: 'فاکتور و پرداخت', icon: Receipt },
           { path: '/customers', label: 'مشتریان', icon: UserRound },
