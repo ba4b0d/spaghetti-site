@@ -25,7 +25,7 @@ const apiMock = vi.hoisted(() => ({ getProductsAll: vi.fn() }));
 vi.mock('../lib/commerceApi', () => commerceApiMock);
 vi.mock('../lib/api', () => apiMock);
 
-import CommerceAdmin, { SEARCH_DEBOUNCE_MS } from '../pages/CommerceAdmin';
+import CommerceAdmin, { SEARCH_DEBOUNCE_MS, POSTAL_PRINT_CSS } from '../pages/CommerceAdmin';
 import { formatPrice } from '../lib/utils';
 import { todayGregorianIso } from '../lib/shamsi';
 
@@ -361,6 +361,42 @@ describe('CommerceAdmin postal label', () => {
     expect(screen.getByTestId('postal-slip-btn-103')).toBeInTheDocument();
     // A draft has nothing to ship yet.
     expect(screen.queryByTestId('postal-slip-btn-101')).toBeNull();
+  });
+
+  it('neutralises the modal transform so the slip prints full-bleed', async () => {
+    commerceApiMock.getStaffInvoices.mockResolvedValue({ data: [PAID] });
+
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByTestId('postal-slip-btn-103'));
+    await screen.findByTestId('postal-slip');
+
+    // Modal.jsx animates [role="dialog"] with `fadeInScale`; a non-none
+    // transform makes the dialog the containing block for `position: fixed`,
+    // which would otherwise trap #postal-slip-print inside the 520px dialog
+    // (and its max-height/overflow) instead of the page box under print.
+    expect(POSTAL_PRINT_CSS).toContain('transform: none !important');
+    expect(POSTAL_PRINT_CSS).toContain('animation: none !important');
+    expect(POSTAL_PRINT_CSS).toContain('max-height: none !important');
+    expect(POSTAL_PRINT_CSS).toContain('overflow: visible !important');
+    expect(POSTAL_PRINT_CSS).toContain('[role="dialog"], [role="dialog"] * {');
+
+    // The neutralisation is scoped to print media, next to the full-width lift.
+    const printBlock = POSTAL_PRINT_CSS.slice(POSTAL_PRINT_CSS.indexOf('@media print'));
+    expect(printBlock).toContain('transform: none !important');
+    expect(printBlock).toContain('animation: none !important');
+    expect(printBlock).toContain('#postal-slip-print {');
+    expect(printBlock).toContain('position: fixed !important');
+    expect(printBlock).toContain('width: 100% !important');
+    expect(printBlock).toContain('box-sizing: border-box !important');
+
+    // …and the rule really reaches the document (the label's own <style> tag).
+    const printStyle = Array.from(document.querySelectorAll('style')).find((el) =>
+      el.textContent.includes('postal-slip-print')
+    );
+    expect(printStyle).toBeTruthy();
+    expect(printStyle.textContent).toContain('[role="dialog"], [role="dialog"] * {');
+    expect(printStyle.textContent).toContain('transform: none !important');
   });
 });
 

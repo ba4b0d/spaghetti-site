@@ -94,10 +94,23 @@ const GATEWAY_PILL = 'درگاه آنلاین (دیجی‌پی / بیت‌پی)'
 // hides the whole document and lifts the slip out to a fixed, full-width block:
 // ``visibility`` (not ``display``) keeps an ancestor's box from forcing layout
 // collapse while still revealing the slip subtree.
+//
+// The dialog subtree is flattened as well: Modal.jsx animates ``[role="dialog"]``
+// with ``fadeInScale``, and a non-``none`` transform establishes a containing
+// block for ``position: fixed`` — so without neutralising it the slip resolves
+// against the 520px dialog instead of the page box and never reaches full bleed.
+// The slip itself is then sized ``border-box`` so ``width: 100%`` plus its own
+// padding lands exactly on the page margins instead of overflowing them.
 export const POSTAL_PRINT_CSS = `
 @media print {
   @page { size: auto; margin: 10mm; }
   body * { visibility: hidden !important; }
+  [role="dialog"], [role="dialog"] * {
+    animation: none !important;
+    transform: none !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
   #postal-slip-print, #postal-slip-print * { visibility: visible !important; }
   #postal-slip-print {
     position: fixed !important;
@@ -105,6 +118,7 @@ export const POSTAL_PRINT_CSS = `
     top: 0 !important;
     width: 100% !important;
     max-width: 100% !important;
+    box-sizing: border-box !important;
     margin: 0 !important;
     padding: 20px !important;
     background: white !important;
@@ -820,8 +834,9 @@ export default function CommerceAdmin() {
                 ...inv,
                 ...(updated || {}),
                 state: updated?.state || 'paid',
-                // The staff serializer carries no payment fields, so the method
-                // and reference staff just recorded stay on the card for badges.
+                // The server now carries the badges for a settled invoice, but
+                // the just-recorded method and reference are merged explicitly
+                // so the card stays correct even if the response omits them.
                 payment_method: manualForm.payment_method,
                 reference_code: reference,
               }
